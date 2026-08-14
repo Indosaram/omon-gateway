@@ -1,0 +1,40 @@
+[package]
+name = "omon-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Ultra-fast, zero-GC async AI agent gateway and session multiplexer for Discord in 100% Rust"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/omon-ai/omon-gateway"
+keywords = ["discord", "agent", "multiplexer", "llm", "hermes"]
+categories = ["network-programming", "asynchronous"]
+
+[lib]
+name = "omon_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "omon-gateway"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.43", features = ["full", "test-util"] }
+poise = "0.6"
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
+dashmap = "6.1"
+dotenvy = "0.15"
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.12", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+songbird = { version = "0.5", default-features = false, features = ["driver", "gateway", "serenity", "rustls", "receive", "tungstenite"] }
+cron = "0.15"
+urlencoding = "2.1"

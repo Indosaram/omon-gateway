@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+*.env
+*.db
+*.db-*
+*.log
+*.pid
+target
+workspace
+.DS_Store

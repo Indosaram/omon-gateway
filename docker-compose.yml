@@ -1,0 +1,32 @@
+services:
+  omon-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: omon-gateway:0.1.0
+    container_name: omon-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: sqlite:///app/data/omon_gateway.db
+      OMON_WORKSPACE_ROOT: /app/workspace
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_BOT_TOKENS: ${DISCORD_BOT_TOKENS:-}
+      DISCORD_ALLOWED_USERS: ${DISCORD_ALLOWED_USERS:-}
+      DISCORD_FREE_RESPONSE_CHANNELS: ${DISCORD_FREE_RESPONSE_CHANNELS:-}
+      DISCORD_HOME_CHANNEL: ${DISCORD_HOME_CHANNEL:-}
+      DEFAULT_MODEL: ${DEFAULT_MODEL}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      APPROVAL_MODE: ${APPROVAL_MODE:-smart}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./data:/app/data
+      - ./workspace:/app/workspace
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
