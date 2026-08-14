@@ -1,16 +1,16 @@
 <div align="center">
 
 ```
- ██████╗ ███╗   ███╗ ██████╗ ███╗   ██╗
-██╔═══██╗████╗ ████║██╔═══██╗████╗  ██║
-██║   ██║██╔████╔██║██║   ██║██╔██╗ ██║
-██║   ██║██║╚██╔╝██║██║   ██║██║╚██╗██║
-╚██████╔╝██║ ╚═╝ ██║╚██████╔╝██║ ╚████║
- ╚═════╝ ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
+ ██████╗ ███╗   ███╗ ██████╗ 
+██╔═══██╗████╗ ████║██╔═══██╗
+██║   ██║██╔████╔██║██║   ██║
+██║   ██║██║╚██╔╝██║██║   ██║
+╚██████╔╝██║ ╚═╝ ██║╚██████╔╝
+ ╚═════╝ ╚═╝     ╚═╝ ╚═════╝ 
    G  A  T  E  W  A  Y
 ```
 
-**The Rust-native AI agent gateway that replaces your entire Python fleet.**
+**High-performance, Zero-GC Discord Multiplexer Gateway for OMO (oh-my-openagent) in 100% Rust.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.78+-f74c00?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tokio](https://img.shields.io/badge/Tokio-Async_Runtime-232f3e?style=flat-square&logo=rust&logoColor=white)](https://tokio.rs/)
@@ -21,242 +21,183 @@
 
 ---
 
-### The 10× Rust Advantage
+### The Native Discord Bridge for OMO
 
-One **~20 MB binary**. Dozens of Discord bots. Sub-millisecond session routing.<br/>
-No GIL. No garbage collector latency spikes. No 500 MB idle memory tax per bot.<br/>
-Just pure, lock-free, zero-copy, Tokio-powered throughput.
+**OMO Gateway** is a dedicated, ultra-fast Rust gateway that bridges **OMO (oh-my-openagent)** directly to Discord.<br/>
+It multiplexes thousands of concurrent channels, threads, and DMs with sub-millisecond routing, multi-bot sharding, scale-to-zero memory reclamation, and sandboxed tool execution.
 
 </div>
 
 ---
 
-## ⚡ Why Omon Exists
+## ⚡ Why OMO Gateway?
 
-Traditional AI agent gateways — built in Python or Node — hit a wall:
+**OMO (oh-my-openagent)** provides autonomous agent intelligence, deep planning, and subagent orchestration. However, running AI agents directly against Discord's WebSocket APIs creates operational bottlenecks:
 
-| Pain Point | Root Cause |
-|---|---|
-| **GIL contention** | One bot blocks all others in-process |
-| **500 MB+ idle memory** | Heavy runtimes, fat dependency trees |
-| **GC latency spikes** | Unpredictable pauses during live streaming |
-| **Fragile session routing** | Manual sticky sessions, Redis duct-tape |
-| **Deployment sprawl** | One container per bot × N bots = Kubernetes nightmares |
+- **Heavy Idle Memory**: Running individual Discord connections per agent consumes hundreds of megabytes.
+- **Concurrency & Rate Limits**: Managing token streaming across many channels triggers Discord rate-limit bans without centralized debouncing.
+- **Multi-Bot Management**: Running multiple bot identities requires running multiple redundant runtime instances.
 
-**Omon Gateway** is the single compiled artifact that replaces all of it.
+**OMO Gateway solves this** by acting as a high-throughput, pure-Rust I/O multiplexer sitting between Discord and OMO.
 
 ---
 
-## 🏗️ System Architecture
+## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          DISCORD GATEWAY v10                                 │
-│                    (Shards 0..N per bot identity)                            │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    SESSION MULTIPLEXER & DELIVERY LEDGER                     │
-│                                                                             │
-│   ┌───────────────┐   ┌───────────────────────┐   ┌──────────────────┐    │
-│   │  Lock-Free    │   │  Sliding-Window Rate  │   │  SQLite WAL      │    │
-│   │  DashMap      │──▶│  Limit Debouncer      │──▶│  Context Store   │    │
-│   │  (Sessions)   │   │  (per-channel)        │   │  (Scale-to-Zero) │    │
-│   └───────────────┘   └───────────────────────┘   └──────────────────┘    │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       TOKIO ACTOR WORKER POOL                                │
-│                                                                             │
-│   ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐       │
-│   │wawabot  │  │ silphy  │  │  eris   │  │ bot_N   │  │ bot_N+1 │       │
-│   │ Actor   │  │ Actor   │  │ Actor   │  │ Actor   │  │ Actor   │       │
-│   └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘       │
-│        └─────────────┴─────────────┴─────────────┴─────────────┘           │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        AGENT ENGINE & NATIVE TOOLS                           │
-│                                                                             │
-│   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐   │
-│   │ Terminal │ │ File I/O │ │ Browser  │ │Web Search│ │  MCP Client  │   │
-│   │  (PTY)  │ │  (CRUD)  │ │(CDP:9333)│ │(Jina/DDG)│ │ (stdio/SSE)  │   │
-│   └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────────┘   │
-│   ┌──────────────────────┐ ┌──────────────────────────────────────────┐   │
-│   │  Cron Scheduler      │ │  140+ Auto-Discovered Skills             │   │
-│   │  (SQLite-backed)     │ │  (Dynamic tool registry)                 │   │
-│   └──────────────────────┘ └──────────────────────────────────────────┘   │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      LIVE STREAM EGRESS                                      │
-│                                                                             │
-│   ┌───────────────────┐  ┌────────────────────┐  ┌─────────────────────┐  │
-│   │ Markdown-Aware    │  │ Action Row Buttons │  │  Voice (Songbird)   │  │
-│   │ 2000-char Chunked │  │ [Approve] [Reject] │  │  Opus/PCM Streaming │  │
-│   │ Streaming         │  │ Interactive UX     │  │  Ultra Low-Latency  │  │
-│   └───────────────────┘  └────────────────────┘  └─────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
+[ Discord Ingress: DMs / Server Channels / Threads / Voice ]
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    OMO GATEWAY (Pure Rust)                  │
+│                                                             │
+│  ┌─────────────────────────┐   ┌─────────────────────────┐  │
+│  │   Session Multiplexer   │   │     Delivery Ledger     │  │
+│  │   (Lock-Free DashMap)   │   │  (SQLite WAL Idempotent)│  │
+│  └────────────┬────────────┘   └─────────────────────────┘  │
+│               │                                             │
+│               ▼                                             │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │       Bounded Actor Worker Pool (tokio::task)         │  │
+│  │     - Scale-to-Zero GC (Idle Session Eviction)        │  │
+│  │     - Multi-Bot Sharding (N Bots in 1 Binary)         │  │
+│  └────────────────────────────┬──────────────────────────┘  │
+└───────────────────────────────┼─────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   OMO AGENT EXECUTION ENGINE                │
+│                                                             │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  LLM Streaming & Tool-Call Loop (OpenAI/Anthropic/...)│  │
+│  └────────────────────────────┬──────────────────────────┘  │
+│                               │                             │
+│  ┌────────────────────────────┴──────────────────────────┐  │
+│  │ Native Tools: PTY Terminal / File CRUD / MCP / Web    │  │
+│  │ Dedicated Workspace Isolation (~/.omon/workspace)     │  │
+│  └───────────────────────────────────────────────────────┘  │
+└───────────────────────────────┬─────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    DISCORD RESPONSE EGRESS                  │
+│  - Live-Edit Debounced Streaming (800ms sliding window)     │
+│  - Interactive Smart Approvals ([Approve] / [Reject] UI)    │
+│  - Songbird Real-Time Voice Audio Pipeline (Opus / PCM)     │
+│  - Scheduled Cron Event Push Dispatch                       │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 📊 Comparison
+## ✨ Key Features
 
-| Dimension | **Omon Gateway (Rust)** | Traditional Gateways (Python) |
-|---|---|---|
-| **Idle Memory / Bot** | ~8 MB | 500+ MB |
-| **Binary Size** | ~20 MB (single static) | 2+ GB (venv + deps) |
-| **Session Routing** | Lock-free DashMap, <1ms | Redis/sticky-session, 5-15ms |
-| **GC Pauses** | **None** (ownership model) | 10-100ms stop-the-world |
-| **Concurrent Bots** | Dozens in one process | One per process/container |
-| **Live Streaming** | Zero-copy chunked egress | Buffered, GC-interrupted |
-| **Context Eviction** | Automatic SQLite WAL flush | Manual / memory leak |
-| **Voice Support** | Native Songbird + Opus | Third-party, high latency |
-| **Tool Execution** | In-process PTY + sandbox | Subprocess + IPC overhead |
-| **Cold Start** | < 50ms | 3-10 seconds |
-| **Deployment** | `docker pull` → done | Dockerfile + pip + prayers |
+- ⚡ **Lock-Free Session Multiplexing**: Routes messages across servers, threads, and DMs using composite session keys `(platform, guild_id, channel_id, thread_id, user_id)` with zero lock contention.
+- 🤖 **Multi-Bot Parallel Sharding**: Run and control multiple Discord bot identities simultaneously from a single compiled ~20MB binary.
+- 📉 **Scale-to-Zero GC**: Inactive sessions automatically flush their state to SQLite and evict worker tasks, reducing idle memory footprint to near zero.
+- 🎙️ **Songbird Discord Voice**: Stream bidirectional Opus/PCM audio directly in Discord voice channels.
+- ⏰ **Autonomous Cron Engine**: Persistent SQLite scheduler that triggers background agent prompt runs and command executions, pushing results directly to designated Discord channels.
+- 🛠️ **Native Tool Suite**:
+  - **PTY Terminal**: Execute commands in an isolated workspace (`~/.omon/workspace`).
+  - **File Tools**: Sandboxed file read, write, and directory inspection.
+  - **Browser & Web**: Chrome CDP control (port 9333), live web search, and text extraction.
+  - **Model Context Protocol (MCP)**: Connect to external tools via stdio and SSE.
+- 🛡️ **Smart Approval Guard**: Interactively request user confirmation in Discord via button components before running dangerous shell commands.
 
 ---
 
-## 🧱 Core Pillars
+## 🔄 Hermes to OMO Gateway Migration Guide (for LLMs & Automations)
 
-### 🔀 Sub-Millisecond Session Multiplexing
+If you are migrating an existing **Hermes Agent** installation to **OMO Gateway**, follow this automated recipe.
 
-Lock-free `DashMap` routes every incoming Discord event to the correct actor in under 1ms. No mutexes. No contention. No Redis hop.
+### 1. Configuration Mapping
 
-### 🤖 Multi-Bot Sharding
+| Hermes Location | Hermes Key | OMO Gateway `.env` Key | Example Value |
+|---|---|---|---|
+| `~/.hermes/.env` | `DISCORD_BOT_TOKEN` | `DISCORD_BOT_TOKEN` | `MTQ2...` |
+| `~/.hermes/profiles/*/.env` | `DISCORD_BOT_TOKEN` | `DISCORD_BOT_TOKENS` | `token1,token2,token3` |
+| `~/.hermes/.env` | `DISCORD_ALLOWED_USERS` | `DISCORD_ALLOWED_USERS` | `414011632306618368` |
+| `~/.hermes/.env` | `DISCORD_FREE_RESPONSE_CHANNELS` | `DISCORD_FREE_RESPONSE_CHANNELS` | `1474213245014376569` |
+| `~/.hermes/config.yaml` | `model.default` | `DEFAULT_MODEL` | `gpt-4o` / `gpt-5.6-luna` |
+| `~/.hermes/config.yaml` | `model.base_url` / `providers.*.api` | `OPENAI_API_BASE` | `http://127.0.0.1:8317/v1` |
+| `~/.hermes/config.yaml` | `model.api_key` / `providers.*.api_key` | `OPENAI_API_KEY` | `your-api-key` |
+| `~/.hermes/config.yaml` | `approvals.mode` | `APPROVAL_MODE` | `smart` |
 
-Run `wawabot`, `silphy`, `eris`, and dozens more simultaneously — all inside one compiled binary. Each bot is a lightweight Tokio task, not a heavyweight OS process.
+### 2. Multi-Bot Sharding Migration
+In Hermes, multiple bot profiles (`advisor`, `marketer`, etc.) required running separate Python daemon processes.
+In **OMO Gateway**, simply join all tokens with commas in `DISCORD_BOT_TOKENS`:
+```bash
+DISCORD_BOT_TOKENS="primary_bot_token,advisor_bot_token,marketer_bot_token"
+```
+OMO Gateway will automatically launch distinct gateway shards inside a single Tokio runtime.
 
-### 🧊 Scale-to-Zero GC
+### 3. Automated Cron Jobs Synchronization
+Hermes stores scheduled jobs in `~/.hermes/cron/jobs.json` and `~/.hermes/profiles/*/cron/jobs.json`.
+OMO Gateway includes `HermesStoreSynchronizer`:
+- On startup, OMO Gateway automatically reads and imports all Hermes cron jobs into its persistent SQLite database (`cron_jobs` table).
+- Both `prompt` jobs (which execute through the full agent LLM and tool-call loop) and `script` jobs are fully supported and dispatched to their target Discord channels (`deliver`/`origin`).
 
-Idle sessions automatically flush their context to **SQLite WAL** and release memory. Configurable timeout. Zero manual intervention. Your 3 AM memory graph stays flat.
-
-### 💬 Full Discord UX
-
-- **Markdown-aware** live streaming with intelligent 2000-character boundary splitting
-- **Sliding-window rate limit debounce** — never hit 429 again
-- **Interactive Action Rows**: `[Approve]` / `[Reject]` buttons for human-in-the-loop workflows
-- **Slash commands** with full registration lifecycle
-
-### ⏰ Autonomous Cron Engine
-
-Persistent SQLite-backed scheduler. Define agent-powered prompt workflows or script executions on any cron expression. Survives restarts. No external scheduler required.
-
-### 🛠️ Native Tool Ecosystem
-
-| Tool | Capability |
-|---|---|
-| **Terminal** | PTY execution with per-workspace sandboxing |
-| **File I/O** | Full CRUD with path safety enforcement |
-| **Browser** | Chrome CDP control on port 9333 |
-| **Web Search** | Jina Reader + DuckDuckGo fallback |
-| **Web Fetch** | Raw HTTP with automatic readability extraction |
-| **MCP Client** | Model Context Protocol over stdio and SSE |
-| **Skills** | 140+ auto-discovered, dynamically registered |
-
-### 🎙️ Ultra Low-Latency Voice
-
-Discord voice channel integration via **Songbird**. Opus and PCM audio streaming with minimal jitter buffer. Real-time voice AI without third-party bridges.
+### 4. Workspace & Skills Migration
+- **Workspace**: OMO Gateway isolates tool execution under `~/.omon/workspace` (configurable via `OMON_WORKSPACE_ROOT`).
+- **Skills**: OMO Gateway automatically scans both `~/.hermes/skills/` and `~/.omon/skills/` for `SKILL.md` bundles.
 
 ---
 
-## 🚀 60-Second Quickstart
+## 🚀 Quickstart
 
-### Option A: Cargo (from source)
+### 1. Build and Run from Source
 
 ```bash
-# Clone
-git clone https://github.com/your-org/omon-gateway.git
+# Clone the repository
+git clone https://github.com/Indosaram/omon-gateway.git
 cd omon-gateway
 
-# Configure
+# Configure environment
 cp .env.example .env
-# Edit .env with your bot tokens and API keys
+# Edit .env with your Discord bot tokens and LLM endpoint
 
-# Build & Run
+# Build and run optimized release binary
 cargo run --release
 ```
 
-### Option B: Docker Compose (recommended)
-
-```yaml
-# docker-compose.yml
-version: "3.9"
-services:
-  omon:
-    image: ghcr.io/your-org/omon-gateway:latest
-    restart: unless-stopped
-    env_file: .env
-    volumes:
-      - ./data:/app/data        # SQLite persistence
-      - ./workspaces:/app/ws    # Tool sandboxes
-    ports:
-      - "9333:9333"             # Chrome CDP (optional)
-```
+### 2. Run with Docker Compose
 
 ```bash
 docker compose up -d
-# That's it. All bots are live.
 ```
 
----
-
-## ⚙️ Configuration Cheatsheet
-
-| Variable | Description | Default |
-|---|---|---|
-| `DISCORD_TOKENS` | Comma-separated bot tokens | *required* |
-| `DISCORD_BOT_NAMES` | Matching comma-separated bot names | *required* |
-| `LLM_API_URL` | OpenAI-compatible endpoint | `https://api.openai.com/v1` |
-| `LLM_API_KEY` | API key for the LLM provider | *required* |
-| `LLM_MODEL` | Model identifier | `gpt-4o` |
-| `SESSION_TIMEOUT_SECS` | Idle session eviction timeout | `300` |
-| `SQLITE_PATH` | Path to SQLite database file | `./data/omon.db` |
-| `CHROME_CDP_PORT` | Chrome DevTools Protocol port | `9333` |
-| `CRON_ENABLED` | Enable autonomous cron engine | `true` |
-| `VOICE_ENABLED` | Enable Songbird voice integration | `false` |
-| `MCP_SERVERS` | JSON array of MCP server configs | `[]` |
-| `LOG_LEVEL` | Tracing filter directive | `info` |
-| `RATE_LIMIT_WINDOW_MS` | Sliding window size for debounce | `1000` |
-| `MAX_CONCURRENT_SESSIONS` | Per-bot session ceiling | `100` |
-
----
-
-## 🤝 Contributing
-
-We welcome contributions of all kinds — bug fixes, new tools, performance improvements, documentation.
+### 3. Run as macOS Background Service (LaunchAgent)
 
 ```bash
-# Run tests
-cargo test
+# Build release binary
+cargo build --release --bin omon-gateway
 
-# Run with debug logging
-RUST_LOG=debug cargo run
-
-# Format & lint
-cargo fmt && cargo clippy -- -D warnings
+# Install LaunchAgent
+cp ai.omon.gateway.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 ```
 
-Please open an issue before starting large features. All PRs should include tests where applicable.
+---
+
+## ⚙️ Configuration Reference
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `DISCORD_BOT_TOKEN` | Required | Primary Discord Bot Token |
+| `DISCORD_BOT_TOKENS` | Optional | Comma-separated tokens for Multi-Bot sharding |
+| `DISCORD_ALLOWED_USERS` | Optional | Allowed Discord user IDs (empty allows all) |
+| `DISCORD_FREE_RESPONSE_CHANNELS` | Optional | Channels where the bot responds without @mention |
+| `DEFAULT_MODEL` | `gpt-4o` | Default LLM model identifier |
+| `OPENAI_API_BASE` | `https://api.openai.com/v1` | OpenAI-compatible endpoint URL |
+| `OPENAI_API_KEY` | Optional | OpenAI API key |
+| `ANTHROPIC_BASE_URL` | Optional | Anthropic Messages endpoint URL |
+| `ANTHROPIC_API_KEY` | Optional | Anthropic API key |
+| `DATABASE_URL` | `sqlite://omon_gateway.db` | SQLite database path (WAL mode) |
+| `OMON_WORKSPACE_ROOT` | `~/.omon/workspace` | Dedicated sandboxed working directory |
+| `APPROVAL_MODE` | `smart` | `smart` (button approval) or `yolo` (auto-execute) |
 
 ---
 
-## 📄 License
+## 📜 License
 
-MIT © Omon Contributors
-
----
-
-<div align="center">
-
-**Built with 🦀 Rust, ⚡ Tokio, and zero patience for GC pauses.**
-
-[Report Bug](../../issues) · [Request Feature](../../issues) · [Discussions](../../discussions)
-
-</div>
+Licensed under the [Apache License 2.0](LICENSE).
