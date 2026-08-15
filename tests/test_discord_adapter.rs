@@ -1,15 +1,23 @@
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use omon_gateway::discord::adapter::{message_to_inbound, message_to_inbound_with_config};
 use omon_gateway::discord::commands::is_user_allowed;
 use omon_gateway::{
-    chunk_markdown, render_user_prompt, ApprovalDecision, ApprovalError, Database,
-    DeliveryLedgerService, DiscordMessageTransport, InboundEvent, LiveEditThrottler,
-    MessageAttachment, Result, SessionKey, SmartApprovalGuard,
+    chunk_markdown, render_user_prompt, ApprovalDecision, ApprovalError, AttachmentDownloader,
+    ChatMessage, Database, DeliveryLedgerService, DiscordEgress, DiscordFileUploader,
+    DiscordMessageTransport, InboundEvent, LiveEditThrottler, LlmClient, LlmConfig, LlmProvider,
+    MessageAttachment, OutboundAction, OutboundDispatcher, Result, SessionKey, SmartApprovalGuard,
+    DISCORD_ATTACHMENT_MAX_BYTES,
 };
 use serenity::all::{ChannelId, ChannelType, Message, MessageId, UserId};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +61,24 @@ impl DiscordMessageTransport for MockTransport {
 
     async fn delete_message(&self, _channel_id: ChannelId, message_id: MessageId) -> Result<()> {
         self.calls.lock().await.push(Call::Delete(message_id));
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct MockFileUploader {
+    calls: Mutex<Vec<(ChannelId, PathBuf)>>,
+}
+
+#[async_trait]
+impl DiscordFileUploader for MockFileUploader {
+    async fn upload(
+        &self,
+        _http: Arc<serenity::http::Http>,
+        channel: ChannelId,
+        path: &Path,
+    ) -> Result<()> {
+        self.calls.lock().await.push((channel, path.to_owned()));
         Ok(())
     }
 }
@@ -221,6 +247,7 @@ fn converts_serenity_dm_mentions_threads_and_attachments() {
         event.attachments[0].content_type.as_deref(),
         Some("text/x-rust")
     );
+    assert_eq!(event.attachments[0].local_path, None);
 
     let ignored = message_fixture(Some(9), "ordinary channel message", Vec::new());
     assert!(message_to_inbound(&ignored, bot_id, Some(ChannelType::Text)).is_none());
@@ -351,6 +378,7 @@ fn renders_complete_attachment_context_for_attachment_only_turns() {
         url: "https://cdn.example/main.rs".into(),
         content_type: Some("text/x-rust".into()),
         size_bytes: Some(24),
+        local_path: None,
     }]);
 
     assert_eq!(
@@ -360,10 +388,198 @@ fn renders_complete_attachment_context_for_attachment_only_turns() {
 }
 
 #[test]
+fn renders_downloaded_attachment_local_path() {
+    let local_path = PathBuf::from("/tmp/omon/main.png");
+    let event = InboundEvent::message(
+        SessionKey::new("discord", Some("9"), "7", None::<String>, "10"),
+        "8",
+        "inspect",
+    )
+    .with_attachments(vec![MessageAttachment {
+        id: "11".into(),
+        filename: "main.png".into(),
+        url: "https://cdn.example/main.png".into(),
+        content_type: Some("image/png".into()),
+        size_bytes: Some(24),
+        local_path: Some(local_path.clone()),
+    }]);
+
+    let prompt = render_user_prompt(&event);
+    assert!(prompt.starts_with("inspect\n\n[Attachment: main.png"));
+    assert!(prompt.contains(&format!("local path: {}", local_path.display())));
+}
+
+#[tokio::test]
+async fn downloads_discord_attachment_once_and_reuses_cache() {
+    let workspace = test_workspace("download-cache");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let body = b"cached-image-bytes".to_vec();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let (url, server) = spawn_single_response_server(body.clone(), request_count.clone()).await;
+    let downloader = AttachmentDownloader::new(&workspace).unwrap();
+    let attachment = MessageAttachment {
+        id: "attachment/11".into(),
+        filename: "../capture.png".into(),
+        url,
+        content_type: Some("image/png".into()),
+        size_bytes: Some(body.len() as u64),
+        local_path: None,
+    };
+
+    let first = downloader.download_attachment(&attachment).await.unwrap();
+    server.await.unwrap();
+    let second = downloader.download_attachment(&attachment).await.unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(std::fs::read(&first).unwrap(), body);
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    assert!(first.starts_with(std::fs::canonicalize(&workspace).unwrap()));
+    assert_eq!(first.parent(), Some(downloader.attachment_root()));
+    assert!(!first.to_string_lossy().contains(".."));
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn rejects_discord_attachment_over_size_limit_before_network() {
+    let workspace = test_workspace("size-limit");
+    let downloader = AttachmentDownloader::new(&workspace).unwrap();
+    let attachment = MessageAttachment {
+        id: "11".into(),
+        filename: "large.bin".into(),
+        url: "http://127.0.0.1:1/never-requested".into(),
+        content_type: Some("application/octet-stream".into()),
+        size_bytes: Some(DISCORD_ATTACHMENT_MAX_BYTES + 1),
+        local_path: None,
+    };
+
+    let error = downloader
+        .download_attachment(&attachment)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("25 MB"));
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn encodes_supported_images_as_openai_and_anthropic_vision_blocks() {
+    let workspace = test_workspace("vision");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let formats = [
+        ("png", "image/png", b"png-bytes".as_slice()),
+        ("jpg", "image/jpeg", b"jpeg-bytes".as_slice()),
+        ("webp", "image/webp", b"webp-bytes".as_slice()),
+        ("gif", "image/gif", b"gif-bytes".as_slice()),
+    ];
+    let mut attachments = Vec::new();
+    for (index, (extension, media_type, bytes)) in formats.iter().enumerate() {
+        let path = workspace.join(format!("image-{index}.{extension}"));
+        std::fs::write(&path, bytes).unwrap();
+        attachments.push(MessageAttachment {
+            id: index.to_string(),
+            filename: path.file_name().unwrap().to_string_lossy().into_owned(),
+            url: format!("https://cdn.example/image-{index}.{extension}"),
+            content_type: Some((*media_type).into()),
+            size_bytes: Some(bytes.len() as u64),
+            local_path: Some(path),
+        });
+    }
+    let message = ChatMessage::new("user", "inspect these").with_attachments(attachments.clone());
+
+    let openai = LlmClient::new(LlmConfig::new(LlmProvider::OpenAi, "gpt-test")).unwrap();
+    let openai_payload = openai.build_payload(std::slice::from_ref(&message), &[]);
+    let openai_content = openai_payload["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(openai_content[0]["type"], "text");
+    assert_eq!(openai_content.len(), formats.len() + 1);
+    for (index, (_, media_type, bytes)) in formats.iter().enumerate() {
+        assert_eq!(openai_content[index + 1]["type"], "image_url");
+        assert_eq!(
+            openai_content[index + 1]["image_url"]["url"],
+            format!("data:{media_type};base64,{}", BASE64_STANDARD.encode(bytes))
+        );
+    }
+
+    let anthropic = LlmClient::new(LlmConfig::new(LlmProvider::Anthropic, "claude-test")).unwrap();
+    let anthropic_payload = anthropic.build_payload(&[message], &[]);
+    let anthropic_content = anthropic_payload["messages"][0]["content"]
+        .as_array()
+        .unwrap();
+    assert_eq!(anthropic_content.len(), formats.len() + 1);
+    for (index, (_, media_type, bytes)) in formats.iter().enumerate() {
+        assert_eq!(anthropic_content[index]["type"], "image");
+        assert_eq!(anthropic_content[index]["source"]["type"], "base64");
+        assert_eq!(
+            anthropic_content[index]["source"]["media_type"],
+            *media_type
+        );
+        assert_eq!(
+            anthropic_content[index]["source"]["data"],
+            BASE64_STANDARD.encode(bytes)
+        );
+    }
+    assert_eq!(anthropic_content[formats.len()]["type"], "text");
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn discord_egress_dispatches_upload_file_to_target_channel() {
+    let workspace = test_workspace("upload");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let path = workspace.join("report.txt");
+    std::fs::write(&path, b"report").unwrap();
+    let uploader = Arc::new(MockFileUploader::default());
+    let egress = DiscordEgress::new(Arc::new(serenity::http::Http::new("test-token")))
+        .with_file_uploader(uploader.clone());
+    let session = SessionKey::new("discord", Some("9"), "7", None::<String>, "10");
+
+    egress
+        .dispatch(OutboundAction::UploadFile {
+            session,
+            path: path.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *uploader.calls.lock().await,
+        vec![(ChannelId::new(7), path)]
+    );
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
 fn slash_authorization_defaults_open_and_enforces_allowlist() {
     assert!(is_user_allowed(&[], 10));
     assert!(is_user_allowed(&[10, 11], 10));
     assert!(!is_user_allowed(&[10, 11], 12));
+}
+
+fn test_workspace(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("omon-discord-{label}-{}", uuid::Uuid::new_v4()))
+}
+
+async fn spawn_single_response_server(
+    body: Vec<u8>,
+    request_count: Arc<AtomicUsize>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 2048];
+        let _ = socket.read(&mut request).await.unwrap();
+        request_count.fetch_add(1, Ordering::SeqCst);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    (format!("http://{address}/attachment"), handle)
 }
 
 fn message_fixture(guild_id: Option<u64>, content: &str, mentions: Vec<u64>) -> Message {

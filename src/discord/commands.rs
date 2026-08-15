@@ -4,6 +4,7 @@ use poise::serenity_prelude as serenity;
 use sqlx::SqlitePool;
 
 use super::approval::SmartApprovalGuard;
+use super::attachments::AttachmentDownloader;
 use crate::{OmonError, SessionKey, SessionMultiplexer};
 
 pub type CommandError = Box<dyn std::error::Error + Send + Sync>;
@@ -20,6 +21,7 @@ pub struct PoiseData {
     pub free_response_channels: Vec<u64>,
     pub allowed_users: Vec<u64>,
     pub primary_bot_id: Option<u64>,
+    pub attachment_downloader: Option<AttachmentDownloader>,
     pub tool_registry: crate::ToolRegistry,
 }
 
@@ -43,6 +45,7 @@ impl PoiseData {
             free_response_channels: Vec::new(),
             allowed_users: Vec::new(),
             primary_bot_id: None,
+            attachment_downloader: None,
             tool_registry: crate::ToolRegistry::new(),
         }
     }

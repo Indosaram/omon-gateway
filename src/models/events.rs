@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -11,6 +13,8 @@ pub struct MessageAttachment {
     pub url: String,
     pub content_type: Option<String>,
     pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,14 +41,20 @@ pub fn render_user_prompt(event: &InboundEvent) -> String {
         .attachments
         .iter()
         .map(|attachment| {
+            let local = attachment
+                .local_path
+                .as_ref()
+                .map(|path| format!(" | local path: {}", path.display()))
+                .unwrap_or_default();
             format!(
-                "[Attachment: {} ({}, {} bytes) - {}]",
+                "[Attachment: {} ({}, {} bytes) - {}{}]",
                 attachment.filename,
                 attachment.content_type.as_deref().unwrap_or("unknown"),
                 attachment
                     .size_bytes
                     .map_or_else(|| "unknown".to_owned(), |size| size.to_string()),
-                attachment.url
+                attachment.url,
+                local
             )
         })
         .collect::<Vec<_>>()
@@ -109,6 +119,10 @@ pub enum OutboundAction {
         session: SessionKey,
         platform_message_id: String,
     },
+    UploadFile {
+        session: SessionKey,
+        path: PathBuf,
+    },
     Stream {
         session: SessionKey,
         chunk: StreamChunk,
@@ -125,6 +139,8 @@ pub enum OutboundAction {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use uuid::Uuid;
 
     use super::{InboundEvent, MessageAttachment, OutboundAction, StreamChunk};
@@ -142,6 +158,7 @@ mod tests {
             url: "https://cdn.example/notes.txt".into(),
             content_type: Some("text/plain".into()),
             size_bytes: Some(42),
+            local_path: Some(PathBuf::from("/workspace/attachments/notes.txt")),
         };
         let event = InboundEvent::message(session(), "message-1", "hello")
             .with_attachments(vec![attachment.clone()]);

@@ -9,12 +9,12 @@ use futures_util::StreamExt;
 use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
-    render_user_prompt, AgentRunner, ApprovalPolicy, ChatMessage, CronJob, CronScheduler,
-    CronTaskExecutor, CronTool, DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool,
-    HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool,
-    MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher, PoiseData,
-    Result, ScaleToZero, SessionContext, SessionKey, SessionMultiplexer, SmartApprovalGuard,
-    TerminalTool, ToolDefinition, ToolRegistry,
+    render_user_prompt, AgentRunner, ApprovalPolicy, AttachmentDownloader, ChatMessage, CronJob,
+    CronScheduler, CronTaskExecutor, CronTool, DiscordAdapter, DiscordApprovalRequester,
+    DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient,
+    LlmConfig, LlmProvider, McpTool, MemoryStore, MultiplexerConfig, OmonError, OutboundAction,
+    OutboundDispatcher, PoiseData, Result, ScaleToZero, SessionContext, SessionKey,
+    SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -355,11 +355,15 @@ impl LiveAgentRunner {
             user_content = format!("{}{}", user_content, ulw_directive);
         }
 
-        if !messages
-            .iter()
-            .any(|message| message.role == "user" && message.content == user_content)
+        let attachments = event.attachments.clone();
+        if let Some(message) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role == "user" && message.content == user_content)
         {
-            messages.push(ChatMessage::new("user", &user_content));
+            message.attachments = attachments;
+        } else {
+            messages.push(ChatMessage::new("user", &user_content).with_attachments(attachments));
         }
         ensure_agent_session(&self.pool, session).await?;
         let tools = execution_tools.unwrap_or(&self.tools);
@@ -1033,6 +1037,7 @@ async fn run_gateway() -> Result<()> {
     poise_data.tool_registry = tools.clone();
     poise_data.free_response_channels = config.free_response_channels.clone();
     poise_data.allowed_users = config.allowed_users.clone();
+    poise_data.attachment_downloader = Some(AttachmentDownloader::new(&config.workspace_root)?);
     poise_data.primary_bot_id = Some(default_bot_id.parse().map_err(|_| {
         OmonError::Config(format!(
             "invalid primary Discord bot identity {default_bot_id}"

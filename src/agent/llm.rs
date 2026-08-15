@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::{OmonError, StreamChunk};
+use crate::{MessageAttachment, OmonError, StreamChunk};
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, OmonError>> + Send>>;
 
@@ -48,6 +49,8 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -58,9 +61,15 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: content.into(),
+            attachments: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
+    }
+
+    pub fn with_attachments(mut self, attachments: Vec<MessageAttachment>) -> Self {
+        self.attachments = attachments;
+        self
     }
 }
 
@@ -249,7 +258,11 @@ impl LlmClient {
         tools: &[ToolDefinition],
         ollama: bool,
     ) -> Value {
-        let messages: Vec<Value> = messages.iter().map(openai_message).collect();
+        let include_vision = self.config.provider == LlmProvider::OpenAi && !ollama;
+        let messages: Vec<Value> = messages
+            .iter()
+            .map(|message| openai_message(message, include_vision))
+            .collect();
         let tools: Vec<Value> = tools
             .iter()
             .map(|tool| {
@@ -323,8 +336,28 @@ impl LlmClient {
     }
 }
 
-fn openai_message(message: &ChatMessage) -> Value {
-    let mut value = json!({"role": message.role, "content": message.content});
+fn openai_message(message: &ChatMessage, include_vision: bool) -> Value {
+    let images = if include_vision && message.role == "user" {
+        message
+            .attachments
+            .iter()
+            .filter_map(openai_image_block)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let content = if images.is_empty() {
+        Value::String(message.content.clone())
+    } else {
+        let mut content =
+            Vec::with_capacity(images.len() + usize::from(!message.content.is_empty()));
+        if !message.content.is_empty() {
+            content.push(json!({"type": "text", "text": message.content}));
+        }
+        content.extend(images);
+        Value::Array(content)
+    };
+    let mut value = json!({"role": message.role, "content": content});
     if !message.tool_calls.is_empty() {
         value["tool_calls"] = Value::Array(
             message
@@ -346,6 +379,9 @@ fn openai_message(message: &ChatMessage) -> Value {
 
 fn anthropic_message(message: &ChatMessage) -> Value {
     let mut content = Vec::new();
+    if message.role == "user" {
+        content.extend(message.attachments.iter().filter_map(anthropic_image_block));
+    }
     if !message.content.is_empty() {
         content.push(json!({"type": "text", "text": message.content}));
     }
@@ -356,6 +392,68 @@ fn anthropic_message(message: &ChatMessage) -> Value {
         content.push(json!({"type": "tool_result", "tool_use_id": id, "content": message.content}));
     }
     json!({"role": message.role, "content": content})
+}
+
+fn openai_image_block(attachment: &MessageAttachment) -> Option<Value> {
+    let (media_type, data) = encoded_image(attachment)?;
+    Some(json!({
+        "type": "image_url",
+        "image_url": {
+            "url": format!("data:{media_type};base64,{data}")
+        }
+    }))
+}
+
+fn anthropic_image_block(attachment: &MessageAttachment) -> Option<Value> {
+    let (media_type, data) = encoded_image(attachment)?;
+    Some(json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": data
+        }
+    }))
+}
+
+fn encoded_image(attachment: &MessageAttachment) -> Option<(&'static str, String)> {
+    let media_type = image_media_type(attachment)?;
+    let path = attachment.local_path.as_ref()?;
+    let bytes = std::fs::read(path).ok()?;
+    Some((media_type, BASE64_STANDARD.encode(bytes)))
+}
+
+fn image_media_type(attachment: &MessageAttachment) -> Option<&'static str> {
+    let content_type = attachment
+        .content_type
+        .as_deref()
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+    match content_type.as_deref() {
+        Some("image/png") => Some("image/png"),
+        Some("image/jpeg" | "image/jpg") => Some("image/jpeg"),
+        Some("image/webp") => Some("image/webp"),
+        Some("image/gif") => Some("image/gif"),
+        _ => {
+            let path = attachment
+                .local_path
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(&attachment.filename));
+            match path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("png") => Some("image/png"),
+                Some("jpg" | "jpeg") => Some("image/jpeg"),
+                Some("webp") => Some("image/webp"),
+                Some("gif") => Some("image/gif"),
+                _ => None,
+            }
+        }
+    }
 }
 
 #[derive(Default)]

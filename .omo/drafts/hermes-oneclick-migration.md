@@ -5,20 +5,20 @@ intent: clear
 review_required: true
 plan_path: .omo/plans/hermes-oneclick-migration.md
 plan_sha256: null
-review_round_id: null
+review_round_id: momus-r4
 review_round_limit: 5
-pending-action: write and review .omo/plans/hermes-oneclick-migration.md
+pending-action: deliver (approved)
 review:
   momus:
-    status: pending
-    workspace_root: null
+    status: approved
+    workspace_root: /Users/indo/code/project/omon-gateway
     runtime_home: null
     target: .omo/plans/hermes-oneclick-migration.md
-    round_id: null
+    round_id: momus-r4
     plan_sha256: null
-    launch_id: null
-    session: null
-    result: null
+    launch_id: st_01a00595
+    session: st_01a00595
+    result: OKAY - all references valid, every task has executable QA, no blocking contradictions (rounds 1-3 rejected: mis-cited line refs, dry-run/sync contradiction, missing verifier QA - all fixed).
 approach: >
   Add a first-class `migrate` subcommand to the omon-gateway Rust binary that (1) imports
   Hermes config (~/.hermes/.env + config.yaml + per-profile) into omon-gateway .env, (2)
@@ -76,5 +76,11 @@ approach: >
 See brief - 6 forks: (A) CLI-subcommand vs shell script, (B) cutover trigger/safety, (C) existing-.env behavior, (D) launchd scope, (E) APPROVAL_MODE wire vs remove, (F) test strategy.
 
 ## Approval gate
-status: awaiting-approval
-Approach recorded in frontmatter. Post-approval: write plan -> metis gap analysis -> momus high-accuracy review (default-on) -> deliver. Next action: write and review .omo/plans/hermes-oneclick-migration.md.
+status: approved
+Approved 2026-08-15 (no users; compat may break; most fundamental direction). Plan written to .omo/plans/hermes-oneclick-migration.md.
+
+## Review/advisory state
+- architect advisory (st_01a0056d): FAILED - anthropic OAuth refresh (invalid_grant). Skipped; not blocking (advisory-only).
+- ultrabrain advisory (st_01a0056e): running - config mapping / cron-delete / launchd cutover edge cases; fold into plan before momus.
+- metis gap analysis (st_01a00575): FAILED - 429 monthly usage limit. Mandatory step unavailable this session; note to user; not fabricated.
+- momus high-accuracy review: PENDING - run after folding ultrabrain, on the complete plan. May also be limit-blocked; if so, report honestly.

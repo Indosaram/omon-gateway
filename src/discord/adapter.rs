@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use poise::serenity_prelude as serenity;
 use serenity::all::{
-    ChannelId, ChannelType, CreateInteractionResponse, CreateInteractionResponseMessage,
-    CreateMessage, EditMessage, FullEvent, GatewayIntents, Interaction, Message, MessageId,
+    ChannelId, ChannelType, CreateAttachment, CreateInteractionResponse,
+    CreateInteractionResponseMessage, CreateMessage, EditMessage, FullEvent, GatewayIntents,
+    Interaction, Message, MessageId,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -180,6 +182,20 @@ async fn route_claimed_event(data: &PoiseData, mut event: InboundEvent) -> Resul
         tracing::info!(delivery_id, "Ignoring duplicate Discord delivery");
         return Ok(false);
     }
+
+    if let Some(downloader) = &data.attachment_downloader {
+        for attachment in &mut event.attachments {
+            if let Err(error) = downloader.hydrate(attachment).await {
+                tracing::warn!(
+                    attachment_id = %attachment.id,
+                    filename = %attachment.filename,
+                    %error,
+                    "failed to download Discord attachment; routing remote metadata only"
+                );
+            }
+        }
+    }
+
     event.delivery_id = Some(delivery_id.clone());
     if let Err(error) = data.multiplexer.route(event).await {
         ledger.mark_failed(&delivery_id, error.to_string()).await?;
@@ -272,6 +288,7 @@ pub fn message_to_inbound_with_config(
             url: attachment.url.clone(),
             content_type: attachment.content_type.clone(),
             size_bytes: Some(u64::from(attachment.size)),
+            local_path: None,
         })
         .collect();
     let mut event = InboundEvent::message(session, message.id.to_string(), content)
@@ -300,6 +317,51 @@ fn strip_bot_mention(content: &str, bot_user_id: serenity::UserId) -> String {
         .to_owned()
 }
 
+#[async_trait]
+pub trait DiscordFileUploader: Send + Sync {
+    async fn upload(
+        &self,
+        http: Arc<serenity::Http>,
+        channel: ChannelId,
+        path: &Path,
+    ) -> Result<()>;
+}
+
+#[derive(Clone, Default)]
+pub struct SerenityFileUploader;
+
+#[async_trait]
+impl DiscordFileUploader for SerenityFileUploader {
+    async fn upload(
+        &self,
+        http: Arc<serenity::Http>,
+        channel: ChannelId,
+        path: &Path,
+    ) -> Result<()> {
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                OmonError::Config(format!(
+                    "Discord upload path has no valid filename: {}",
+                    path.display()
+                ))
+            })?
+            .to_owned();
+        let bytes = tokio::fs::read(path).await.map_err(|error| {
+            OmonError::Config(format!(
+                "failed to read Discord upload {}: {error}",
+                path.display()
+            ))
+        })?;
+        let attachment = CreateAttachment::bytes(bytes, filename);
+        channel
+            .send_files(&http, vec![attachment], CreateMessage::new())
+            .await?;
+        Ok(())
+    }
+}
+
 struct ActiveDiscordStream {
     throttler: Arc<LiveEditThrottler<SerenityMessageTransport>>,
     last_sequence: Mutex<Option<u64>>,
@@ -312,6 +374,7 @@ pub struct DiscordEgress {
     clients: Arc<HashMap<String, Arc<serenity::Http>>>,
     default_bot_id: String,
     streams: Arc<Mutex<HashMap<StreamKey, Arc<ActiveDiscordStream>>>>,
+    file_uploader: Arc<dyn DiscordFileUploader>,
 }
 
 impl DiscordEgress {
@@ -325,6 +388,7 @@ impl DiscordEgress {
             clients: Arc::new(clients),
             default_bot_id,
             streams: Arc::new(Mutex::new(HashMap::new())),
+            file_uploader: Arc::new(SerenityFileUploader),
         }
     }
 
@@ -342,7 +406,13 @@ impl DiscordEgress {
             clients: Arc::new(clients),
             default_bot_id,
             streams: Arc::new(Mutex::new(HashMap::new())),
+            file_uploader: Arc::new(SerenityFileUploader),
         })
+    }
+
+    pub fn with_file_uploader(mut self, uploader: Arc<dyn DiscordFileUploader>) -> Self {
+        self.file_uploader = uploader;
+        self
     }
 
     fn target(session: &SessionKey) -> Result<ChannelId> {
@@ -463,6 +533,11 @@ impl OutboundDispatcher for DiscordEgress {
                 Self::target(&session)?
                     .delete_message(&http, message_id)
                     .await?;
+            }
+            OutboundAction::UploadFile { session, path } => {
+                let http = self.http_for(&session)?;
+                let channel = Self::target(&session)?;
+                self.file_uploader.upload(http, channel, &path).await?;
             }
             OutboundAction::Stream { session, chunk } => {
                 self.stream(session, chunk).await?;

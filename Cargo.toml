@@ -42,3 +42,4 @@ futures-util = "0.3"
 songbird = { version = "0.5", default-features = false, features = ["driver", "gateway", "serenity", "rustls", "receive", "tungstenite"] }
 cron = "0.15"
 urlencoding = "2.1"
+base64 = "0.22"
