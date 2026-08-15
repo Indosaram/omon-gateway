@@ -1,0 +1,75 @@
+T7 Hermes one-click migration orchestration evidence
+Date: 2026-08-15
+Worktree: /Users/indo/code/project/omon-gateway
+
+IMPLEMENTATION
+- Implemented run_migrate with OsEnv, real paths, authoritative config import, writable gateway DB initialization, HermesStoreSynchronizer::from_environment(pool).sync(), verified cron cutover, and gateway-down in strict order.
+- Added run_migrate_with for fixture injection with explicit MigrationPaths and optional pool.
+- Added a distinct dry-run projection path: no sync(), no Database::connect/migrations, existing file DB opened with SqliteConnectOptions::read_only(true), missing DB reported as would-create.
+- Added structured masked config/cron/gateway summaries and step-specific errors listing remaining unrun steps.
+- Reconciled tests/test_migrate.rs with deterministic temp fixture names.
+
+FAILING-FIRST ARTIFACT
+Command: cargo test --test test_migrate
+Exit code: 101
+Observed against the original run_migrate stub:
+  error[E0432]: unresolved imports `omon_gateway::migrate::run_migrate_with`, `omon_gateway::migrate::MigrationPaths`
+This establishes the integration test did not compile/pass against the stub.
+
+PASSING INTEGRATION ARTIFACT
+Command: cargo test --test test_migrate
+Exit code: 0
+Result:
+  running 3 tests
+  dry_run_without_database_reports_creation_without_creating_it ... ok
+  dry_run_projects_every_step_with_zero_writes_or_side_effects ... ok
+  full_migration_imports_config_and_cron_before_cutover ... ok
+  test result: ok. 3 passed; 0 failed
+The full fixture test asserts authoritative .env write + timestamped backup, imported cron_jobs row, jobs.json backup + emptying, and fake TERM/KILL/launchctl/plist-disable records.
+The dry-run tests assert the cron_jobs table remains empty (sync was not called), no fake writes/renames/signals/launchctl occur, projection is populated, and an absent DB is reported without creation.
+
+AUTOMATED VERIFICATION (all exit codes captured)
+- cargo build: exit 0
+- cargo test --test test_migrate: exit 0
+- cargo test: exit 0 (all unit, integration, stress, and doc test targets passed in one invocation)
+- cargo clippy --all-targets -- -D warnings: exit 0
+- cargo fmt --check: exit 0
+- LSP diagnostics src/migrate/mod.rs: none
+- LSP diagnostics tests/test_migrate.rs: none
+
+REAL READ-ONLY QA - ONLY ALLOWED LIVE COMMAND USED
+Before:
+  ~/.hermes/cron/jobs.json sha256 = 81f2456c95f7df07f8a2e68f9d73d5dab486d3ba821cc274c8505525dae22db1
+  omon_gateway.db mtime = 1786801802
+Command:
+  cargo run -- migrate --dry-run
+Exit code: 0
+Projection sections printed:
+  migration_summary
+  mode: DRY RUN
+  config_keys/config_tokens/config_changes (all values masked)
+  database_would_be_created
+  cron_import: imported/importable/already_present
+  cron_delete per profile
+  gateway_down: pids_to_stop/plists_to_disable
+After:
+  ~/.hermes/cron/jobs.json sha256 = 81f2456c95f7df07f8a2e68f9d73d5dab486d3ba821cc274c8505525dae22db1
+  omon_gateway.db mtime = 1786801802
+Assertions:
+  exit_zero = PASS
+  jobs_hash_unchanged = PASS
+  db_mtime_unchanged = PASS
+No non-dry migrate, `cargo run -- run`, or bare `cargo run --` command was executed.
+
+ADVERSARIAL CHECKS
+- stale_state: covered by existing cron_cutover stale-store test; orchestration only reaches cutover after successful sync and preserves the module's byte recheck.
+- misleading_success_output: live dry-run output was not trusted alone; jobs.json SHA-256 and DB mtime were compared before/after and were identical.
+- prompt_injection: n/a (migration reads structured YAML/JSON/env data, no instruction-following surface).
+- symlink_race: n/a for T7 orchestration; filesystem mutation semantics remain owned by landed modules.
+- concurrency_timing: n/a; integration tests use no sleeps/polling and deterministic fixture IDs.
+- model/auth/quota: n/a.
+
+SAFETY
+- Full destructive path exercised only with FakeMigrationEnv + fixture HERMES_HOME + in-memory migrated SQLite DB.
+- Real dry-run uses read-only SQLite options and does not call sync().
+- No live Hermes process signal, launchctl mutation, cron deletion, .env write, or DB migration occurred during manual QA.
