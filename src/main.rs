@@ -911,6 +911,13 @@ fn canonical_directory(path: &Path, kind: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn hermes_skill_dirs(hermes_root: &Path, home: &Path) -> Vec<PathBuf> {
+    vec![
+        hermes_root.join("skills"),
+        home.join(".omon").join("skills"),
+    ]
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -939,15 +946,14 @@ async fn run_gateway() -> Result<()> {
     tools.register(omon_gateway::WebSearchTool);
     tools.register(omon_gateway::WebFetchTool);
     tools.register(omon_gateway::BrowserTool::default());
-    let skills_dirs = vec![
-        config.workspace_root.join(".hermes").join("skills"),
-        env::var_os("HERMES_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hermes")))
-            .unwrap_or_default()
-            .join("skills"),
-    ];
-    tools.register(omon_gateway::SkillsTool::new(skills_dirs));
+    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let hermes_root = env::var_os("HERMES_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".hermes"));
+    tools.register(omon_gateway::SkillsTool::new(hermes_skill_dirs(
+        &hermes_root,
+        &home,
+    )));
     let tool_names = tools.names();
 
     let llm = LlmClient::new(config.llm_config(config.default_model.clone()))?;
@@ -1073,7 +1079,23 @@ mod runner_tests {
 
     use clap::Parser;
 
-    use super::{canonical_authorized_directory, tool_enabled, Cli, Command};
+    use super::{canonical_authorized_directory, hermes_skill_dirs, tool_enabled, Cli, Command};
+
+    #[test]
+    fn hermes_skill_dirs_use_documented_roots() {
+        let dirs = hermes_skill_dirs(std::path::Path::new("/x"), std::path::Path::new("/h"));
+
+        assert_eq!(
+            dirs,
+            vec![
+                std::path::PathBuf::from("/x/skills"),
+                std::path::PathBuf::from("/h/.omon/skills"),
+            ]
+        );
+        assert!(dirs
+            .iter()
+            .all(|path| !path.to_string_lossy().contains("workspace/.hermes")));
+    }
 
     #[test]
     fn cli_defaults_to_run_without_a_subcommand() {

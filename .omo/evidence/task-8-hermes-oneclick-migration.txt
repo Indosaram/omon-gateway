@@ -1,0 +1,257 @@
+T8 hermes skills-dir wiring evidence
+====================================
+
+FAILING-FIRST helper test (test added before helper implementation)
+Command: cargo test hermes_skill_dirs_use_documented_roots
+   Compiling omon-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+error[E0432]: unresolved import `super::hermes_skill_dirs`
+    --> src/main.rs:1076:49
+     |
+1076 |     use super::{canonical_authorized_directory, hermes_skill_dirs, tool_enabled, Cli, Command};
+     |                                                 ^^^^^^^^^^^^^^^^^ no `hermes_skill_dirs` in the root
+
+error[E0282]: type annotations needed
+    --> src/main.rs:1094:19
+     |
+1094 |             .all(|path| !path.to_string_lossy().contains("workspace/.hermes")));
+     |                   ^^^^   ---- type must be known at this point
+     |
+help: consider giving this closure parameter an explicit type
+     |
+1094 |             .all(|path: /* Type */| !path.to_string_lossy().contains("workspace/.hermes")));
+     |                       ++++++++++++
+
+Some errors have detailed explanations: E0282, E0432.
+For more information about an error, try `rustc --explain E0282`.
+error: could not compile `omon-gateway` (bin "omon-gateway" test) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+EXIT_CODE=101
+
+Wrong-path grep (rg exit 1 means zero hits)
+Command: rg -n "workspace.*\.hermes.*skills|\.hermes"\)\.join\("skills" src/main.rs
+EXIT_CODE=1
+RESULT=ZERO_HITS
+
+PASSING helper test
+Command: cargo test hermes_skill_dirs_use_documented_roots
+   Compiling omon-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.63s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-05242d25466718a0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/omon_gateway-238a3a55f0cfc3a8)
+
+running 1 test
+test runner_tests::hermes_skill_dirs_use_documented_roots ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/test_agent_tools.rs (target/debug/deps/test_agent_tools-2b08c427f9ee244b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/test_discord_adapter.rs (target/debug/deps/test_discord_adapter-bacfdb4e70e4250e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/test_e2e_stress.rs (target/debug/deps/test_e2e_stress-55bedb48650df330)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/test_multiplexer.rs (target/debug/deps/test_multiplexer-792b6123b2a7cefd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/test_voice_cron.rs (target/debug/deps/test_voice_cron-6564b389bcb5d1a2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+EXIT_CODE=0
+
+Cargo build
+Command: cargo build
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling omon-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.43s
+EXIT_CODE=0
+
+Full cargo test
+Command: cargo test
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling omon-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.94s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-05242d25466718a0)
+
+running 44 tests
+test cron::store::tests::supports_interval_and_one_shot_schedules ... ok
+test migrate::config_import::tests::malformed_hermes_root_path_is_typed_and_never_writes_target ... ok
+test cron::store::tests::parses_full_job_and_resolves_origin_delivery ... ok
+test migrate::config_import::tests::malformed_yaml_is_typed_and_never_writes_target ... ok
+test migrate::config_import::tests::root_scalar_values_win_over_profile_fallbacks ... ok
+test migrate::config_import::tests::dedupes_profile_tokens_in_stable_order_and_strips_quotes ... ok
+test migrate::config_import::tests::env_parser_ignores_comments_and_uses_last_value_in_a_file ... ok
+test migrate::config_import::tests::omits_missing_and_empty_values ... ok
+test migrate::config_import::tests::routes_non_claude_custom_provider_to_openai_compatible_keys ... ok
+test migrate::config_import::tests::dry_run_returns_masked_diff_and_performs_zero_writes ... ok
+test migrate::config_import::tests::routes_claude_model_to_anthropic_and_maps_runtime_keys ... ok
+test migrate::cron_cutover::tests::stale_store_state_is_rejected_before_backup ... ok
+test migrate::config_import::tests::backs_up_existing_env_before_authoritative_overwrite ... ok
+test migrate::sys::tests::fake_clock_is_injectable ... ok
+test migrate::gateway_down::tests::not_loaded_bootout_is_success_and_plist_is_still_disabled ... ok
+test migrate::gateway_down::tests::every_matching_plist_is_booted_out_then_renamed_disabled ... ok
+test migrate::sys::tests::fake_read_only_path_rejects_writes ... ok
+test migrate::sys::tests::fake_filesystem_write_read_rename_and_exists_are_coherent ... ok
+test migrate::sys::tests::fake_records_process_and_launchctl_calls_without_os_env ... ok
+test models::events::tests::serializes_tagged_outbound_action ... ok
+test models::events::tests::constructs_inbound_message_with_attachment ... ok
+test models::session::tests::bot_identity_partitions_discord_sessions_without_breaking_legacy_keys ... ok
+test migrate::gateway_down::tests::malformed_locks_are_skipped_and_escalation_is_bounded ... ok
+test migrate::gateway_down::tests::dry_run_reports_intended_actions_with_zero_side_effects ... ok
+test models::session::tests::derives_stable_key_from_every_routing_dimension ... ok
+test models::session::tests::deserializes_pre_identity_session_keys ... ok
+test migrate::gateway_down::tests::second_run_with_stale_pid_and_disabled_plists_is_a_no_op ... ok
+test migrate::gateway_down::tests::alive_pids_terminate_then_escalate_only_when_still_alive ... ok
+test models::session::tests::supports_hash_based_session_lookup_and_serde_round_trip ... ok
+test models::session::tests::differentiates_absent_values_and_separator_like_content ... ok
+test models::events::tests::stream_chunk_round_trips_through_an_action ... ok
+test migrate::cron_cutover::tests::malformed_store_returns_typed_error_and_performs_no_writes ... ok
+test storage::db::tests::applies_all_migrations_to_an_in_memory_database ... ok
+test storage::db::tests::migrations_are_idempotent_for_repeated_connections ... ok
+test storage::db::tests::enforces_foreign_keys_after_migration ... ok
+test migrate::cron_cutover::tests::dry_run_reports_unverified_jobs_and_performs_zero_writes ... ok
+test migrate::cron_cutover::tests::unimported_job_returns_typed_error_without_changing_store ... ok
+test migrate::cron_cutover::tests::rerun_on_empty_store_creates_no_second_backup ... ok
+test migrate::cron_cutover::tests::verified_jobs_are_backed_up_then_atomically_emptied ... ok
+test migrate::cron_cutover::tests::backup_bytes_equal_the_pre_delete_store ... ok
+test migrate::cron_cutover::tests::profiles_are_discovered_from_the_profiles_directory ... ok
+test cron::store::tests::synchronization_does_not_rearm_completed_one_shot ... ok
+test cron::store::tests::synchronization_preserves_scheduler_advanced_next_run ... ok
+test storage::db::tests::message_sequence_preserves_causality_and_recent_history_window ... ok
+
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running unittests src/main.rs (target/debug/deps/omon_gateway-238a3a55f0cfc3a8)
+
+running 7 tests
+test runner_tests::hermes_skill_dirs_use_documented_roots ... ok
+test runner_tests::maps_hermes_web_toolset_to_both_web_tools ... ok
+test runner_tests::cli_defaults_to_run_without_a_subcommand ... ok
+test runner_tests::cli_maps_explicit_run_to_the_run_path ... ok
+test runner_tests::cli_rejects_unknown_subcommands ... ok
+test runner_tests::cli_parses_migrate_flags ... ok
+test runner_tests::rejects_cron_workdir_outside_authorized_roots ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/test_agent_tools.rs (target/debug/deps/test_agent_tools-2b08c427f9ee244b)
+
+running 5 tests
+test file_tool_reads_writes_lists_searches_and_blocks_traversal ... ok
+test terminal_executes_processes_and_captures_status ... ok
+test builds_provider_specific_llm_payloads_and_parses_tool_calls ... ok
+test memory_search_ranks_relevant_session_scoped_results ... ok
+test mcp_stdio_drains_large_stderr_without_blocking_jsonrpc_response ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/test_discord_adapter.rs (target/debug/deps/test_discord_adapter-bacfdb4e70e4250e)
+
+running 11 tests
+test slash_authorization_defaults_open_and_enforces_allowlist ... ok
+test renders_complete_attachment_context_for_attachment_only_turns ... ok
+test chunks_markdown_at_discord_limit_and_balances_code_fences ... ok
+test final_live_edit_preempts_a_sleeping_intermediate_update ... ok
+test final_live_edit_deletes_surplus_chunk_messages ... ok
+test live_edits_use_typing_and_debounce_subsequent_updates ... ok
+test approval_guard_resolves_both_buttons_and_times_out ... ok
+test every_explicitly_mentioned_bot_owns_exactly_its_target ... ok
+test only_primary_bot_owns_unmentioned_threads_dms_and_free_channels ... ok
+test converts_serenity_dm_mentions_threads_and_attachments ... ok
+test discord_delivery_claims_deduplicate_per_target_bot ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/test_e2e_stress.rs (target/debug/deps/test_e2e_stress-55bedb48650df330)
+
+running 3 tests
+test delivery_ledger_is_idempotent_during_a_128_way_duplicate_storm ... ok
+test routes_120_messages_in_order_per_session_and_in_parallel_across_sessions ... ok
+test scale_to_zero_evicts_all_sessions_during_high_turnover ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/test_multiplexer.rs (target/debug/deps/test_multiplexer-792b6123b2a7cefd)
+
+running 9 tests
+test route_reports_actor_startup_failure_instead_of_acknowledging_a_lost_event ... ok
+test dropping_multiplexer_releases_actor_cycle_and_flushes_dirty_state ... ok
+test gc_does_not_evict_an_actor_with_an_active_turn ... ok
+test stop_immediately_cancels_the_active_turn ... ok
+test scale_to_zero_evicts_and_flushes_idle_sessions ... ok
+test a_new_message_interrupts_the_active_turn_and_runs_promptly ... ok
+test delivery_ledger_deduplicates_concurrent_claims_and_records_latency ... ok
+test routes_multiple_sessions_in_parallel ... ok
+test handles_events_sequentially_within_one_session ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/test_voice_cron.rs (target/debug/deps/test_voice_cron-6564b389bcb5d1a2)
+
+running 5 tests
+test audio_frame_buffer_serializes_without_losing_pcm_samples ... ok
+test failed_due_run_keeps_schedule_and_records_failed_lease ... ok
+test background_scheduler_executes_due_interval_and_notifies_channel ... ok
+test cron_scheduler_registers_triggers_and_manages_jobs ... ok
+test active_lease_blocks_duplicate_claims_until_success_commits_one_shot ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+   Doc-tests omon_gateway
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+EXIT_CODE=0
+
+Cargo clippy
+Command: cargo clippy --all-targets -- -D warnings
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Checking omon-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.99s
+EXIT_CODE=0
+
+Cargo fmt check
+Command: cargo fmt --check
+
+EXIT_CODE=0
+
+Final forbidden-path grep
+Command: rg -n "workspace.*\.hermes.*skills|\.hermes"\)\.join\("skills" src/main.rs
+EXIT_CODE=1
+RESULT=ZERO_HITS
+
+Adversarial classes
+None of the 9 adversarial classes apply: this is pure startup wiring with no new I/O, parsing, concurrency, authorization, or destructive behavior.
+The sole identified risk was environment dependence; the params-based helper test isolates and covers root-to-directory mapping without mutating process environment.
+Gateway boot/manual runtime invocation intentionally not performed.
