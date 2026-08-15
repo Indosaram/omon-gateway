@@ -24,7 +24,7 @@ pub use multiplexer::{
 };
 pub use storage::Database;
 pub use tools::{
-    BrowserTool, CronTool, FileTool, McpClientTool, McpTool, McpTransport, SkillsTool,
-    TerminalTool, Tool, ToolRegistry, WebFetchTool, WebSearchTool,
+    ApprovalPolicy, BrowserTool, CronTool, FileTool, McpClientTool, McpTool, McpTransport,
+    SkillsTool, TerminalTool, Tool, ToolRegistry, WebFetchTool, WebSearchTool,
 };
 pub use voice::*;

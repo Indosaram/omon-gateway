@@ -10,7 +10,7 @@ use serenity::all::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::approval::SmartApprovalGuard;
+use super::approval::{approval_buttons, SmartApprovalGuard};
 use super::commands::{self, CommandError, PoiseData};
 use super::throttler::{
     chunk_markdown, DiscordMessageTransport, LiveEditThrottler, SerenityMessageTransport,
@@ -470,6 +470,26 @@ impl OutboundDispatcher for DiscordEgress {
             OutboundAction::Typing { session } => {
                 let http = self.http_for(&session)?;
                 http.broadcast_typing(Self::target(&session)?).await?;
+            }
+            OutboundAction::ApprovalRequest {
+                session,
+                request_id,
+                command,
+            } => {
+                let http = self.http_for(&session)?;
+                let channel = Self::target(&session)?;
+                let content = format!(
+                    "Approval required before running this command:\n```text\n{}\n```",
+                    command
+                );
+                channel
+                    .send_message(
+                        &http,
+                        CreateMessage::new()
+                            .content(content)
+                            .components(approval_buttons(request_id)),
+                    )
+                    .await?;
             }
         }
         Ok(())

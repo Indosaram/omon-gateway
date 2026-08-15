@@ -2,10 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serenity::all::{ButtonStyle, CreateActionRow, CreateButton};
 use thiserror::Error;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use uuid::Uuid;
+
+use crate::{OutboundAction, OutboundDispatcher, SessionKey};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalDecision {
@@ -13,7 +16,7 @@ pub enum ApprovalDecision {
     Rejected,
 }
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ApprovalError {
     #[error("approval request timed out")]
     Timeout,
@@ -45,6 +48,71 @@ pub struct SmartApprovalGuard {
     pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<ApprovalDecision>>>>,
 }
 
+#[async_trait]
+pub trait ApprovalRequester: Send + Sync {
+    async fn request_approval(
+        &self,
+        session: &SessionKey,
+        command: &str,
+    ) -> Result<ApprovalDecision, ApprovalError>;
+}
+
+#[derive(Clone)]
+pub struct DiscordApprovalRequester {
+    guard: SmartApprovalGuard,
+    dispatcher: Arc<RwLock<Option<Arc<dyn OutboundDispatcher>>>>,
+    timeout: Duration,
+}
+
+impl DiscordApprovalRequester {
+    pub fn new(guard: SmartApprovalGuard, timeout: Duration) -> Self {
+        Self {
+            guard,
+            dispatcher: Arc::new(RwLock::new(None)),
+            timeout,
+        }
+    }
+
+    pub async fn set_dispatcher(&self, dispatcher: Arc<dyn OutboundDispatcher>) {
+        *self.dispatcher.write().await = Some(dispatcher);
+    }
+}
+
+#[async_trait]
+impl ApprovalRequester for DiscordApprovalRequester {
+    async fn request_approval(
+        &self,
+        session: &SessionKey,
+        command: &str,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        let dispatcher = self
+            .dispatcher
+            .read()
+            .await
+            .clone()
+            .ok_or(ApprovalError::Cancelled)?;
+        let prompt = self.guard.request().await;
+        let request_id = prompt.request_id;
+        if dispatcher
+            .dispatch(OutboundAction::ApprovalRequest {
+                session: session.clone(),
+                request_id,
+                command: command.to_owned(),
+            })
+            .await
+            .is_err()
+        {
+            self.guard.cancel(request_id).await;
+            return Err(ApprovalError::Cancelled);
+        }
+        let result = prompt.wait(self.timeout).await;
+        if result.is_err() {
+            self.guard.cancel(request_id).await;
+        }
+        result
+    }
+}
+
 impl SmartApprovalGuard {
     pub fn new() -> Self {
         Self::default()
@@ -69,6 +137,10 @@ impl SmartApprovalGuard {
             return false;
         };
         sender.send(decision).is_ok()
+    }
+
+    pub async fn cancel(&self, request_id: Uuid) {
+        self.pending.lock().await.remove(&request_id);
     }
 
     pub async fn pending_count(&self) -> usize {

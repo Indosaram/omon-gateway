@@ -116,6 +116,11 @@ pub enum OutboundAction {
     Typing {
         session: SessionKey,
     },
+    ApprovalRequest {
+        session: SessionKey,
+        request_id: Uuid,
+        command: String,
+    },
 }
 
 #[cfg(test)]

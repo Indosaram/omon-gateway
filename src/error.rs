@@ -17,6 +17,9 @@ pub enum OmonError {
     #[error("tool execution error: {0}")]
     ToolExecution(String),
 
+    #[error("approval refused: {0}")]
+    Approval(String),
+
     #[error("configuration error: {0}")]
     Config(String),
 }

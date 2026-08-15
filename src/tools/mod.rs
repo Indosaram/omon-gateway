@@ -12,14 +12,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::OmonError;
+use crate::{OmonError, SessionKey};
 
 pub use browser::BrowserTool;
 pub use cron::CronTool;
 pub use file::FileTool;
 pub use mcp::{McpClientTool, McpTool, McpTransport};
 pub use skills::SkillsTool;
-pub use terminal::TerminalTool;
+pub use terminal::{ApprovalPolicy, TerminalTool};
 pub use web::{WebFetchTool, WebSearchTool};
 
 #[async_trait]
@@ -28,6 +28,14 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn input_schema(&self) -> Value;
     async fn execute(&self, args: Value) -> Result<Value, OmonError>;
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        _session: Option<&SessionKey>,
+    ) -> Result<Value, OmonError> {
+        self.execute(args).await
+    }
 }
 
 #[derive(Clone, Default)]
@@ -59,9 +67,18 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, name: &str, args: Value) -> Result<Value, OmonError> {
+        self.execute_with_context(name, args, None).await
+    }
+
+    pub async fn execute_with_context(
+        &self,
+        name: &str,
+        args: Value,
+        session: Option<&SessionKey>,
+    ) -> Result<Value, OmonError> {
         let tool = self
             .get(name)
             .ok_or_else(|| OmonError::ToolExecution(format!("unknown tool: {name}")))?;
-        tool.execute(args).await
+        tool.execute_with_context(args, session).await
     }
 }

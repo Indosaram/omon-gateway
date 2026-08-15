@@ -9,11 +9,12 @@ use futures_util::StreamExt;
 use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
-    render_user_prompt, AgentRunner, ChatMessage, CronJob, CronScheduler, CronTaskExecutor,
-    CronTool, DiscordAdapter, DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer,
-    InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore, MultiplexerConfig,
-    OmonError, OutboundAction, OutboundDispatcher, PoiseData, Result, ScaleToZero, SessionContext,
-    SessionKey, SessionMultiplexer, TerminalTool, ToolDefinition, ToolRegistry,
+    render_user_prompt, AgentRunner, ApprovalPolicy, ChatMessage, CronJob, CronScheduler,
+    CronTaskExecutor, CronTool, DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool,
+    HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool,
+    MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher, PoiseData,
+    Result, ScaleToZero, SessionContext, SessionKey, SessionMultiplexer, SmartApprovalGuard,
+    TerminalTool, ToolDefinition, ToolRegistry,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -55,6 +56,7 @@ struct Config {
     workspace_root: PathBuf,
     free_response_channels: Vec<u64>,
     allowed_users: Vec<u64>,
+    approval_policy: ApprovalPolicy,
 }
 
 impl Config {
@@ -130,6 +132,7 @@ impl Config {
             workspace_root,
             free_response_channels,
             allowed_users,
+            approval_policy: ApprovalPolicy::parse(optional_env("APPROVAL_MODE").as_deref()),
         })
     }
 
@@ -421,7 +424,10 @@ impl LiveAgentRunner {
                 let status_msg = format!("\n\n⚙️ Running tool `{}`...", call.name);
                 let _ = self.emit(session, status_msg, false).await;
 
-                let result = tools.execute(&call.name, call.arguments.clone()).await;
+                let tool_session = stream_output.then_some(&session.key);
+                let result = tools
+                    .execute_with_context(&call.name, call.arguments.clone(), tool_session)
+                    .await;
                 let content = match result {
                     Ok(value) => value.to_string(),
                     Err(error) => json!({"error": error.to_string()}).to_string(),
@@ -938,8 +944,17 @@ async fn run_gateway() -> Result<()> {
     let pool = init_pool(&config.database_url).await?;
     let memory = MemoryStore::new(pool.clone());
 
+    let approval_guard = SmartApprovalGuard::new();
+    let approval_requester = Arc::new(DiscordApprovalRequester::new(
+        approval_guard.clone(),
+        std::time::Duration::from_secs(120),
+    ));
     let mut tools = ToolRegistry::new();
-    tools.register(TerminalTool::new(&config.workspace_root));
+    tools.register(TerminalTool::new(&config.workspace_root).with_approval(
+        config.approval_policy,
+        approval_requester.clone(),
+        std::time::Duration::from_secs(125),
+    ));
     tools.register(FileTool::new(&config.workspace_root));
     tools.register(McpTool::default());
     tools.register(CronTool::new(pool.clone()));
@@ -996,6 +1011,9 @@ async fn run_gateway() -> Result<()> {
         bot_http_clients,
     )?);
     shared_dispatcher.set(discord_egress.clone()).await;
+    approval_requester
+        .set_dispatcher(discord_egress.clone())
+        .await;
 
     let cron_sync = HermesStoreSynchronizer::from_environment(pool.clone())?;
     let imported = cron_sync.sync().await?;
@@ -1020,7 +1038,7 @@ async fn run_gateway() -> Result<()> {
             "invalid primary Discord bot identity {default_bot_id}"
         ))
     })?);
-    let adapter = DiscordAdapter::new(poise_data);
+    let adapter = DiscordAdapter::new(poise_data).with_approval_guard(approval_guard);
 
     let mut clients = Vec::new();
     let mut shard_managers = Vec::new();
