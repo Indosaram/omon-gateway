@@ -1,0 +1,273 @@
+
+=== First actual focused test run (repository cwd) ===
+   Compiling omon-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.06s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-05242d25466718a0)
+
+running 6 tests
+malformed-input error=configuration error: invalid Hermes cron store /fixtures/.hermes/cron/jobs.json: key must be a string at line 1 column 2
+test migrate::cron_cutover::tests::malformed_store_returns_typed_error_and_performs_no_writes ... ok
+dry-run summary=CronCutoverSummary { stores: [CronStoreCutoverSummary { profile: "default", jobs_found: 2, all_imported: false, would_empty: false, unverified_jobs: ["weekly"] }] }
+unimported-block error=configuration error: Hermes cron job hermes:default:weekly has not been imported into cron_jobs; refusing to empty /fixtures/.hermes/cron/jobs.json
+test migrate::cron_cutover::tests::dry_run_reports_unverified_jobs_and_performs_zero_writes ... ok
+test migrate::cron_cutover::tests::unimported_job_returns_typed_error_without_changing_store ... ok
+idempotent rerun summary=CronCutoverSummary { stores: [CronStoreCutoverSummary { profile: "default", jobs_found: 0, all_imported: true, would_empty: false, unverified_jobs: [] }] }
+verified-delete summary=CronCutoverSummary { stores: [CronStoreCutoverSummary { profile: "default", jobs_found: 2, all_imported: true, would_empty: true, unverified_jobs: [] }] }
+backup-equality path=/fixtures/.hermes/cron/jobs.json.bak-omon-migration-20260815T123456Z
+test migrate::cron_cutover::tests::rerun_on_empty_store_creates_no_second_backup ... ok
+test migrate::cron_cutover::tests::verified_jobs_are_backed_up_then_atomically_emptied ... ok
+test migrate::cron_cutover::tests::backup_bytes_equal_the_pre_delete_store ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.03s
+
+     Running unittests src/main.rs (target/debug/deps/omon_gateway-238a3a55f0cfc3a8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/test_agent_tools.rs (target/debug/deps/test_agent_tools-2b08c427f9ee244b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/test_discord_adapter.rs (target/debug/deps/test_discord_adapter-bacfdb4e70e4250e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/test_e2e_stress.rs (target/debug/deps/test_e2e_stress-55bedb48650df330)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/test_multiplexer.rs (target/debug/deps/test_multiplexer-792b6123b2a7cefd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/test_voice_cron.rs (target/debug/deps/test_voice_cron-6564b389bcb5d1a2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+EXIT_CODE=0
+
+=== Final focused manual QA ===
+   Compiling omon-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.38s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-05242d25466718a0)
+
+running 8 tests
+stale-state error=configuration error: Hermes cron store changed during migration: /fixtures/.hermes/cron/jobs.json; refusing to back up or empty stale state
+test migrate::cron_cutover::tests::stale_store_state_is_rejected_before_backup ... ok
+malformed-input error=configuration error: invalid Hermes cron store /fixtures/.hermes/cron/jobs.json: key must be a string at line 1 column 2
+test migrate::cron_cutover::tests::malformed_store_returns_typed_error_and_performs_no_writes ... ok
+unimported-block error=configuration error: Hermes cron job hermes:default:weekly has not been imported into cron_jobs; refusing to empty /fixtures/.hermes/cron/jobs.json
+test migrate::cron_cutover::tests::unimported_job_returns_typed_error_without_changing_store ... ok
+dry-run summary=CronCutoverSummary { stores: [CronStoreCutoverSummary { profile: "default", jobs_found: 2, all_imported: false, would_empty: false, unverified_jobs: ["weekly"] }] }
+idempotent rerun summary=CronCutoverSummary { stores: [CronStoreCutoverSummary { profile: "default", jobs_found: 0, all_imported: true, would_empty: false, unverified_jobs: [] }] }
+test migrate::cron_cutover::tests::dry_run_reports_unverified_jobs_and_performs_zero_writes ... ok
+test migrate::cron_cutover::tests::rerun_on_empty_store_creates_no_second_backup ... ok
+verified-delete summary=CronCutoverSummary { stores: [CronStoreCutoverSummary { profile: "default", jobs_found: 2, all_imported: true, would_empty: true, unverified_jobs: [] }] }
+test migrate::cron_cutover::tests::profiles_are_discovered_from_the_profiles_directory ... ok
+test migrate::cron_cutover::tests::verified_jobs_are_backed_up_then_atomically_emptied ... ok
+backup-equality path=/fixtures/.hermes/cron/jobs.json.bak-omon-migration-20260815T123456Z
+test migrate::cron_cutover::tests::backup_bytes_equal_the_pre_delete_store ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.03s
+
+     Running unittests src/main.rs (target/debug/deps/omon_gateway-238a3a55f0cfc3a8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/test_agent_tools.rs (target/debug/deps/test_agent_tools-2b08c427f9ee244b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/test_discord_adapter.rs (target/debug/deps/test_discord_adapter-bacfdb4e70e4250e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/test_e2e_stress.rs (target/debug/deps/test_e2e_stress-55bedb48650df330)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/test_multiplexer.rs (target/debug/deps/test_multiplexer-792b6123b2a7cefd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/test_voice_cron.rs (target/debug/deps/test_voice_cron-6564b389bcb5d1a2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+FOCUSED_TEST_EXIT_CODE=0
+
+=== cargo build ===
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.35s
+CARGO_BUILD_EXIT_CODE=0
+
+=== full cargo test ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-05242d25466718a0)
+
+running 38 tests
+test migrate::config_import::tests::malformed_hermes_root_path_is_typed_and_never_writes_target ... ok
+test cron::store::tests::supports_interval_and_one_shot_schedules ... ok
+test cron::store::tests::parses_full_job_and_resolves_origin_delivery ... ok
+test migrate::config_import::tests::malformed_yaml_is_typed_and_never_writes_target ... ok
+test migrate::config_import::tests::dry_run_returns_masked_diff_and_performs_zero_writes ... ok
+test migrate::config_import::tests::env_parser_ignores_comments_and_uses_last_value_in_a_file ... ok
+test migrate::config_import::tests::omits_missing_and_empty_values ... ok
+test migrate::config_import::tests::routes_claude_model_to_anthropic_and_maps_runtime_keys ... ok
+test migrate::config_import::tests::dedupes_profile_tokens_in_stable_order_and_strips_quotes ... ok
+test migrate::config_import::tests::routes_non_claude_custom_provider_to_openai_compatible_keys ... ok
+test migrate::config_import::tests::root_scalar_values_win_over_profile_fallbacks ... ok
+test migrate::config_import::tests::backs_up_existing_env_before_authoritative_overwrite ... ok
+test migrate::sys::tests::fake_clock_is_injectable ... ok
+test migrate::cron_cutover::tests::stale_store_state_is_rejected_before_backup ... ok
+test migrate::sys::tests::fake_read_only_path_rejects_writes ... ok
+test migrate::sys::tests::fake_filesystem_write_read_rename_and_exists_are_coherent ... ok
+test migrate::sys::tests::fake_records_process_and_launchctl_calls_without_os_env ... ok
+test models::events::tests::constructs_inbound_message_with_attachment ... ok
+test models::events::tests::serializes_tagged_outbound_action ... ok
+test models::session::tests::bot_identity_partitions_discord_sessions_without_breaking_legacy_keys ... ok
+test models::session::tests::derives_stable_key_from_every_routing_dimension ... ok
+test models::session::tests::deserializes_pre_identity_session_keys ... ok
+test models::events::tests::stream_chunk_round_trips_through_an_action ... ok
+test models::session::tests::differentiates_absent_values_and_separator_like_content ... ok
+test models::session::tests::supports_hash_based_session_lookup_and_serde_round_trip ... ok
+test migrate::cron_cutover::tests::backup_bytes_equal_the_pre_delete_store ... ok
+test cron::store::tests::synchronization_does_not_rearm_completed_one_shot ... ok
+test migrate::cron_cutover::tests::dry_run_reports_unverified_jobs_and_performs_zero_writes ... ok
+test migrate::cron_cutover::tests::unimported_job_returns_typed_error_without_changing_store ... ok
+test migrate::cron_cutover::tests::malformed_store_returns_typed_error_and_performs_no_writes ... ok
+test storage::db::tests::applies_all_migrations_to_an_in_memory_database ... ok
+test storage::db::tests::enforces_foreign_keys_after_migration ... ok
+test migrate::cron_cutover::tests::profiles_are_discovered_from_the_profiles_directory ... ok
+test storage::db::tests::migrations_are_idempotent_for_repeated_connections ... ok
+test migrate::cron_cutover::tests::rerun_on_empty_store_creates_no_second_backup ... ok
+test migrate::cron_cutover::tests::verified_jobs_are_backed_up_then_atomically_emptied ... ok
+test cron::store::tests::synchronization_preserves_scheduler_advanced_next_run ... ok
+test storage::db::tests::message_sequence_preserves_causality_and_recent_history_window ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/main.rs (target/debug/deps/omon_gateway-238a3a55f0cfc3a8)
+
+running 6 tests
+test runner_tests::maps_hermes_web_toolset_to_both_web_tools ... ok
+test runner_tests::cli_defaults_to_run_without_a_subcommand ... ok
+test runner_tests::cli_maps_explicit_run_to_the_run_path ... ok
+test runner_tests::cli_rejects_unknown_subcommands ... ok
+test runner_tests::cli_parses_migrate_flags ... ok
+test runner_tests::rejects_cron_workdir_outside_authorized_roots ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/test_agent_tools.rs (target/debug/deps/test_agent_tools-2b08c427f9ee244b)
+
+running 5 tests
+test builds_provider_specific_llm_payloads_and_parses_tool_calls ... ok
+test file_tool_reads_writes_lists_searches_and_blocks_traversal ... ok
+test memory_search_ranks_relevant_session_scoped_results ... ok
+test terminal_executes_processes_and_captures_status ... ok
+test mcp_stdio_drains_large_stderr_without_blocking_jsonrpc_response ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/test_discord_adapter.rs (target/debug/deps/test_discord_adapter-bacfdb4e70e4250e)
+
+running 11 tests
+test slash_authorization_defaults_open_and_enforces_allowlist ... ok
+test renders_complete_attachment_context_for_attachment_only_turns ... ok
+test chunks_markdown_at_discord_limit_and_balances_code_fences ... ok
+test approval_guard_resolves_both_buttons_and_times_out ... ok
+test final_live_edit_preempts_a_sleeping_intermediate_update ... ok
+test final_live_edit_deletes_surplus_chunk_messages ... ok
+test live_edits_use_typing_and_debounce_subsequent_updates ... ok
+test every_explicitly_mentioned_bot_owns_exactly_its_target ... ok
+test only_primary_bot_owns_unmentioned_threads_dms_and_free_channels ... ok
+test converts_serenity_dm_mentions_threads_and_attachments ... ok
+test discord_delivery_claims_deduplicate_per_target_bot ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/test_e2e_stress.rs (target/debug/deps/test_e2e_stress-55bedb48650df330)
+
+running 3 tests
+test delivery_ledger_is_idempotent_during_a_128_way_duplicate_storm ... ok
+test routes_120_messages_in_order_per_session_and_in_parallel_across_sessions ... ok
+test scale_to_zero_evicts_all_sessions_during_high_turnover ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/test_multiplexer.rs (target/debug/deps/test_multiplexer-792b6123b2a7cefd)
+
+running 9 tests
+test gc_does_not_evict_an_actor_with_an_active_turn ... ok
+test route_reports_actor_startup_failure_instead_of_acknowledging_a_lost_event ... ok
+test stop_immediately_cancels_the_active_turn ... ok
+test scale_to_zero_evicts_and_flushes_idle_sessions ... ok
+test delivery_ledger_deduplicates_concurrent_claims_and_records_latency ... ok
+test a_new_message_interrupts_the_active_turn_and_runs_promptly ... ok
+test dropping_multiplexer_releases_actor_cycle_and_flushes_dirty_state ... ok
+test routes_multiple_sessions_in_parallel ... ok
+test handles_events_sequentially_within_one_session ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/test_voice_cron.rs (target/debug/deps/test_voice_cron-6564b389bcb5d1a2)
+
+running 5 tests
+test audio_frame_buffer_serializes_without_losing_pcm_samples ... ok
+test failed_due_run_keeps_schedule_and_records_failed_lease ... ok
+test background_scheduler_executes_due_interval_and_notifies_channel ... ok
+test cron_scheduler_registers_triggers_and_manages_jobs ... ok
+test active_lease_blocks_duplicate_claims_until_success_commits_one_shot ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+   Doc-tests omon_gateway
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+FULL_CARGO_TEST_EXIT_CODE=0
+
+=== cargo clippy --all-targets -- -D warnings ===
+    Checking omon-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.93s
+CARGO_CLIPPY_EXIT_CODE=0
+
+=== cargo fmt --check ===
+CARGO_FMT_CHECK_EXIT_CODE=0
+
+=== Adversarial classes ===
+stale_state: APPLIES - tested current bytes against preflight bytes before backup/write, plus rerun idempotency.
+malformed_input: APPLIES - malformed jobs.json returns OmonError::Config with zero migration writes.
+concurrency: not separately applicable beyond stale-state byte comparison; this cutover owns no async task/shared mutable state.
+resource_exhaustion: not applicable to bounded local migration fixtures and ordinary serde/sqlx/fs operations.
+permission_boundary: not applicable as an authorization model; filesystem failures propagate through MigrationEnv as typed errors.
+network_failure: not applicable; no network access.
+ordering: covered - backup write is recorded before temp write and atomic rename.
+partial_failure: covered by all-store verification preflight before any destructive store write.
+FINAL_GATE_EXIT_CODE=0
