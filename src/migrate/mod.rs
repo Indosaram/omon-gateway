@@ -1,5 +1,6 @@
 pub mod config_import;
 pub mod cron_cutover;
+pub mod gateway_down;
 pub mod sys;
 
 #[derive(clap::Args, Debug, Clone)]
