@@ -114,10 +114,24 @@ impl McpClientTool {
             .stdout
             .take()
             .ok_or_else(|| mcp_error("MCP stdout unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| mcp_error("MCP stderr unavailable"))?;
         let encoded = serde_json::to_vec(request).map_err(mcp_error)?;
         stdin.write_all(&encoded).await.map_err(mcp_error)?;
         stdin.write_all(b"\n").await.map_err(mcp_error)?;
         stdin.shutdown().await.map_err(mcp_error)?;
+
+        // MCP servers frequently log to stderr. If that pipe is not drained, a
+        // verbose server can fill the OS pipe buffer and block before it writes
+        // its JSON-RPC response to stdout. Drain to a sink so logging cannot
+        // deadlock the protocol and cannot become an unbounded memory buffer.
+        let stderr_task = tokio::spawn(async move {
+            let mut stderr = BufReader::new(stderr);
+            let mut sink = tokio::io::sink();
+            tokio::io::copy(&mut stderr, &mut sink).await
+        });
 
         let read = async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -128,9 +142,15 @@ impl McpClientTool {
             }
             Err(mcp_error("MCP server closed without a JSON-RPC response"))
         };
-        tokio::time::timeout(self.timeout, read)
+        let result = tokio::time::timeout(self.timeout, read)
             .await
-            .map_err(|_| mcp_error("MCP stdio request timed out"))?
+            .map_err(|_| mcp_error("MCP stdio request timed out"))?;
+
+        // Each request owns a fresh stdio server process. Terminate anything
+        // that remains after the response so helpers/servers cannot accumulate.
+        let _ = child.kill().await;
+        let _ = stderr_task.await;
+        result
     }
 
     async fn request_sse(

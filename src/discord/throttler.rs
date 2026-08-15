@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ pub trait DiscordMessageTransport: Send + Sync + 'static {
         content: String,
     ) -> Result<()>;
     async fn send_message(&self, channel_id: ChannelId, content: String) -> Result<MessageId>;
+    async fn delete_message(&self, channel_id: ChannelId, message_id: MessageId) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -59,6 +61,11 @@ impl DiscordMessageTransport for SerenityMessageTransport {
             .await?;
         Ok(message.id)
     }
+
+    async fn delete_message(&self, channel_id: ChannelId, message_id: MessageId) -> Result<()> {
+        channel_id.delete_message(&self.http, message_id).await?;
+        Ok(())
+    }
 }
 
 struct LiveEditState {
@@ -68,13 +75,16 @@ struct LiveEditState {
 
 /// Serializes and rate-limits updates for one streaming Discord response.
 ///
-/// Updates inside the debounce window slide the deadline forward. The final
-/// update bypasses the delay while still preserving edit ordering.
+/// Non-final updates are coalesced: when a newer update arrives during the
+/// debounce window, the stale update returns without touching Discord. The
+/// debounce sleep happens outside the state mutex, so a final update does not
+/// queue behind a sleeping intermediate update. Network mutations remain
+/// serialized to preserve message ordering and the chunk/message-id mapping.
 pub struct LiveEditThrottler<T: DiscordMessageTransport> {
     transport: Arc<T>,
     channel_id: ChannelId,
-    initial_message_id: MessageId,
     debounce: Duration,
+    revision: AtomicU64,
     state: Mutex<LiveEditState>,
 }
 
@@ -92,8 +102,8 @@ impl<T: DiscordMessageTransport> LiveEditThrottler<T> {
         Self {
             transport,
             channel_id,
-            initial_message_id: message_id,
             debounce,
+            revision: AtomicU64::new(0),
             state: Mutex::new(LiveEditState {
                 last_edit: None,
                 message_ids: vec![message_id],
@@ -106,18 +116,38 @@ impl<T: DiscordMessageTransport> LiveEditThrottler<T> {
     }
 
     pub async fn update(&self, content: &str, is_final: bool) -> Result<()> {
-        self.transport.start_typing(self.channel_id).await?;
-        let mut state = self.state.lock().await;
+        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
 
+        if !is_final && !self.wait_for_debounce(revision).await {
+            return Ok(());
+        }
+
+        let mut state = self.state.lock().await;
+        if !is_final && self.revision.load(Ordering::Acquire) != revision {
+            return Ok(());
+        }
+
+        // A previous edit may have finished while this update was waiting for
+        // the wire-serialization mutex. Re-check the deadline without holding
+        // the mutex across the sleep.
         if !is_final {
             if let Some(last_edit) = state.last_edit {
                 let deadline = last_edit + self.debounce;
                 if deadline > Instant::now() {
+                    drop(state);
                     tokio::time::sleep_until(deadline).await;
+                    if self.revision.load(Ordering::Acquire) != revision {
+                        return Ok(());
+                    }
+                    state = self.state.lock().await;
+                    if self.revision.load(Ordering::Acquire) != revision {
+                        return Ok(());
+                    }
                 }
             }
         }
 
+        self.transport.start_typing(self.channel_id).await?;
         let chunks = chunk_markdown(content, DISCORD_MESSAGE_LIMIT);
         for (index, chunk) in chunks.iter().enumerate() {
             if index < state.message_ids.len() {
@@ -133,16 +163,44 @@ impl<T: DiscordMessageTransport> LiveEditThrottler<T> {
             }
         }
 
-        for message_id in state.message_ids.drain(chunks.len()..) {
-            self.transport
-                .edit_message(self.channel_id, message_id, "\u{200b}".into())
-                .await?;
+        if is_final {
+            let stale: Vec<_> = state.message_ids.drain(chunks.len()..).collect();
+            for message_id in stale {
+                self.transport
+                    .delete_message(self.channel_id, message_id)
+                    .await?;
+            }
+        } else {
+            // Keep surplus IDs for reuse if the stream grows again. This avoids
+            // orphaning blank Discord messages on every shrink/grow cycle.
+            for message_id in state.message_ids.iter().skip(chunks.len()).copied() {
+                self.transport
+                    .edit_message(self.channel_id, message_id, "\u{200b}".into())
+                    .await?;
+            }
         }
-        if state.message_ids.is_empty() {
-            state.message_ids.push(self.initial_message_id);
-        }
+
         state.last_edit = Some(Instant::now());
         Ok(())
+    }
+
+    async fn wait_for_debounce(&self, revision: u64) -> bool {
+        loop {
+            if self.revision.load(Ordering::Acquire) != revision {
+                return false;
+            }
+            let deadline = {
+                let state = self.state.lock().await;
+                state.last_edit.map(|last_edit| last_edit + self.debounce)
+            };
+            let Some(deadline) = deadline else {
+                return self.revision.load(Ordering::Acquire) == revision;
+            };
+            if deadline <= Instant::now() {
+                return self.revision.load(Ordering::Acquire) == revision;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
     }
 }
 

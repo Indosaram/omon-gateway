@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -6,10 +7,15 @@ use serenity::all::{
     ChannelId, ChannelType, CreateInteractionResponse, CreateInteractionResponseMessage,
     CreateMessage, EditMessage, FullEvent, GatewayIntents, Interaction, Message, MessageId,
 };
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use super::approval::SmartApprovalGuard;
 use super::commands::{self, CommandError, PoiseData};
-use super::throttler::{chunk_markdown, DISCORD_MESSAGE_LIMIT};
+use super::throttler::{
+    chunk_markdown, DiscordMessageTransport, LiveEditThrottler, SerenityMessageTransport,
+    DISCORD_MESSAGE_LIMIT,
+};
 use crate::{
     InboundEvent, MessageAttachment, OmonError, OutboundAction, OutboundDispatcher, Result,
     SessionKey,
@@ -121,7 +127,7 @@ async fn handle_event(
                 &data.free_response_channels,
                 &data.allowed_users,
             ) {
-                tracing::info!(session = %event.session, "Routing inbound message to multiplexer");
+                tracing::info!(session = %event.session, bot_id = %bot_user_id, "Routing inbound message to multiplexer");
                 data.multiplexer.route(event).await?;
             } else {
                 tracing::info!("Message ignored by filter (not DM, not thread, not mentioned, not in free channels)");
@@ -192,7 +198,8 @@ pub fn message_to_inbound_with_config(
         channel_id.clone(),
         is_thread.then_some(channel_id),
         message.author.id.to_string(),
-    );
+    )
+    .with_bot_id(bot_user_id.to_string());
     let attachments = message
         .attachments
         .iter()
@@ -225,14 +232,49 @@ fn strip_bot_mention(content: &str, bot_user_id: serenity::UserId) -> String {
         .to_owned()
 }
 
+struct ActiveDiscordStream {
+    throttler: Arc<LiveEditThrottler<SerenityMessageTransport>>,
+    last_sequence: Mutex<Option<u64>>,
+}
+
+type StreamKey = (String, Uuid);
+
 #[derive(Clone)]
 pub struct DiscordEgress {
-    http: Arc<serenity::Http>,
+    clients: Arc<HashMap<String, Arc<serenity::Http>>>,
+    default_bot_id: String,
+    streams: Arc<Mutex<HashMap<StreamKey, Arc<ActiveDiscordStream>>>>,
 }
 
 impl DiscordEgress {
+    /// Creates a single-client egress. Sessions without a bot identity use this
+    /// client. Identity-aware multi-bot deployments should use
+    /// [`DiscordEgress::with_bot_clients`].
     pub fn new(http: Arc<serenity::Http>) -> Self {
-        Self { http }
+        let default_bot_id = "default".to_owned();
+        let clients = HashMap::from([(default_bot_id.clone(), http)]);
+        Self {
+            clients: Arc::new(clients),
+            default_bot_id,
+            streams: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_bot_clients(
+        default_bot_id: impl Into<String>,
+        clients: HashMap<String, Arc<serenity::Http>>,
+    ) -> Result<Self> {
+        let default_bot_id = default_bot_id.into();
+        if !clients.contains_key(&default_bot_id) {
+            return Err(OmonError::Config(format!(
+                "default Discord bot identity {default_bot_id} has no HTTP client"
+            )));
+        }
+        Ok(Self {
+            clients: Arc::new(clients),
+            default_bot_id,
+            streams: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     fn target(session: &SessionKey) -> Result<ChannelId> {
@@ -242,20 +284,80 @@ impl DiscordEgress {
             .map(ChannelId::new)
             .map_err(|_| OmonError::Config(format!("invalid Discord channel ID: {value}")))
     }
+
+    fn identity<'a>(&'a self, session: &'a SessionKey) -> &'a str {
+        session.bot_id.as_deref().unwrap_or(&self.default_bot_id)
+    }
+
+    fn http_for(&self, session: &SessionKey) -> Result<Arc<serenity::Http>> {
+        let identity = self.identity(session);
+        self.clients.get(identity).cloned().ok_or_else(|| {
+            OmonError::Config(format!(
+                "no Discord HTTP client configured for bot identity {identity}"
+            ))
+        })
+    }
+
+    async fn stream(&self, session: SessionKey, chunk: crate::StreamChunk) -> Result<()> {
+        let identity = self.identity(&session).to_owned();
+        let key = (identity, chunk.stream_id);
+        let channel = Self::target(&session)?;
+        let http = self.http_for(&session)?;
+
+        let active = {
+            let mut streams = self.streams.lock().await;
+            if let Some(active) = streams.get(&key) {
+                active.clone()
+            } else {
+                let transport = Arc::new(SerenityMessageTransport::new(http));
+                let message_id = transport
+                    .send_message(channel, "\u{200b}".to_owned())
+                    .await?;
+                let active = Arc::new(ActiveDiscordStream {
+                    throttler: Arc::new(LiveEditThrottler::new(transport, channel, message_id)),
+                    last_sequence: Mutex::new(None),
+                });
+                streams.insert(key.clone(), active.clone());
+                active
+            }
+        };
+
+        let mut last_sequence = active.last_sequence.lock().await;
+        if last_sequence.is_some_and(|sequence| chunk.sequence <= sequence) {
+            return Ok(());
+        }
+        active
+            .throttler
+            .update(&chunk.content, chunk.is_final)
+            .await?;
+        *last_sequence = Some(chunk.sequence);
+        drop(last_sequence);
+
+        if chunk.is_final {
+            let mut streams = self.streams.lock().await;
+            if streams
+                .get(&key)
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &active))
+            {
+                streams.remove(&key);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl OutboundDispatcher for DiscordEgress {
     async fn dispatch(&self, action: OutboundAction) -> Result<()> {
-        let http = &self.http;
         match action {
             OutboundAction::SendMessage {
                 session, content, ..
             } => {
+                let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
                 for chunk in chunk_markdown(&content, DISCORD_MESSAGE_LIMIT) {
                     channel
-                        .send_message(http, CreateMessage::new().content(chunk))
+                        .send_message(&http, CreateMessage::new().content(chunk))
                         .await?;
                 }
             }
@@ -264,6 +366,7 @@ impl OutboundDispatcher for DiscordEgress {
                 platform_message_id,
                 content,
             } => {
+                let http = self.http_for(&session)?;
                 let message_id = platform_message_id
                     .parse::<u64>()
                     .map(MessageId::new)
@@ -273,13 +376,14 @@ impl OutboundDispatcher for DiscordEgress {
                         ))
                     })?;
                 Self::target(&session)?
-                    .edit_message(http, message_id, EditMessage::new().content(content))
+                    .edit_message(&http, message_id, EditMessage::new().content(content))
                     .await?;
             }
             OutboundAction::DeleteMessage {
                 session,
                 platform_message_id,
             } => {
+                let http = self.http_for(&session)?;
                 let message_id = platform_message_id
                     .parse::<u64>()
                     .map(MessageId::new)
@@ -289,15 +393,14 @@ impl OutboundDispatcher for DiscordEgress {
                         ))
                     })?;
                 Self::target(&session)?
-                    .delete_message(http, message_id)
+                    .delete_message(&http, message_id)
                     .await?;
             }
             OutboundAction::Stream { session, chunk } => {
-                Self::target(&session)?
-                    .send_message(http, CreateMessage::new().content(chunk.content))
-                    .await?;
+                self.stream(session, chunk).await?;
             }
             OutboundAction::Typing { session } => {
+                let http = self.http_for(&session)?;
                 http.broadcast_typing(Self::target(&session)?).await?;
             }
         }

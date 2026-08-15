@@ -7,7 +7,7 @@ use omon_gateway::{
     OmonError,
 };
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 struct RecordingExecutor(mpsc::UnboundedSender<String>);
 
@@ -15,6 +15,29 @@ struct RecordingExecutor(mpsc::UnboundedSender<String>);
 impl CronTaskExecutor for RecordingExecutor {
     async fn execute(&self, job: &CronJob) -> Result<Option<String>, OmonError> {
         self.0.send(job.id.clone()).unwrap();
+        Ok(Some("finished".into()))
+    }
+}
+
+struct FailingExecutor;
+
+#[async_trait]
+impl CronTaskExecutor for FailingExecutor {
+    async fn execute(&self, _job: &CronJob) -> Result<Option<String>, OmonError> {
+        Err(OmonError::ToolExecution("intentional failure".into()))
+    }
+}
+
+struct BlockingExecutor {
+    started: mpsc::UnboundedSender<String>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl CronTaskExecutor for BlockingExecutor {
+    async fn execute(&self, job: &CronJob) -> Result<Option<String>, OmonError> {
+        self.started.send(job.id.clone()).unwrap();
+        self.release.notified().await;
         Ok(Some("finished".into()))
     }
 }
@@ -31,11 +54,17 @@ async fn cron_scheduler_registers_triggers_and_manages_jobs() {
         ))
         .await
         .unwrap();
+    let scheduled = job.next_run_at;
 
     assert!(job.enabled);
     assert_eq!(scheduler.list_active().await.unwrap().len(), 1);
     assert!(scheduler.trigger(&job.id).await.unwrap());
     assert_eq!(rx.recv().await.unwrap(), job.id);
+    scheduler.shutdown().await;
+    assert_eq!(
+        scheduler.get(&job.id).await.unwrap().unwrap().next_run_at,
+        scheduled
+    );
     assert!(scheduler.pause(&job.id).await.unwrap());
     assert!(scheduler.list_active().await.unwrap().is_empty());
     assert!(scheduler.resume(&job.id).await.unwrap());
@@ -81,6 +110,105 @@ async fn background_scheduler_executes_due_interval_and_notifies_channel() {
     assert_eq!(event.channel_id, 123456);
     assert_eq!(event.content, "finished");
     scheduler.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_due_run_keeps_schedule_and_records_failed_lease() {
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let scheduler = CronScheduler::new(database.pool().clone(), Arc::new(FailingExecutor));
+    let job = scheduler
+        .register(CronJobSpec::new(
+            "once:2999-01-01T00:00:00Z",
+            json!({"content": "run"}),
+        ))
+        .await
+        .unwrap();
+    let due = chrono::Utc::now() - chrono::TimeDelta::seconds(1);
+    sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+        .bind(due)
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 1);
+    scheduler.shutdown().await;
+
+    let updated = scheduler.get(&job.id).await.unwrap().unwrap();
+    assert!(updated.enabled);
+    assert!(updated
+        .next_run_at
+        .is_some_and(|next| next <= chrono::Utc::now()));
+    let (status, error): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, error FROM cron_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "failed");
+    assert!(error.is_some_and(|value| value.contains("intentional failure")));
+}
+
+#[tokio::test]
+async fn active_lease_blocks_duplicate_claims_until_success_commits_one_shot() {
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Notify::new());
+    let scheduler = CronScheduler::new(
+        database.pool().clone(),
+        Arc::new(BlockingExecutor {
+            started: started_tx,
+            release: release.clone(),
+        }),
+    );
+    let job = scheduler
+        .register(CronJobSpec::new(
+            "once:2999-01-01T00:00:00Z",
+            json!({"content": "run"}),
+        ))
+        .await
+        .unwrap();
+    let due = chrono::Utc::now() - chrono::TimeDelta::seconds(1);
+    sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+        .bind(due)
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 1);
+    assert_eq!(started_rx.recv().await.unwrap(), job.id);
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 0);
+    assert!(!scheduler.trigger(&job.id).await.unwrap());
+
+    let during = scheduler.get(&job.id).await.unwrap().unwrap();
+    assert!(during.enabled);
+    assert!(during.next_run_at.is_some());
+    let running: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cron_runs WHERE job_id = ? AND status = 'running'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(running, 1);
+
+    release.notify_waiters();
+    scheduler.shutdown().await;
+
+    let completed = scheduler.get(&job.id).await.unwrap().unwrap();
+    assert!(!completed.enabled);
+    assert!(completed.next_run_at.is_none());
+    let (status, completed_at): (String, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT status, completed_at FROM cron_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "succeeded");
+    assert!(completed_at.is_some());
 }
 
 #[test]

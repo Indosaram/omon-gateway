@@ -50,9 +50,19 @@ pub(crate) async fn collect(multiplexer: &SessionMultiplexer) -> Result<usize> {
         .collect();
     let mut evicted = 0;
 
-    for (key, sender) in sessions {
+    for (key, handle) in sessions {
+        if !handle.try_retire() {
+            continue;
+        }
+
+        // Once retirement starts, new routes wait instead of enqueueing to this
+        // actor. Waiting for already-started sends makes the eviction command a
+        // strict mailbox barrier: every accepted event is queued before it.
+        handle.wait_for_in_flight().await;
+
         let (reply_tx, reply_rx) = oneshot::channel();
-        if sender
+        if handle
+            .sender
             .send(ActorCommand::EvictIfIdle {
                 idle_timeout: multiplexer.idle_timeout(),
                 reply: reply_tx,
@@ -60,25 +70,25 @@ pub(crate) async fn collect(multiplexer: &SessionMultiplexer) -> Result<usize> {
             .await
             .is_err()
         {
-            multiplexer
-                .sessions
-                .remove_if(&key, |_, current| current.same_channel(&sender));
+            multiplexer.remove_handle(&key, &handle);
+            handle.mark_finished();
             continue;
         }
 
         match reply_rx.await {
             Ok(Ok(true)) => {
-                multiplexer
-                    .sessions
-                    .remove_if(&key, |_, current| current.same_channel(&sender));
+                multiplexer.remove_handle(&key, &handle);
+                handle.mark_finished();
                 evicted += 1;
             }
-            Ok(Ok(false)) => {}
-            Ok(Err(error)) => return Err(error),
+            Ok(Ok(false)) => handle.resume(),
+            Ok(Err(error)) => {
+                handle.resume();
+                return Err(error);
+            }
             Err(_) => {
-                multiplexer
-                    .sessions
-                    .remove_if(&key, |_, current| current.same_channel(&sender));
+                multiplexer.remove_handle(&key, &handle);
+                handle.mark_finished();
             }
         }
     }

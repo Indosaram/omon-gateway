@@ -19,6 +19,7 @@ pub struct PoiseData {
     pub approvals: SmartApprovalGuard,
     pub free_response_channels: Vec<u64>,
     pub allowed_users: Vec<u64>,
+    pub tool_registry: crate::ToolRegistry,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +41,7 @@ impl PoiseData {
             approvals: SmartApprovalGuard::new(),
             free_response_channels: Vec::new(),
             allowed_users: Vec::new(),
+            tool_registry: crate::ToolRegistry::new(),
         }
     }
 
@@ -60,7 +62,179 @@ impl PoiseData {
 }
 
 pub fn all() -> Vec<poise::Command<PoiseData, CommandError>> {
-    vec![model(), reset(), status(), tools()]
+    vec![model(), reset(), status(), tools(), skill(), cron()]
+}
+
+#[poise::command(slash_command)]
+/// Execute or inspect an OMO skill
+pub async fn skill(
+    ctx: PoiseContext<'_>,
+    #[description = "Skill action: list, search, read, run"] action: String,
+    #[description = "Skill name or query"] name_or_query: Option<String>,
+) -> Result<(), CommandError> {
+    ctx.defer().await?;
+    let data = ctx.data();
+    let query_val = name_or_query.clone().unwrap_or_default();
+
+    match action.as_str() {
+        "list" => {
+            let res = data
+                .tool_registry
+                .execute("skills", serde_json::json!({"action": "list"}))
+                .await;
+            match res {
+                Ok(val) => {
+                    let total = val
+                        .get("total_skills")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let skills = val
+                        .get("skills")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let list_str = skills
+                        .iter()
+                        .take(30)
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    ctx.say(format!("📚 **Available OMO Skills** ({total} total):\n`{list_str}`\n*(Use `/skill action:read name_or_query:<skill_name>` to inspect)*")).await?;
+                }
+                Err(e) => {
+                    ctx.say(format!("❌ Failed to list skills: {e}")).await?;
+                }
+            }
+        }
+        "search" => {
+            let res = data
+                .tool_registry
+                .execute(
+                    "skills",
+                    serde_json::json!({"action": "search", "query": query_val}),
+                )
+                .await;
+            match res {
+                Ok(val) => {
+                    let count = val.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let matches = val
+                        .get("matches")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let list_str = matches
+                        .iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n- ");
+                    ctx.say(format!("🔍 **Skill Search Results for `{query_val}`** ({count} matches):\n- {list_str}")).await?;
+                }
+                Err(e) => {
+                    ctx.say(format!("❌ Search failed: {e}")).await?;
+                }
+            }
+        }
+        "read" => {
+            let res = data
+                .tool_registry
+                .execute(
+                    "skills",
+                    serde_json::json!({"action": "read", "name": query_val}),
+                )
+                .await;
+            match res {
+                Ok(val) => {
+                    let content = val
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("No content");
+                    let preview = if content.len() > 1800 {
+                        &content[..1800]
+                    } else {
+                        content
+                    };
+                    ctx.say(format!(
+                        "📖 **Skill: `{query_val}`**\n```markdown\n{preview}\n```"
+                    ))
+                    .await?;
+                }
+                Err(e) => {
+                    ctx.say(format!("❌ Could not read skill `{query_val}`: {e}"))
+                        .await?;
+                }
+            }
+        }
+        "run" => {
+            ctx.say(format!(
+                "🚀 Injecting skill `{query_val}` into current OMO session..."
+            ))
+            .await?;
+            let session_key = session_key(ctx).await?;
+            let prompt = format!("Execute skill: {}", query_val);
+            let event = crate::InboundEvent::message(session_key, ctx.id().to_string(), prompt);
+            let _ = data.multiplexer.route(event).await;
+        }
+        _ => {
+            ctx.say("Usage: `/skill action:<list|search|read|run> name_or_query:<name>`")
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+#[poise::command(slash_command)]
+/// Inspect or manage background cron jobs
+pub async fn cron(
+    ctx: PoiseContext<'_>,
+    #[description = "Cron action: list, add, delete"] action: Option<String>,
+) -> Result<(), CommandError> {
+    ctx.defer().await?;
+    let data = ctx.data();
+    let act = action.unwrap_or_else(|| "list".to_string());
+
+    match act.as_str() {
+        "list" => {
+            let res = data
+                .tool_registry
+                .execute("cron", serde_json::json!({"action": "list"}))
+                .await;
+            match res {
+                Ok(val) => {
+                    let count = val.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let jobs = val
+                        .get("cron_jobs")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut lines = Vec::new();
+                    for j in jobs.iter().take(15) {
+                        let id = j.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                        let expr = j
+                            .get("expression")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let next = j
+                            .get("next_run_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("paused");
+                        lines.push(format!("• `{id}`: `{expr}` (Next: `{next}`)"));
+                    }
+                    let body = lines.join("\n");
+                    ctx.say(format!(
+                        "⏰ **Active OMO Cron Jobs** ({count} total):\n{body}"
+                    ))
+                    .await?;
+                }
+                Err(e) => {
+                    ctx.say(format!("❌ Failed to list cron jobs: {e}")).await?;
+                }
+            }
+        }
+        _ => {
+            ctx.say("Usage: `/cron [action:list]`").await?;
+        }
+    }
+    Ok(())
 }
 
 #[poise::command(slash_command)]
@@ -164,7 +338,8 @@ async fn session_key(ctx: PoiseContext<'_>) -> Result<SessionKey, CommandError> 
         channel_id.to_string(),
         thread_id,
         ctx.author().id.to_string(),
-    ))
+    )
+    .with_bot_id(ctx.serenity_context().cache.current_user().id.to_string()))
 }
 
 fn is_thread(kind: serenity::ChannelType) -> bool {

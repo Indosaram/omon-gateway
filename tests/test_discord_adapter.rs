@@ -15,6 +15,7 @@ enum Call {
     Typing,
     Edit(MessageId, String),
     Send(String),
+    Delete(MessageId),
 }
 
 struct MockTransport {
@@ -47,6 +48,11 @@ impl DiscordMessageTransport for MockTransport {
         self.calls.lock().await.push(Call::Send(content));
         Ok(MessageId::new(99))
     }
+
+    async fn delete_message(&self, _channel_id: ChannelId, message_id: MessageId) -> Result<()> {
+        self.calls.lock().await.push(Call::Delete(message_id));
+        Ok(())
+    }
 }
 
 #[test]
@@ -68,7 +74,7 @@ fn chunks_markdown_at_discord_limit_and_balances_code_fences() {
 
 #[tokio::test(start_paused = true)]
 async fn live_edits_use_typing_and_debounce_subsequent_updates() {
-    let (typing_tx, mut typing_rx) = mpsc::unbounded_channel();
+    let (typing_tx, _typing_rx) = mpsc::unbounded_channel();
     let transport = Arc::new(MockTransport {
         calls: Mutex::new(Vec::new()),
         typing: typing_tx,
@@ -81,16 +87,16 @@ async fn live_edits_use_typing_and_debounce_subsequent_updates() {
     ));
 
     throttler.update("first", false).await.unwrap();
-    typing_rx.recv().await.unwrap();
     let update = {
         let throttler = throttler.clone();
         tokio::spawn(async move { throttler.update("second", false).await })
     };
-    typing_rx.recv().await.unwrap();
-    assert_eq!(transport.calls.lock().await.len(), 3);
+    tokio::task::yield_now().await;
+    assert_eq!(transport.calls.lock().await.len(), 2);
 
     tokio::time::advance(Duration::from_millis(799)).await;
-    assert_eq!(transport.calls.lock().await.len(), 3);
+    tokio::task::yield_now().await;
+    assert_eq!(transport.calls.lock().await.len(), 2);
     tokio::time::advance(Duration::from_millis(1)).await;
     update.await.unwrap().unwrap();
 
@@ -103,6 +109,68 @@ async fn live_edits_use_typing_and_debounce_subsequent_updates() {
             Call::Edit(MessageId::new(8), "second".into()),
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_live_edit_preempts_a_sleeping_intermediate_update() {
+    let (typing_tx, _typing_rx) = mpsc::unbounded_channel();
+    let transport = Arc::new(MockTransport {
+        calls: Mutex::new(Vec::new()),
+        typing: typing_tx,
+    });
+    let throttler = Arc::new(LiveEditThrottler::with_debounce(
+        transport.clone(),
+        ChannelId::new(7),
+        MessageId::new(8),
+        Duration::from_millis(800),
+    ));
+
+    throttler.update("first", false).await.unwrap();
+    let stale = {
+        let throttler = throttler.clone();
+        tokio::spawn(async move { throttler.update("stale", false).await })
+    };
+    tokio::task::yield_now().await;
+
+    tokio::time::timeout(Duration::from_millis(1), throttler.update("final", true))
+        .await
+        .expect("final update must not wait behind the debounce sleeper")
+        .unwrap();
+    assert_eq!(
+        *transport.calls.lock().await,
+        vec![
+            Call::Typing,
+            Call::Edit(MessageId::new(8), "first".into()),
+            Call::Typing,
+            Call::Edit(MessageId::new(8), "final".into()),
+        ]
+    );
+
+    tokio::time::advance(Duration::from_millis(800)).await;
+    stale.await.unwrap().unwrap();
+    assert_eq!(transport.calls.lock().await.len(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_live_edit_deletes_surplus_chunk_messages() {
+    let (typing_tx, _typing_rx) = mpsc::unbounded_channel();
+    let transport = Arc::new(MockTransport {
+        calls: Mutex::new(Vec::new()),
+        typing: typing_tx,
+    });
+    let throttler = LiveEditThrottler::with_debounce(
+        transport.clone(),
+        ChannelId::new(7),
+        MessageId::new(8),
+        Duration::from_millis(800),
+    );
+
+    throttler.update(&"x".repeat(2_100), false).await.unwrap();
+    throttler.update("short", true).await.unwrap();
+
+    let calls = transport.calls.lock().await;
+    assert!(calls.iter().any(|call| matches!(call, Call::Send(_))));
+    assert!(calls.contains(&Call::Delete(MessageId::new(99))));
 }
 
 #[tokio::test(start_paused = true)]

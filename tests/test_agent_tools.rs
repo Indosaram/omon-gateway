@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use omon_gateway::{
-    ChatMessage, Database, FileTool, LlmClient, LlmConfig, LlmProvider, MemoryStore, SessionKey,
-    TerminalTool, Tool, ToolDefinition,
+    ChatMessage, Database, FileTool, LlmClient, LlmConfig, LlmProvider, McpClientTool,
+    McpTransport, MemoryStore, SessionKey, TerminalTool, Tool, ToolDefinition,
 };
 use serde_json::json;
 
@@ -48,13 +48,28 @@ async fn terminal_executes_processes_and_captures_status() {
     let root = tempfile_dir("terminal");
     let tool = TerminalTool::new(&root).with_timeout(Duration::from_secs(2));
     let output = tool
-        .execute(json!({"program": "/bin/sh", "args": ["-c", "printf hello; printf warning >&2; exit 3"]}))
+        .execute(
+            json!({"program": "sh", "args": ["-c", "printf hello; printf warning >&2; exit 3"]}),
+        )
         .await
         .unwrap();
     assert_eq!(output["stdout"], "hello");
     assert_eq!(output["stderr"], "warning");
     assert_eq!(output["exit_code"], 3);
     assert_eq!(output["success"], false);
+
+    assert!(tool
+        .execute(json!({"program": "sh", "args": ["-c", "pwd"], "cwd": "../"}))
+        .await
+        .is_err());
+    assert!(tool
+        .execute(json!({"program": "/bin/sh", "args": ["-c", "true"]}))
+        .await
+        .is_err());
+    assert!(tool
+        .execute(json!({"program": "../outside.sh"}))
+        .await
+        .is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -86,7 +101,53 @@ async fn file_tool_reads_writes_lists_searches_and_blocks_traversal() {
         .execute(json!({"operation": "read", "path": "../outside"}))
         .await
         .is_err());
+    assert!(tool
+        .execute(json!({"operation": "write", "path": "../outside", "content": "escape"}))
+        .await
+        .is_err());
+
+    #[cfg(unix)]
+    {
+        let outside = tempfile_dir("file-outside");
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        assert!(tool
+            .execute(json!({"operation": "write", "path": "escape/pwned.txt", "content": "escape"}))
+            .await
+            .is_err());
+        assert!(tool
+            .execute(json!({"operation": "read", "path": "escape/secret.txt"}))
+            .await
+            .is_err());
+        assert!(!outside.join("pwned.txt").exists());
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn mcp_stdio_drains_large_stderr_without_blocking_jsonrpc_response() {
+    let script = r#"
+import sys
+sys.stderr.write("x" * 262144)
+sys.stderr.flush()
+print('{"jsonrpc":"2.0","id":1,"result":{"ok":true}}', flush=True)
+"#;
+    let tool = McpClientTool::new(
+        "fixture",
+        "fixture_remote",
+        "test MCP transport",
+        json!({"type": "object"}),
+        McpTransport::Stdio {
+            program: "python3".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: None,
+        },
+    )
+    .with_timeout(Duration::from_secs(2));
+
+    let result = tool.execute(json!({"input": "ignored"})).await.unwrap();
+    assert_eq!(result["ok"], true);
 }
 
 #[tokio::test]

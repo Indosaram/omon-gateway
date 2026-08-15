@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
@@ -23,7 +24,11 @@ impl FileTool {
         }
     }
 
-    fn path(&self, value: &str) -> Result<PathBuf, OmonError> {
+    fn canonical_root(&self) -> Result<PathBuf, OmonError> {
+        std::fs::canonicalize(&self.root).map_err(tool_error)
+    }
+
+    fn relative_path(value: &str) -> Result<&Path, OmonError> {
         let relative = Path::new(value);
         if relative.is_absolute()
             || relative.components().any(|component| {
@@ -35,11 +40,17 @@ impl FileTool {
         {
             return Err(OmonError::ToolExecution("path escapes tool root".into()));
         }
-        Ok(self.root.join(relative))
+        Ok(relative)
     }
 
     async fn read(&self, args: &Value) -> Result<Value, OmonError> {
         let path = self.checked_existing(required(args, "path")?)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(tool_error)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(OmonError::ToolExecution(
+                "read path must resolve to a regular file inside tool root".into(),
+            ));
+        }
         let bytes = fs::read(path).await.map_err(tool_error)?;
         if bytes.len() > self.max_read_bytes {
             return Err(OmonError::ToolExecution(format!(
@@ -53,29 +64,99 @@ impl FileTool {
     }
 
     async fn write(&self, args: &Value) -> Result<Value, OmonError> {
-        let path = self.path(required(args, "path")?)?;
+        let relative = Self::relative_path(required(args, "path")?)?;
         let content = required(args, "content")?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await.map_err(tool_error)?;
-            self.ensure_inside_root(parent)?;
+        let root = self.canonical_root()?;
+        let path = root.join(relative);
+        let parent = path
+            .parent()
+            .ok_or_else(|| OmonError::ToolExecution("invalid write path".into()))?;
+        self.create_checked_directories(&root, parent).await?;
+
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(OmonError::ToolExecution(
+                    "refusing to write through a symbolic link".into(),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                return Err(OmonError::ToolExecution(
+                    "write path resolves to a directory".into(),
+                ));
+            }
+            Ok(_) => {
+                self.ensure_inside_root(&path)?;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(tool_error(error)),
         }
-        if path.exists() {
-            self.ensure_inside_root(&path)?;
-        }
+
         fs::write(&path, content).await.map_err(tool_error)?;
-        Ok(json!({"path": relative_string(&self.root, &path), "bytes_written": content.len()}))
+        let written = self.ensure_inside_root(&path)?;
+        let metadata = std::fs::symlink_metadata(&written).map_err(tool_error)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(OmonError::ToolExecution(
+                "written path is not a regular file inside tool root".into(),
+            ));
+        }
+        Ok(json!({"path": relative_string(&root, &written), "bytes_written": content.len()}))
+    }
+
+    async fn create_checked_directories(
+        &self,
+        root: &Path,
+        parent: &Path,
+    ) -> Result<(), OmonError> {
+        let relative = parent
+            .strip_prefix(root)
+            .map_err(|_| OmonError::ToolExecution("path escapes tool root".into()))?;
+        let mut current = root.to_path_buf();
+        for component in relative.components() {
+            match component {
+                Component::CurDir => continue,
+                Component::Normal(name) => current.push(name),
+                _ => {
+                    return Err(OmonError::ToolExecution("path escapes tool root".into()));
+                }
+            }
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(OmonError::ToolExecution(
+                            "write path contains a non-directory or symbolic link".into(),
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    fs::create_dir(&current).await.map_err(tool_error)?;
+                    let metadata = std::fs::symlink_metadata(&current).map_err(tool_error)?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(OmonError::ToolExecution(
+                            "created path is not a directory inside tool root".into(),
+                        ));
+                    }
+                }
+                Err(error) => return Err(tool_error(error)),
+            }
+            let canonical = std::fs::canonicalize(&current).map_err(tool_error)?;
+            if !canonical.starts_with(root) {
+                return Err(OmonError::ToolExecution("path escapes tool root".into()));
+            }
+        }
+        Ok(())
     }
 
     async fn list(&self, args: &Value) -> Result<Value, OmonError> {
         let path =
             self.checked_existing(args.get("path").and_then(Value::as_str).unwrap_or("."))?;
         let mut reader = fs::read_dir(&path).await.map_err(tool_error)?;
+        let root = self.canonical_root()?;
         let mut entries = Vec::new();
         while let Some(entry) = reader.next_entry().await.map_err(tool_error)? {
             let metadata = entry.metadata().await.map_err(tool_error)?;
             entries.push(json!({
                 "name": entry.file_name().to_string_lossy(),
-                "path": relative_string(&self.root, &entry.path()),
+                "path": relative_string(&root, &entry.path()),
                 "is_dir": metadata.is_dir(),
                 "size": metadata.len()
             }));
@@ -88,7 +169,7 @@ impl FileTool {
         let query = required(args, "query")?.to_owned();
         let start =
             self.checked_existing(args.get("path").and_then(Value::as_str).unwrap_or("."))?;
-        let root = std::fs::canonicalize(&self.root).map_err(tool_error)?;
+        let root = self.canonical_root()?;
         let limit = self.max_search_results;
         let matches =
             tokio::task::spawn_blocking(move || search_files(&root, &start, &query, limit))
@@ -98,14 +179,19 @@ impl FileTool {
     }
 
     fn checked_existing(&self, value: &str) -> Result<PathBuf, OmonError> {
-        let path = self.path(value)?;
-        self.ensure_inside_root(&path)
+        let relative = Self::relative_path(value)?;
+        let root = self.canonical_root()?;
+        let path = std::fs::canonicalize(root.join(relative)).map_err(tool_error)?;
+        if !path.starts_with(&root) {
+            return Err(OmonError::ToolExecution("path escapes tool root".into()));
+        }
+        Ok(path)
     }
 
     fn ensure_inside_root(&self, path: &Path) -> Result<PathBuf, OmonError> {
-        let root = std::fs::canonicalize(&self.root).map_err(tool_error)?;
+        let root = self.canonical_root()?;
         let path = std::fs::canonicalize(path).map_err(tool_error)?;
-        if !path.starts_with(root) {
+        if !path.starts_with(&root) {
             return Err(OmonError::ToolExecution("path escapes tool root".into()));
         }
         Ok(path)
@@ -163,7 +249,10 @@ fn search_files(
         }
         if metadata.is_dir() {
             for entry in std::fs::read_dir(path).map_err(tool_error)? {
-                pending.push(entry.map_err(tool_error)?.path());
+                let path = entry.map_err(tool_error)?.path();
+                if path.starts_with(root) {
+                    pending.push(path);
+                }
             }
             continue;
         }

@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,6 +13,7 @@ use omon_gateway::{
     OutboundDispatcher, PoiseData, Result, ScaleToZero, SessionContext, SessionKey,
     SessionMultiplexer, TerminalTool, ToolDefinition, ToolRegistry,
 };
+use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
@@ -155,6 +157,12 @@ impl OutboundDispatcher for SharedDispatcher {
     }
 }
 
+struct StreamEmissionState {
+    stream_id: Uuid,
+    next_sequence: u64,
+    content: String,
+}
+
 struct LiveAgentRunner {
     pool: SqlitePool,
     memory: MemoryStore,
@@ -162,6 +170,7 @@ struct LiveAgentRunner {
     llm: LlmClient,
     dispatcher: Arc<dyn OutboundDispatcher>,
     workspace_root: PathBuf,
+    streams: ParkingMutex<HashMap<String, StreamEmissionState>>,
 }
 
 impl LiveAgentRunner {
@@ -171,7 +180,13 @@ impl LiveAgentRunner {
         event: &InboundEvent,
     ) -> Result<Vec<ChatMessage>> {
         let history: Vec<(String, String)> = sqlx::query_as(
-            "SELECT role, content FROM messages WHERE session_key = ? ORDER BY created_at, id LIMIT 100",
+            "SELECT role, content FROM (
+                SELECT sequence, role, content
+                FROM messages
+                WHERE session_key = ?
+                ORDER BY sequence DESC
+                LIMIT 100
+             ) ORDER BY sequence ASC",
         )
         .bind(session.key.storage_key())
         .fetch_all(&self.pool)
@@ -261,14 +276,19 @@ impl LiveAgentRunner {
         content: &str,
         metadata: serde_json::Value,
     ) -> Result<()> {
+        let now = chrono::Utc::now();
         sqlx::query(
-            "INSERT INTO messages (id, session_key, role, content, metadata_json) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO messages (id, session_key, role, content, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(session.key.storage_key())
         .bind(role)
         .bind(content)
-        .bind(serde_json::to_string(&metadata).map_err(|error| OmonError::Database(error.to_string()))?)
+        .bind(
+            serde_json::to_string(&metadata)
+                .map_err(|error| OmonError::Database(error.to_string()))?,
+        )
+        .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -283,6 +303,7 @@ impl LiveAgentRunner {
         stream_output: bool,
     ) -> Result<String> {
         if stream_output {
+            self.streams.lock().remove(&session.key.storage_key());
             let _ = self
                 .dispatcher
                 .dispatch(OutboundAction::Typing {
@@ -292,11 +313,30 @@ impl LiveAgentRunner {
         }
         info!(session = %session.key, user = %event.session.user_id, content = %event.content, "Starting agent execution for message");
         let mut messages = self.messages(session, &event).await?;
+        let mut user_content = event.content.clone();
+        let lower = user_content.to_lowercase();
+        let is_ulw = lower.contains("ulw")
+            || lower.contains("ultrawork")
+            || lower.contains("울트라워크")
+            || lower.contains("/ulw");
+
+        if is_ulw {
+            let ulw_directive = "\n\n<ultrawork-mode>\n\
+                **MANDATORY**: First user-visible line this turn MUST be exactly:\n\
+                `ULTRAWORK MODE ENABLED!`\n\n\
+                [CODE RED] Maximum precision. Outcome-first. Evidence-driven.\n\
+                - Decompose work into systematic, evidence-bound steps.\n\
+                - Actively use available tools (terminal, file, web_search, browser, mcp, skills) to inspect, execute, and verify.\n\
+                - Never claim completion without executing and verifying real artifacts.\n\
+                </ultrawork-mode>";
+            user_content = format!("{}{}", user_content, ulw_directive);
+        }
+
         if !messages
             .iter()
-            .any(|message| message.role == "user" && message.content == event.content)
+            .any(|message| message.role == "user" && message.content == user_content)
         {
-            messages.push(ChatMessage::new("user", &event.content));
+            messages.push(ChatMessage::new("user", &user_content));
         }
         ensure_agent_session(&self.pool, session).await?;
         let tools = execution_tools.unwrap_or(&self.tools);
@@ -341,6 +381,8 @@ impl LiveAgentRunner {
                             true,
                         )
                         .await?;
+                    } else {
+                        self.emit(session, String::new(), true).await?;
                     }
                 }
                 self.persist_message(session, "assistant", &response, json!({}))
@@ -356,6 +398,9 @@ impl LiveAgentRunner {
             self.persist_message(session, "assistant", "", json!({"tool_calls": calls}))
                 .await?;
             for call in calls {
+                let status_msg = format!("\n\n⚙️ Running tool `{}`...", call.name);
+                let _ = self.emit(session, status_msg, false).await;
+
                 let result = tools.execute(&call.name, call.arguments.clone()).await;
                 let content = match result {
                     Ok(value) => value.to_string(),
@@ -394,17 +439,44 @@ impl LiveAgentRunner {
         content: String,
         final_chunk: bool,
     ) -> Result<()> {
-        self.dispatcher
+        let session_key = session.key.storage_key();
+        let chunk = {
+            let mut streams = self.streams.lock();
+            let state = streams
+                .entry(session_key.clone())
+                .or_insert_with(|| StreamEmissionState {
+                    stream_id: Uuid::new_v4(),
+                    next_sequence: 0,
+                    content: String::new(),
+                });
+            state.content.push_str(&content);
+            let chunk = omon_gateway::StreamChunk {
+                stream_id: state.stream_id,
+                sequence: state.next_sequence,
+                content: state.content.clone(),
+                is_final: final_chunk,
+            };
+            state.next_sequence = state.next_sequence.saturating_add(1);
+            chunk
+        };
+        let stream_id = chunk.stream_id;
+        let result = self
+            .dispatcher
             .dispatch(OutboundAction::Stream {
                 session: session.key.clone(),
-                chunk: omon_gateway::StreamChunk {
-                    stream_id: Uuid::new_v4(),
-                    sequence: 0,
-                    content,
-                    is_final: final_chunk,
-                },
+                chunk,
             })
-            .await
+            .await;
+        if final_chunk {
+            let mut streams = self.streams.lock();
+            if streams
+                .get(&session_key)
+                .is_some_and(|state| state.stream_id == stream_id)
+            {
+                streams.remove(&session_key);
+            }
+        }
+        result
     }
 }
 
@@ -428,7 +500,8 @@ fn tool_enabled(name: &str, enabled: Option<&[String]>) -> bool {
 
 async fn ensure_agent_session(pool: &SqlitePool, session: &SessionContext) -> Result<()> {
     sqlx::query(
-        "INSERT INTO sessions (session_key, platform, guild_id, channel_id, thread_id, user_id, state_json, created_at, updated_at)\n         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_key) DO NOTHING",
+        "INSERT INTO sessions (session_key, platform, guild_id, channel_id, thread_id, user_id, state_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_key) DO NOTHING",
     )
     .bind(session.key.storage_key())
     .bind(&session.key.platform)
@@ -436,7 +509,10 @@ async fn ensure_agent_session(pool: &SqlitePool, session: &SessionContext) -> Re
     .bind(&session.key.channel_id)
     .bind(&session.key.thread_id)
     .bind(&session.key.user_id)
-    .bind(serde_json::to_string(&session.state).map_err(|error| OmonError::Database(error.to_string()))?)
+    .bind(
+        serde_json::to_string(&session.state)
+            .map_err(|error| OmonError::Database(error.to_string()))?,
+    )
     .bind(session.created_at)
     .bind(session.updated_at)
     .execute(pool)
@@ -459,7 +535,7 @@ impl CronTaskExecutor for AgentCronExecutor {
             OmonError::Config(format!("invalid Hermes job {}: {error}", job.id))
         })?;
         let script_output = if let Some(script) = hermes.script.as_deref() {
-            Some(run_cron_script(&hermes, script).await?)
+            Some(run_cron_script(&hermes, script, &self.runner.workspace_root).await?)
         } else {
             None
         };
@@ -512,7 +588,8 @@ impl CronTaskExecutor for AgentCronExecutor {
             .metadata
             .insert("hermes_cron_job_id".into(), json!(hermes.id));
         let event = InboundEvent::message(session_key, format!("cron:{}", job.id), prompt);
-        let execution_tools = build_cron_tools(&hermes, &self.runner.tools)?;
+        let execution_tools =
+            build_cron_tools(&hermes, &self.runner.tools, &self.runner.workspace_root)?;
         self.runner
             .execute(
                 &mut session,
@@ -533,11 +610,13 @@ async fn execute_native_cron(
 ) -> Result<Option<String>> {
     let script_output =
         if let Some(script) = payload.get("script").and_then(serde_json::Value::as_str) {
+            let workspace = canonical_directory(&runner.workspace_root, "workspace root")?;
             let output = tokio::time::timeout(
                 std::time::Duration::from_secs(15 * 60),
                 tokio::process::Command::new("sh")
                     .arg("-c")
                     .arg(script)
+                    .current_dir(workspace)
                     .kill_on_drop(true)
                     .output(),
             )
@@ -610,13 +689,8 @@ fn load_cron_skills(job: &HermesJob) -> Result<String> {
     if names.is_empty() {
         return Ok(String::new());
     }
-    let home = job
-        .extra
-        .get("_omon_hermes_home")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| OmonError::Config(format!("Hermes job {} is missing its home", job.id)))?;
-    let root = home.join("skills");
+    let home = hermes_home(job)?;
+    let root = canonical_directory(&home.join("skills"), "Hermes skills root")?;
     let mut assembled = String::new();
     for name in names {
         let path = find_skill_file(&root, &name).ok_or_else(|| {
@@ -636,20 +710,36 @@ fn load_cron_skills(job: &HermesJob) -> Result<String> {
     Ok(assembled)
 }
 
-fn find_skill_file(root: &std::path::Path, name: &str) -> Option<PathBuf> {
+fn find_skill_file(root: &Path, name: &str) -> Option<PathBuf> {
+    if Path::new(name).components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
     let direct = root.join(name).join("SKILL.md");
-    if direct.is_file() {
-        return Some(direct);
+    if let Ok(candidate) = std::fs::canonicalize(&direct) {
+        if candidate.starts_with(root) && candidate.is_file() {
+            return Some(candidate);
+        }
     }
     let mut pending = vec![root.to_owned()];
     while let Some(directory) = pending.pop() {
         for entry in std::fs::read_dir(directory).ok()?.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
                 if path.file_name().is_some_and(|value| value == name) {
                     let candidate = path.join("SKILL.md");
-                    if candidate.is_file() {
-                        return Some(candidate);
+                    if let Ok(candidate) = std::fs::canonicalize(candidate) {
+                        if candidate.starts_with(root) && candidate.is_file() {
+                            return Some(candidate);
+                        }
                     }
                 }
                 pending.push(path);
@@ -659,39 +749,58 @@ fn find_skill_file(root: &std::path::Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-fn build_cron_tools(job: &HermesJob, defaults: &ToolRegistry) -> Result<Option<ToolRegistry>> {
+fn build_cron_tools(
+    job: &HermesJob,
+    defaults: &ToolRegistry,
+    workspace_root: &Path,
+) -> Result<Option<ToolRegistry>> {
     let Some(workdir) = job.workdir.as_ref() else {
         return Ok(None);
     };
-    if !workdir.is_absolute() || !workdir.is_dir() {
-        return Err(OmonError::Config(format!(
-            "Hermes job {} has invalid workdir {}",
-            job.id,
-            workdir.display()
-        )));
-    }
+    let roots = authorized_cron_roots(job, workspace_root)?;
+    let workdir = canonical_authorized_directory(workdir, &roots, "Hermes workdir")?;
     let mut tools = defaults.clone();
-    tools.register(TerminalTool::new(workdir));
-    tools.register(FileTool::new(workdir));
+    tools.register(TerminalTool::new(&workdir));
+    tools.register(FileTool::new(&workdir));
     Ok(Some(tools))
 }
 
-async fn run_cron_script(job: &HermesJob, script: &str) -> Result<String> {
-    let home = job
-        .extra
-        .get("_omon_hermes_home")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| OmonError::Config(format!("Hermes job {} is missing its home", job.id)))?;
-    let path = {
-        let candidate = PathBuf::from(script);
-        if candidate.is_absolute() {
-            candidate
-        } else {
-            home.join("scripts").join(candidate)
-        }
+async fn run_cron_script(job: &HermesJob, script: &str, workspace_root: &Path) -> Result<String> {
+    let home = hermes_home(job)?;
+    let scripts_root = canonical_directory(&home.join("scripts"), "Hermes scripts root")?;
+    let candidate = Path::new(script);
+    if candidate.is_absolute()
+        || candidate.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(OmonError::Config(format!(
+            "Hermes job {} script path escapes its scripts root: {script}",
+            job.id
+        )));
+    }
+    let path = std::fs::canonicalize(scripts_root.join(candidate)).map_err(|error| {
+        OmonError::Config(format!(
+            "failed to resolve Hermes script for {}: {error}",
+            job.id
+        ))
+    })?;
+    if !path.starts_with(&scripts_root) || !path.is_file() {
+        return Err(OmonError::Config(format!(
+            "Hermes job {} script escapes its scripts root: {}",
+            job.id,
+            path.display()
+        )));
+    }
+
+    let roots = authorized_cron_roots(job, workspace_root)?;
+    let workdir = match job.workdir.as_ref() {
+        Some(workdir) => canonical_authorized_directory(workdir, &roots, "Hermes workdir")?,
+        None => home,
     };
-    let workdir = job.workdir.clone().unwrap_or_else(|| home.clone());
     let mut command = if matches!(
         path.extension().and_then(|value| value.to_str()),
         Some("sh" | "bash")
@@ -724,6 +833,50 @@ async fn run_cron_script(job: &HermesJob, script: &str) -> Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn hermes_home(job: &HermesJob) -> Result<PathBuf> {
+    let home = job
+        .extra
+        .get("_omon_hermes_home")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| OmonError::Config(format!("Hermes job {} is missing its home", job.id)))?;
+    canonical_directory(&home, "Hermes home")
+}
+
+fn authorized_cron_roots(job: &HermesJob, workspace_root: &Path) -> Result<Vec<PathBuf>> {
+    let workspace_root = canonical_directory(workspace_root, "workspace root")?;
+    let home = hermes_home(job)?;
+    if home == workspace_root {
+        Ok(vec![workspace_root])
+    } else {
+        Ok(vec![workspace_root, home])
+    }
+}
+
+fn canonical_authorized_directory(path: &Path, roots: &[PathBuf], kind: &str) -> Result<PathBuf> {
+    let path = canonical_directory(path, kind)?;
+    if roots.iter().any(|root| path.starts_with(root)) {
+        Ok(path)
+    } else {
+        Err(OmonError::Config(format!(
+            "{kind} is outside authorized workspace/Hermes roots: {}",
+            path.display()
+        )))
+    }
+}
+
+fn canonical_directory(path: &Path, kind: &str) -> Result<PathBuf> {
+    let path = std::fs::canonicalize(path)
+        .map_err(|error| OmonError::Config(format!("failed to resolve {kind}: {error}")))?;
+    if !path.is_dir() {
+        return Err(OmonError::Config(format!(
+            "{kind} is not a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(path)
 }
 
 #[tokio::main]
@@ -763,10 +916,11 @@ async fn main() -> Result<()> {
     let runner = Arc::new(LiveAgentRunner {
         pool: pool.clone(),
         memory,
-        tools,
+        tools: tools.clone(),
         llm,
         dispatcher: shared_dispatcher.clone(),
         workspace_root: config.workspace_root.clone(),
+        streams: ParkingMutex::new(HashMap::new()),
     });
     let multiplexer = SessionMultiplexer::with_dispatcher(
         pool.clone(),
@@ -776,9 +930,26 @@ async fn main() -> Result<()> {
     );
     let scale_to_zero = ScaleToZero::start(multiplexer.clone());
 
-    let primary_token = config.discord_bot_tokens[0].clone();
-    let http = Arc::new(serenity::http::Http::new(&primary_token));
-    let discord_egress = Arc::new(DiscordEgress::new(http));
+    let mut bot_http_clients = HashMap::new();
+    let mut default_bot_id = None;
+    for token in &config.discord_bot_tokens {
+        let http = Arc::new(serenity::http::Http::new(token));
+        let bot_id = http.get_current_user().await?.id.to_string();
+        if default_bot_id.is_none() {
+            default_bot_id = Some(bot_id.clone());
+        }
+        if bot_http_clients.insert(bot_id.clone(), http).is_some() {
+            return Err(OmonError::Config(format!(
+                "multiple Discord tokens resolve to the same bot identity {bot_id}"
+            )));
+        }
+    }
+    let default_bot_id = default_bot_id
+        .ok_or_else(|| OmonError::Config("no Discord bot identities were configured".into()))?;
+    let discord_egress = Arc::new(DiscordEgress::with_bot_clients(
+        default_bot_id,
+        bot_http_clients,
+    )?);
     shared_dispatcher.set(discord_egress.clone()).await;
 
     let cron_sync = HermesStoreSynchronizer::from_environment(pool.clone())?;
@@ -796,6 +967,7 @@ async fn main() -> Result<()> {
 
     let mut poise_data = PoiseData::new(multiplexer, pool.clone());
     poise_data.tools = tool_names;
+    poise_data.tool_registry = tools.clone();
     poise_data.free_response_channels = config.free_response_channels.clone();
     poise_data.allowed_users = config.allowed_users.clone();
     let adapter = DiscordAdapter::new(poise_data);
@@ -853,7 +1025,9 @@ fn optional_env(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod runner_tests {
-    use super::tool_enabled;
+    use std::fs;
+
+    use super::{canonical_authorized_directory, tool_enabled};
 
     #[test]
     fn maps_hermes_web_toolset_to_both_web_tools() {
@@ -861,5 +1035,26 @@ mod runner_tests {
         assert!(tool_enabled("web_search", Some(&enabled)));
         assert!(tool_enabled("web_fetch", Some(&enabled)));
         assert!(!tool_enabled("terminal", Some(&enabled)));
+    }
+
+    #[test]
+    fn rejects_cron_workdir_outside_authorized_roots() {
+        let base = std::env::temp_dir().join(format!("omon-cron-roots-{}", uuid::Uuid::new_v4()));
+        let workspace = base.join("workspace");
+        let hermes = base.join("hermes");
+        let outside = base.join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&hermes).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let roots = vec![
+            fs::canonicalize(&workspace).unwrap(),
+            fs::canonicalize(&hermes).unwrap(),
+        ];
+
+        assert!(canonical_authorized_directory(&workspace, &roots, "workdir").is_ok());
+        assert!(canonical_authorized_directory(&hermes, &roots, "workdir").is_ok());
+        assert!(canonical_authorized_directory(&outside, &roots, "workdir").is_err());
+
+        let _ = fs::remove_dir_all(base);
     }
 }

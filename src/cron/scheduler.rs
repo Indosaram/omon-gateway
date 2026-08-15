@@ -17,6 +17,9 @@ use crate::{
     SessionKey,
 };
 
+const LEASE_DURATION: TimeDelta = TimeDelta::minutes(30);
+const LEASE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CronJobSpec {
     pub expression: String,
@@ -78,7 +81,6 @@ impl CronTaskExecutor for ShellAndPayloadTaskExecutor {
     async fn execute(&self, job: &CronJob) -> Result<Option<String>> {
         let payload = job.payload()?;
 
-        // 1. If payload contains "command" / "script", execute shell process
         if let Some(cmd) = payload
             .get("command")
             .or_else(|| payload.get("script"))
@@ -94,28 +96,25 @@ impl CronTaskExecutor for ShellAndPayloadTaskExecutor {
                     OmonError::ToolExecution(format!("failed to execute cron command: {e}"))
                 })?;
 
-            let status_msg = if output.status.success() {
+            if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 tracing::info!(job_id = %job.id, "Cron command completed successfully");
-                if stdout.trim().is_empty() {
+                return Ok(Some(if stdout.trim().is_empty() {
                     format!("Cron job `{}` completed successfully", job.id)
                 } else {
                     format!("Cron job `{}` output:\n```\n{}\n```", job.id, stdout.trim())
-                }
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::error!(job_id = %job.id, stderr = %stderr, "Cron command failed");
-                format!(
-                    "Cron job `{}` failed (exit code: {:?}):\n```\n{}\n```",
-                    job.id,
-                    output.status.code(),
-                    stderr.trim()
-                )
-            };
-            return Ok(Some(status_msg));
+                }));
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(OmonError::ToolExecution(format!(
+                "cron job `{}` failed with {:?}: {}",
+                job.id,
+                output.status.code(),
+                stderr.trim()
+            )));
         }
 
-        // 2. Otherwise return notification/content
         Ok(payload
             .get("notification")
             .or_else(|| payload.get("content"))
@@ -137,6 +136,7 @@ impl CronTaskExecutor for PayloadTaskExecutor {
 struct SchedulerState {
     shutdown: watch::Sender<bool>,
     task: Mutex<Option<JoinHandle<()>>>,
+    executions: Mutex<Vec<JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -149,6 +149,14 @@ pub struct CronScheduler {
     wake: Arc<Notify>,
     poll_interval: Duration,
     state: Arc<SchedulerState>,
+}
+
+#[derive(Clone)]
+struct CronClaim {
+    run_id: String,
+    claim_token: String,
+    job: CronJob,
+    advance_schedule: bool,
 }
 
 impl CronScheduler {
@@ -191,6 +199,7 @@ impl CronScheduler {
             state: Arc::new(SchedulerState {
                 shutdown,
                 task: Mutex::new(None),
+                executions: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -240,6 +249,10 @@ impl CronScheduler {
         self.wake.notify_waiters();
         if let Some(task) = self.state.task.lock().await.take() {
             let _ = task.await;
+        }
+        let executions = std::mem::take(&mut *self.state.executions.lock().await);
+        for execution in executions {
+            let _ = execution.await;
         }
     }
 
@@ -380,12 +393,17 @@ impl CronScheduler {
         self.delete(id).await
     }
 
-    /// Executes a job immediately without changing its enabled state or schedule.
+    /// Claims a job through the same lease pipeline used by scheduled runs and
+    /// executes it asynchronously. A manual run does not consume or advance the
+    /// persisted schedule.
     pub async fn trigger(&self, id: &str) -> Result<bool> {
-        let Some(job) = self.get(id).await? else {
+        if self.get(id).await?.is_none() {
+            return Ok(false);
+        }
+        let Some(claim) = self.claim_job(id, false, false).await? else {
             return Ok(false);
         };
-        self.execute_job(job).await?;
+        self.spawn_claim(claim).await;
         Ok(true)
     }
 
@@ -393,99 +411,303 @@ impl CronScheduler {
         self.trigger(id).await
     }
 
-    /// Claims and executes every due job. Public for deterministic integration
-    /// tests and for deployments which drive polling externally.
+    /// Claims every due job and starts each execution in its own task. Claims
+    /// are protected by durable lease rows, so concurrent scheduler instances
+    /// cannot execute the same job while a live lease exists.
     pub async fn run_due_jobs(&self) -> Result<usize> {
         let now = Utc::now();
-        let jobs = sqlx::query_as::<_, CronJob>(
-            "SELECT * FROM cron_jobs
+        let job_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM cron_jobs
              WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
              ORDER BY next_run_at, id",
         )
         .bind(now)
         .fetch_all(&self.pool)
         .await?;
-        let mut executed = 0;
-        for mut job in jobs {
-            let one_shot = job.expression.starts_with("once:");
-            let next = if one_shot {
-                None
-            } else {
-                Some(next_run(&job.expression, now)?)
-            };
-            let claimed = sqlx::query(
-                "UPDATE cron_jobs SET next_run_at = ?, enabled = ?, updated_at = ?
-                 WHERE id = ? AND enabled = 1 AND next_run_at = ?",
-            )
-            .bind(next)
-            .bind(!one_shot)
-            .bind(now)
-            .bind(&job.id)
-            .bind(job.next_run_at)
-            .execute(&self.pool)
-            .await?;
-            if claimed.rows_affected() == 0 {
-                continue;
+        let mut claimed = 0;
+        for id in job_ids {
+            if let Some(claim) = self.claim_job(&id, true, true).await? {
+                self.spawn_claim(claim).await;
+                claimed += 1;
             }
-            job.next_run_at = next;
-            self.execute_job(job).await?;
-            executed += 1;
         }
-        Ok(executed)
+        Ok(claimed)
     }
 
-    async fn execute_job(&self, job: CronJob) -> Result<()> {
-        let result = self.executor.execute(&job).await;
+    async fn claim_job(
+        &self,
+        id: &str,
+        require_due: bool,
+        advance_schedule: bool,
+    ) -> Result<Option<CronClaim>> {
+        let now = Utc::now();
+        let lease_expires_at = now + LEASE_DURATION;
+        let run_id = Uuid::new_v4().to_string();
+        let claim_token = Uuid::new_v4().to_string();
+
+        sqlx::query(
+            "UPDATE cron_runs
+             SET status = 'failed', completed_at = ?, error = COALESCE(error, 'lease expired before completion')
+             WHERE job_id = ? AND status = 'running' AND lease_expires_at <= ?",
+        )
+        .bind(now)
+        .bind(id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        let due_clause = if require_due {
+            "AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "INSERT INTO cron_runs
+             (run_id, job_id, claim_token, lease_expires_at, started_at, completed_at, status, attempt, error)
+             SELECT ?, id, ?, ?, ?, NULL, 'running',
+                    COALESCE((SELECT MAX(attempt) + 1 FROM cron_runs WHERE job_id = ?), 1), NULL
+             FROM cron_jobs
+             WHERE id = ? {due_clause}
+               AND NOT EXISTS (
+                   SELECT 1 FROM cron_runs
+                   WHERE job_id = ? AND status = 'running' AND lease_expires_at > ?
+               )"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(&run_id)
+            .bind(&claim_token)
+            .bind(lease_expires_at)
+            .bind(now)
+            .bind(id)
+            .bind(id);
+        if require_due {
+            query = query.bind(now);
+        }
+        let inserted = query.bind(id).bind(now).execute(&self.pool).await?;
+        if inserted.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        let job = self
+            .get(id)
+            .await?
+            .ok_or_else(|| OmonError::Database(format!("claimed cron job {id} disappeared")))?;
+        Ok(Some(CronClaim {
+            run_id,
+            claim_token,
+            job,
+            advance_schedule,
+        }))
+    }
+
+    async fn spawn_claim(&self, claim: CronClaim) {
+        let scheduler = self.clone();
+        let handle = tokio::spawn(async move {
+            scheduler.execute_claim(claim).await;
+        });
+        let mut executions = self.state.executions.lock().await;
+        executions.retain(|execution| !execution.is_finished());
+        executions.push(handle);
+    }
+
+    async fn execute_claim(&self, claim: CronClaim) {
+        let heartbeat_scheduler = self.clone();
+        let heartbeat_token = claim.claim_token.clone();
+        let (heartbeat_stop, mut heartbeat_stopped) = watch::channel(false);
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(LEASE_REFRESH_INTERVAL) => {
+                        if let Err(error) = heartbeat_scheduler.refresh_lease(&heartbeat_token).await {
+                            tracing::error!(%error, claim_token = %heartbeat_token, "cron lease refresh failed");
+                        }
+                    }
+                    changed = heartbeat_stopped.changed() => {
+                        if changed.is_err() || *heartbeat_stopped.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let result = self.execute_job(&claim.job).await;
+        let _ = heartbeat_stop.send(true);
+        let _ = heartbeat.await;
+
+        match result {
+            Ok(()) => {
+                if let Err(error) = self.complete_success(&claim).await {
+                    tracing::error!(%error, job_id = %claim.job.id, run_id = %claim.run_id, "failed to commit successful cron run");
+                }
+            }
+            Err(error) => {
+                if let Err(record_error) = self.complete_failure(&claim, &error).await {
+                    tracing::error!(%record_error, job_id = %claim.job.id, run_id = %claim.run_id, "failed to record cron failure");
+                }
+                tracing::error!(%error, job_id = %claim.job.id, run_id = %claim.run_id, "cron job execution failed");
+            }
+        }
+    }
+
+    async fn refresh_lease(&self, claim_token: &str) -> Result<()> {
+        let lease_expires_at = Utc::now() + LEASE_DURATION;
+        sqlx::query(
+            "UPDATE cron_runs SET lease_expires_at = ?
+             WHERE claim_token = ? AND status = 'running'",
+        )
+        .bind(lease_expires_at)
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn complete_success(&self, claim: &CronClaim) -> Result<()> {
+        let now = Utc::now();
+        let mut transaction = self.pool.begin().await?;
+        let completed = sqlx::query(
+            "UPDATE cron_runs
+             SET status = 'succeeded', completed_at = ?, lease_expires_at = ?, error = NULL
+             WHERE run_id = ? AND claim_token = ? AND status = 'running'",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(&claim.run_id)
+        .bind(&claim.claim_token)
+        .execute(&mut *transaction)
+        .await?;
+        if completed.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Err(OmonError::Database(format!(
+                "cron claim {} is no longer active",
+                claim.claim_token
+            )));
+        }
+
+        if claim.advance_schedule {
+            if claim.job.expression.starts_with("once:") {
+                sqlx::query(
+                    "UPDATE cron_jobs
+                     SET enabled = 0, next_run_at = NULL, updated_at = ?
+                     WHERE id = ? AND expression = ? AND payload_json = ?",
+                )
+                .bind(now)
+                .bind(&claim.job.id)
+                .bind(&claim.job.expression)
+                .bind(&claim.job.payload_json)
+                .execute(&mut *transaction)
+                .await?;
+            } else {
+                let next = next_run(&claim.job.expression, now)?;
+                sqlx::query(
+                    "UPDATE cron_jobs
+                     SET next_run_at = ?, updated_at = ?
+                     WHERE id = ? AND enabled = 1 AND expression = ? AND payload_json = ?",
+                )
+                .bind(next)
+                .bind(now)
+                .bind(&claim.job.id)
+                .bind(&claim.job.expression)
+                .bind(&claim.job.payload_json)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        transaction.commit().await?;
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    async fn complete_failure(&self, claim: &CronClaim, error: &OmonError) -> Result<()> {
+        let now = Utc::now();
+        sqlx::query(
+            "UPDATE cron_runs
+             SET status = 'failed', completed_at = ?, lease_expires_at = ?, error = ?
+             WHERE run_id = ? AND claim_token = ? AND status = 'running'",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(error.to_string())
+        .bind(&claim.run_id)
+        .bind(&claim.claim_token)
+        .execute(&self.pool)
+        .await?;
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    async fn execute_job(&self, job: &CronJob) -> Result<()> {
         let payload = job.payload()?;
         let destination = delivery_destination(&payload)?;
-        if let Some(destination) = destination {
-            let channel_id = destination.chat_id.parse::<u64>().map_err(|_| {
-                OmonError::Config(format!(
-                    "invalid Discord channel ID: {}",
-                    destination.chat_id
-                ))
-            })?;
-            let content = match result {
-                Ok(content) => content
-                    .or_else(|| {
-                        payload
-                            .get("notification")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .or_else(|| {
-                        payload
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| format!("Cron job {} completed", job.id)),
-                Err(error) => format!("Cron job {} failed: {error}", job.id),
-            };
-            let notification = CronNotification {
-                job_id: job.id.clone(),
-                channel_id,
-                content: content.clone(),
-                triggered_at: Utc::now(),
-            };
-            let _ = self.notifications.send(notification);
-            if let Some(dispatcher) = &self.dispatcher {
-                dispatcher
-                    .dispatch(OutboundAction::SendMessage {
-                        session: SessionKey::new(
-                            "discord",
-                            None::<String>,
-                            destination.chat_id,
-                            destination.thread_id,
-                            destination.user_id.unwrap_or_else(|| "cron".into()),
-                        ),
-                        content,
-                        reply_to: None,
-                    })
-                    .await?;
+        let execution = self.executor.execute(job).await;
+
+        match execution {
+            Ok(result_content) => {
+                if let Some(destination) = destination {
+                    let content = result_content
+                        .or_else(|| {
+                            payload
+                                .get("notification")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .or_else(|| {
+                            payload
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_else(|| format!("Cron job {} completed", job.id));
+                    self.deliver(job, destination, content).await?;
+                }
+                Ok(())
             }
-        } else {
-            result?;
+            Err(error) => {
+                if let Some(destination) = destination {
+                    let content = format!("Cron job {} failed: {error}", job.id);
+                    if let Err(delivery_error) = self.deliver(job, destination, content).await {
+                        tracing::error!(%delivery_error, job_id = %job.id, "failed to deliver cron failure notification");
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn deliver(
+        &self,
+        job: &CronJob,
+        destination: crate::HermesOrigin,
+        content: String,
+    ) -> Result<()> {
+        let channel_id = destination.chat_id.parse::<u64>().map_err(|_| {
+            OmonError::Config(format!(
+                "invalid Discord channel ID: {}",
+                destination.chat_id
+            ))
+        })?;
+        let notification = CronNotification {
+            job_id: job.id.clone(),
+            channel_id,
+            content: content.clone(),
+            triggered_at: Utc::now(),
+        };
+        let _ = self.notifications.send(notification);
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher
+                .dispatch(OutboundAction::SendMessage {
+                    session: SessionKey::new(
+                        "discord",
+                        None::<String>,
+                        destination.chat_id,
+                        destination.thread_id,
+                        destination.user_id.unwrap_or_else(|| "cron".into()),
+                    ),
+                    content,
+                    reply_to: None,
+                })
+                .await?;
         }
         Ok(())
     }
@@ -565,7 +787,7 @@ fn parse_interval(expression: &str) -> Result<Option<Duration>> {
     let (number, unit) = value.split_at(split);
     let amount: u64 = number
         .parse()
-        .map_err(|_| OmonError::Config(format!("invalid interval expression `{expression}`")))?;
+        .map_err(|_| OmonError::Config(format!("invalid interval expression `{expression}")))?;
     if amount == 0 {
         return Err(OmonError::Config(
             "cron interval must be greater than zero".into(),

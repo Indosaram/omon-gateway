@@ -19,7 +19,7 @@ pub trait OutboundDispatcher: Send + Sync + 'static {
 }
 
 pub(crate) enum ActorCommand {
-    Event(InboundEvent),
+    Event(Box<InboundEvent>),
     EvictIfIdle {
         idle_timeout: Duration,
         reply: oneshot::Sender<Result<bool>>,
@@ -33,6 +33,7 @@ pub struct SessionActor {
     dispatcher: Option<Arc<dyn OutboundDispatcher>>,
     pool: SqlitePool,
     last_active_at: tokio::time::Instant,
+    dirty: bool,
 }
 
 impl SessionActor {
@@ -51,6 +52,7 @@ impl SessionActor {
             dispatcher,
             pool,
             last_active_at: tokio::time::Instant::now(),
+            dirty: false,
         })
     }
 
@@ -60,17 +62,19 @@ impl SessionActor {
                 ActorCommand::Event(event) => {
                     self.last_active_at = tokio::time::Instant::now();
                     self.context.updated_at = Utc::now();
+                    self.dirty = true;
                     if let Err(error) = self.persist_inbound(&event).await {
                         tracing::error!(session = %self.context.key, %error, "failed to persist inbound event");
                     }
-                    if let Err(error) = self.runner.run(&mut self.context, event.clone()).await {
+                    let reply_to = event.platform_message_id.clone();
+                    if let Err(error) = self.runner.run(&mut self.context, *event).await {
                         tracing::error!(session = %self.context.key, %error, "agent runner failed");
                         if let Some(dispatcher) = &self.dispatcher {
                             let _ = dispatcher
                                 .dispatch(OutboundAction::SendMessage {
                                     session: self.context.key.clone(),
                                     content: error.to_string(),
-                                    reply_to: Some(event.platform_message_id),
+                                    reply_to: Some(reply_to),
                                 })
                                 .await;
                         }
@@ -84,7 +88,7 @@ impl SessionActor {
                     let idle =
                         self.last_active_at.elapsed() > idle_timeout && self.receiver.is_empty();
                     if idle {
-                        let result = self.flush().await.map(|_| true);
+                        let result = self.flush_if_dirty().await.map(|_| true);
                         let should_stop = result.is_ok();
                         let _ = reply.send(result);
                         if should_stop {
@@ -95,6 +99,13 @@ impl SessionActor {
                     }
                 }
             }
+        }
+
+        // Dropping the multiplexer closes all strong senders. Flush dirty state
+        // on that graceful channel shutdown so actor memory can be reclaimed
+        // without silently discarding the last in-memory session mutation.
+        if let Err(error) = self.flush_if_dirty().await {
+            tracing::error!(session = %self.context.key, %error, "failed to flush session actor during shutdown");
         }
     }
 
@@ -112,6 +123,15 @@ impl SessionActor {
         .bind(event.received_at)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn flush_if_dirty(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.flush().await?;
+        self.dirty = false;
         Ok(())
     }
 

@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use sqlx::SqlitePool;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch, Notify};
 
 use crate::{InboundEvent, OmonError, Result, SessionKey};
 
@@ -27,9 +28,143 @@ impl Default for MultiplexerConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ActorStartup {
+    Starting,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SendOutcome {
+    Sent,
+    Retiring,
+    Closed,
+}
+
+pub(crate) struct SessionHandle {
+    pub(crate) sender: mpsc::Sender<ActorCommand>,
+    accepting: AtomicBool,
+    finished: AtomicBool,
+    in_flight: AtomicUsize,
+    in_flight_drained: Notify,
+    state_changed: Notify,
+    startup: watch::Receiver<ActorStartup>,
+}
+
+impl SessionHandle {
+    fn new(sender: mpsc::Sender<ActorCommand>, startup: watch::Receiver<ActorStartup>) -> Self {
+        Self {
+            sender,
+            accepting: AtomicBool::new(true),
+            finished: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            in_flight_drained: Notify::new(),
+            state_changed: Notify::new(),
+            startup,
+        }
+    }
+
+    async fn wait_started(&self) -> Result<()> {
+        let mut startup = self.startup.clone();
+        loop {
+            let state = startup.borrow().clone();
+            match state {
+                ActorStartup::Starting => {}
+                ActorStartup::Ready => return Ok(()),
+                ActorStartup::Failed(error) => {
+                    return Err(OmonError::Multiplexer(format!(
+                        "session actor failed to start: {error}"
+                    )))
+                }
+            }
+            startup.changed().await.map_err(|_| {
+                OmonError::Multiplexer("session actor stopped during startup".into())
+            })?;
+        }
+    }
+
+    pub(crate) async fn send_event(&self, event: InboundEvent) -> Result<SendOutcome> {
+        self.wait_started().await?;
+        if self.finished.load(Ordering::Acquire) {
+            return Ok(SendOutcome::Closed);
+        }
+        if !self.accepting.load(Ordering::Acquire) {
+            return Ok(SendOutcome::Retiring);
+        }
+
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        if !self.accepting.load(Ordering::Acquire) || self.finished.load(Ordering::Acquire) {
+            self.finish_send();
+            return Ok(if self.finished.load(Ordering::Acquire) {
+                SendOutcome::Closed
+            } else {
+                SendOutcome::Retiring
+            });
+        }
+
+        let result = self.sender.send(ActorCommand::Event(Box::new(event))).await;
+        self.finish_send();
+        Ok(if result.is_ok() {
+            SendOutcome::Sent
+        } else {
+            SendOutcome::Closed
+        })
+    }
+
+    fn finish_send(&self) {
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.in_flight_drained.notify_waiters();
+        }
+    }
+
+    pub(crate) fn try_retire(&self) -> bool {
+        if self.finished.load(Ordering::Acquire) {
+            return false;
+        }
+        self.accepting
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) async fn wait_for_in_flight(&self) {
+        loop {
+            let notified = self.in_flight_drained.notified();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn resume(&self) {
+        if !self.finished.load(Ordering::Acquire) {
+            self.accepting.store(true, Ordering::Release);
+        }
+        self.state_changed.notify_waiters();
+    }
+
+    pub(crate) fn mark_finished(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.finished.store(true, Ordering::Release);
+        self.state_changed.notify_waiters();
+        self.in_flight_drained.notify_waiters();
+    }
+
+    pub(crate) async fn wait_until_reusable(&self) {
+        loop {
+            let notified = self.state_changed.notified();
+            if self.accepting.load(Ordering::Acquire) || self.finished.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionMultiplexer {
-    pub(crate) sessions: Arc<DashMap<SessionKey, mpsc::Sender<ActorCommand>>>,
+    pub(crate) sessions: Arc<DashMap<SessionKey, Arc<SessionHandle>>>,
     runner: Arc<dyn AgentRunner>,
     dispatcher: Option<Arc<dyn OutboundDispatcher>>,
     pool: SqlitePool,
@@ -59,12 +194,15 @@ impl SessionMultiplexer {
     pub async fn route(&self, event: InboundEvent) -> Result<()> {
         let key = event.session.clone();
         loop {
-            let sender = self.sender_for(&key);
-            match sender.send(ActorCommand::Event(event.clone())).await {
-                Ok(()) => return Ok(()),
-                Err(_) => {
-                    self.sessions
-                        .remove_if(&key, |_, current| current.same_channel(&sender));
+            let handle = self.handle_for(&key);
+            match handle.send_event(event.clone()).await? {
+                SendOutcome::Sent => return Ok(()),
+                SendOutcome::Retiring => {
+                    handle.wait_until_reusable().await;
+                }
+                SendOutcome::Closed => {
+                    self.remove_handle(&key, &handle);
+                    handle.mark_finished();
                 }
             }
         }
@@ -82,18 +220,20 @@ impl SessionMultiplexer {
         super::gc::collect(self).await
     }
 
-    fn sender_for(&self, key: &SessionKey) -> mpsc::Sender<ActorCommand> {
-        if let Some(sender) = self.sessions.get(key) {
-            return sender.clone();
+    fn handle_for(&self, key: &SessionKey) -> Arc<SessionHandle> {
+        if let Some(handle) = self.sessions.get(key) {
+            return handle.clone();
         }
 
         let (sender, receiver) = mpsc::channel(SESSION_CHANNEL_CAPACITY);
+        let (startup_tx, startup_rx) = watch::channel(ActorStartup::Starting);
+        let handle = Arc::new(SessionHandle::new(sender, startup_rx));
         match self.sessions.entry(key.clone()) {
             Entry::Occupied(entry) => entry.get().clone(),
             Entry::Vacant(entry) => {
-                entry.insert(sender.clone());
-                self.spawn_actor(key.clone(), receiver, sender.clone());
-                sender
+                entry.insert(handle.clone());
+                self.spawn_actor(key.clone(), receiver, Arc::downgrade(&handle), startup_tx);
+                handle
             }
         }
     }
@@ -102,21 +242,37 @@ impl SessionMultiplexer {
         &self,
         key: SessionKey,
         receiver: mpsc::Receiver<ActorCommand>,
-        sender: mpsc::Sender<ActorCommand>,
+        handle: Weak<SessionHandle>,
+        startup: watch::Sender<ActorStartup>,
     ) {
-        let sessions = self.sessions.clone();
+        let sessions = Arc::downgrade(&self.sessions);
         let runner = self.runner.clone();
         let dispatcher = self.dispatcher.clone();
         let pool = self.pool.clone();
         tokio::spawn(async move {
             match SessionActor::load(key.clone(), receiver, runner, dispatcher, pool).await {
-                Ok(actor) => actor.run().await,
+                Ok(actor) => {
+                    let _ = startup.send(ActorStartup::Ready);
+                    actor.run().await;
+                }
                 Err(error) => {
-                    tracing::error!(session = %key, %error, "failed to start session actor")
+                    let _ = startup.send(ActorStartup::Failed(error.to_string()));
+                    tracing::error!(session = %key, %error, "failed to start session actor");
                 }
             }
-            sessions.remove_if(&key, |_, current| current.same_channel(&sender));
+            if let Some(handle) = handle.upgrade() {
+                if let Some(sessions) = sessions.upgrade() {
+                    sessions.remove_if(&key, |_, current| Arc::ptr_eq(current, &handle));
+                }
+                handle.mark_finished();
+            }
         });
+    }
+
+    pub(crate) fn remove_handle(&self, key: &SessionKey, handle: &Arc<SessionHandle>) -> bool {
+        self.sessions
+            .remove_if(key, |_, current| Arc::ptr_eq(current, handle))
+            .is_some()
     }
 
     pub(crate) fn idle_timeout(&self) -> Duration {

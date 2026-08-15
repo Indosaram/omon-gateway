@@ -157,18 +157,21 @@ impl Tool for CronTool {
                 });
                 let payload_json = serde_json::to_string(&payload)
                     .map_err(|error| OmonError::ToolExecution(error.to_string()))?;
-                let next_run_at = next_run(expression, chrono::Utc::now())?;
+                let now = chrono::Utc::now();
+                let next_run_at = next_run(expression, now)?;
 
                 sqlx::query(
-                    "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at) \
-                     VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
-                     ON CONFLICT(id) DO UPDATE SET expression=excluded.expression, payload_json=excluded.payload_json, \
-                     enabled=1, next_run_at=excluded.next_run_at, updated_at=CURRENT_TIMESTAMP",
+                    "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)
+                     VALUES (?, ?, ?, 1, ?, ?, ?)
+                     ON CONFLICT(id) DO UPDATE SET expression=excluded.expression, payload_json=excluded.payload_json,
+                     enabled=1, next_run_at=excluded.next_run_at, updated_at=excluded.updated_at",
                 )
                 .bind(id)
                 .bind(expression)
                 .bind(payload_json)
                 .bind(next_run_at)
+                .bind(now)
+                .bind(now)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| OmonError::Database(e.to_string()))?;
