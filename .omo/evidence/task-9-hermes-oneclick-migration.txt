@@ -1,0 +1,147 @@
+# T9 manual QA: Hermes one-click migration documentation
+
+## Real CLI help captured before documentation edits
+
+Command:
+
+    cargo run -- migrate --help
+
+Output:
+
+       Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.82s
+        Running `target/debug/omon-gateway migrate --help`
+    Usage: omon-gateway migrate [OPTIONS]
+
+    Options:
+          --dry-run
+          --no-cutover
+      -h, --help        Print help
+
+Command:
+
+    cargo run -- --help
+
+Output:
+
+       Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.78s
+        Running `target/debug/omon-gateway --help`
+    Usage: omon-gateway [COMMAND]
+
+    Commands:
+      run
+      migrate
+      help     Print this message or the help of the given subcommand(s)
+
+    Options:
+      -h, --help  Print help
+
+These successful captures establish the shipped subcommands and migrate flags used by README.md. A later evidence-generation rerun encountered unrelated concurrent, uncommitted source edits in `src/discord/mod.rs`, `src/models/events.rs`, and `src/discord/adapter.rs`; T9 does not modify or stage those files.
+
+## README one-click/migrate spot-check
+
+Command:
+
+    rg -n "one-click|migrate" README.md
+
+Output:
+
+    111:`omon-gateway migrate` performs the shipped one-click migration from Hermes Agent to OMO Gateway. Run it from the gateway directory so the imported configuration is written to that directory's `.env`:
+    116:cargo run -- migrate --dry-run
+    119:cargo run -- migrate
+    122:The compiled binary accepts the same subcommand (`omon-gateway migrate`). The default flow runs in this order:
+    136:| `omon-gateway migrate` | Full import and cutover. Writes the authoritative `.env`, imports cron jobs, empties backed-up Hermes cron stores after verification, and stops/disables the Hermes gateway. |
+    137:| `omon-gateway migrate --dry-run` | Read-only projection of configuration, cron, process, and LaunchAgent changes. It performs zero writes and does not run cron synchronization or destructive side effects. |
+    138:| `omon-gateway migrate --no-cutover` | Import only. Writes the gateway `.env` and synchronizes cron jobs, but does not empty Hermes cron stores or stop/disable Hermes services. |
+
+## APPROVAL_MODE documentation and code spot-check
+
+Command:
+
+    rg -n "APPROVAL_MODE" README.md .env.example
+
+Output:
+
+    README.md:156:| `$HERMES_HOME/.env` or `config.yaml` | `APPROVAL_MODE` or `approvals.mode` | `APPROVAL_MODE` | The root `.env` value wins; otherwise the YAML approval mode is used. |
+    README.md:221:| `APPROVAL_MODE` | `smart` | Enforced terminal approval policy: `smart` gates dangerous commands, `always` gates every command, and `never`/`yolo` bypass approval |
+    .env.example:63:# APPROVAL_MODE is enforced by the terminal SmartApprovalGuard. "smart" requests
+    .env.example:66:APPROVAL_MODE=smart
+
+Command:
+
+    rg -n "APPROVAL_MODE|ApprovalPolicy::parse|with_approval" src/main.rs src/tools/terminal.rs
+
+Output:
+
+    src/main.rs:135:            approval_policy: ApprovalPolicy::parse(optional_env("APPROVAL_MODE").as_deref()),
+    src/main.rs:953:    tools.register(TerminalTool::new(&config.workspace_root).with_approval(
+    src/main.rs:1041:    let adapter = DiscordAdapter::new(poise_data).with_approval_guard(approval_guard);
+    src/tools/terminal.rs:20:impl ApprovalPolicy {
+    src/tools/terminal.rs:83:    pub fn with_approval(
+    src/tools/terminal.rs:138:            ApprovalPolicy::Never => false,
+    src/tools/terminal.rs:139:            ApprovalPolicy::Always => true,
+    src/tools/terminal.rs:140:            ApprovalPolicy::Smart => is_dangerous(command),
+    src/tools/terminal.rs:389:        assert_eq!(ApprovalPolicy::parse(Some("smart")), ApprovalPolicy::Smart);
+    src/tools/terminal.rs:391:            ApprovalPolicy::parse(Some("always")),
+    src/tools/terminal.rs:394:        assert_eq!(ApprovalPolicy::parse(Some("never")), ApprovalPolicy::Never);
+    src/tools/terminal.rs:395:        assert_eq!(ApprovalPolicy::parse(Some("yolo")), ApprovalPolicy::Never);
+
+## Hermes environment knobs spot-check
+
+Command:
+
+    rg -n "HERMES_HOME|OMON_HERMES_PROFILES" README.md .env.example
+
+Output:
+
+    README.md:124:1. Import Hermes configuration from `$HERMES_HOME` (default: `~/.hermes`), including the root `.env`, `config.yaml`, and profile `.env` files.
+    README.md:148:| `$HERMES_HOME/.env` | `DISCORD_BOT_TOKEN` | `DISCORD_BOT_TOKEN` | Preserves the primary token. |
+    README.md:149:| `$HERMES_HOME/profiles/*/.env` | `DISCORD_BOT_TOKEN` | `DISCORD_BOT_TOKENS` | Collects non-empty profile tokens in stable order and removes duplicates, including the primary token. |
+    README.md:162:- **Cron stores**: Hermes jobs are read from `$HERMES_HOME/cron/jobs.json` and `$HERMES_HOME/profiles/*/cron/jobs.json`. `OMON_HERMES_PROFILES` can restrict the profiles synchronized by the runtime; when unset, the default store and profile directories are discovered automatically.
+    README.md:164:- **Skills**: OMO Gateway scans `$HERMES_HOME/skills` (default: `~/.hermes/skills`) and `~/.omon/skills` for `SKILL.md` bundles.
+    README.md:219:| `HERMES_HOME` | `$HOME/.hermes` | Hermes root used by migration, cron synchronization, and Hermes skill discovery |
+    README.md:220:| `OMON_HERMES_PROFILES` | Auto-discover | Optional comma-separated Hermes cron profiles; when unset, synchronizes `default` plus discovered profile directories |
+    .env.example:56:# HERMES_HOME=$HOME/.hermes
+    .env.example:60:# $HERMES_HOME/profiles.
+    .env.example:61:# OMON_HERMES_PROFILES=default,advisor,marketer
+
+Code backing:
+
+    src/migrate/mod.rs:53:    let hermes_root = std::env::var_os("HERMES_HOME")
+    src/main.rs:965:    let hermes_root = env::var_os("HERMES_HOME")
+    src/cron/store.rs:251:        let root = std::env::var_os("HERMES_HOME")
+    src/cron/store.rs:259:        let profiles = std::env::var("OMON_HERMES_PROFILES")
+
+## Skills and workspace defaults
+
+Command:
+
+    rg -n 'hermes_skill_dirs|join\("skills"\)|OMON_WORKSPACE_ROOT|join\("workspace"\)' src/main.rs
+
+Output:
+
+    113:        let workspace_root = env::var_os("OMON_WORKSPACE_ROOT")
+    119:                home.join(".omon").join("workspace")
+    920:fn hermes_skill_dirs(hermes_root: &Path, home: &Path) -> Vec<PathBuf> {
+    922:        hermes_root.join("skills"),
+    923:        home.join(".omon").join("skills"),
+    968:    tools.register(omon_gateway::SkillsTool::new(hermes_skill_dirs(
+
+## Negative checks
+
+Command:
+
+    rg -n "reserved" .env.example
+
+Output: no matches.
+
+Command:
+
+    rg -n "\.omon/workspace/\.hermes|workspace.*\.hermes.*skills" README.md
+
+Output: no matches.
+
+Command:
+
+    git diff --check -- README.md .env.example
+
+Output: clean.

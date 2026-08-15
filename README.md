@@ -108,38 +108,60 @@ It multiplexes thousands of concurrent channels, threads, and DMs with sub-milli
 
 ## 🔄 Hermes to OMO Gateway Migration Guide (for LLMs & Automations)
 
-If you are migrating an existing **Hermes Agent** installation to **OMO Gateway**, follow this automated recipe.
+`omon-gateway migrate` performs the shipped one-click migration from Hermes Agent to OMO Gateway. Run it from the gateway directory so the imported configuration is written to that directory's `.env`:
 
-### 1. Configuration Mapping
-
-| Hermes Location | Hermes Key | OMO Gateway `.env` Key | Example Value |
-|---|---|---|---|
-| `~/.hermes/.env` | `DISCORD_BOT_TOKEN` | `DISCORD_BOT_TOKEN` | `MTQ2...` |
-| `~/.hermes/profiles/*/.env` | `DISCORD_BOT_TOKEN` | `DISCORD_BOT_TOKENS` | `token1,token2,token3` |
-| `~/.hermes/.env` | `DISCORD_ALLOWED_USERS` | `DISCORD_ALLOWED_USERS` | `414011632306618368` |
-| `~/.hermes/.env` | `DISCORD_FREE_RESPONSE_CHANNELS` | `DISCORD_FREE_RESPONSE_CHANNELS` | `1474213245014376569` |
-| `~/.hermes/config.yaml` | `model.default` | `DEFAULT_MODEL` | `gpt-4o` / `gpt-5.6-luna` |
-| `~/.hermes/config.yaml` | `model.base_url` / `providers.*.api` | `OPENAI_API_BASE` | `http://127.0.0.1:8317/v1` |
-| `~/.hermes/config.yaml` | `model.api_key` / `providers.*.api_key` | `OPENAI_API_KEY` | `your-api-key` |
-| `~/.hermes/config.yaml` | `approvals.mode` | `APPROVAL_MODE` | `smart` |
-
-### 2. Multi-Bot Sharding Migration
-In Hermes, multiple bot profiles (`advisor`, `marketer`, etc.) required running separate Python daemon processes.
-In **OMO Gateway**, simply join all tokens with commas in `DISCORD_BOT_TOKENS`:
 ```bash
-DISCORD_BOT_TOKENS="primary_bot_token,advisor_bot_token,marketer_bot_token"
+# Preview the complete migration without writing files, changing the database,
+# signaling processes, or invoking launchctl.
+cargo run -- migrate --dry-run
+
+# Import configuration and cron jobs, then retire the Hermes cron stores and gateway.
+cargo run -- migrate
 ```
-OMO Gateway will automatically launch distinct gateway shards inside a single Tokio runtime.
 
-### 3. Automated Cron Jobs Synchronization
-Hermes stores scheduled jobs in `~/.hermes/cron/jobs.json` and `~/.hermes/profiles/*/cron/jobs.json`.
-OMO Gateway includes `HermesStoreSynchronizer`:
-- On startup, OMO Gateway automatically reads and imports all Hermes cron jobs into its persistent SQLite database (`cron_jobs` table).
-- Both `prompt` jobs (which execute through the full agent LLM and tool-call loop) and `script` jobs are fully supported and dispatched to their target Discord channels (`deliver`/`origin`).
+The compiled binary accepts the same subcommand (`omon-gateway migrate`). The default flow runs in this order:
 
-### 4. Workspace & Skills Migration
-- **Workspace**: OMO Gateway isolates tool execution under `~/.omon/workspace` (configurable via `OMON_WORKSPACE_ROOT`).
-- **Skills**: OMO Gateway automatically scans both `~/.hermes/skills/` and `~/.omon/skills/` for `SKILL.md` bundles.
+1. Import Hermes configuration from `$HERMES_HOME` (default: `~/.hermes`), including the root `.env`, `config.yaml`, and profile `.env` files.
+2. Authoritatively rewrite the gateway `.env`. If `.env` already exists, its complete previous contents are first copied to `.env.bak-<timestamp>`.
+3. Synchronize Hermes cron jobs into the gateway SQLite `cron_jobs` table.
+4. Verify each Hermes job exists in the gateway database, back up each non-empty `jobs.json` as `jobs.json.bak-omon-migration-<timestamp>`, and atomically replace its job list with an empty list.
+5. Stop live Hermes gateway processes recorded by the root and profile `gateway.lock` files. On macOS, matching `~/Library/LaunchAgents/ai.hermes.gateway*.plist` services are booted out with `launchctl` and the plist files are renamed to `.plist.disabled` so launchd cannot restart them.
+
+The backups and `.disabled` LaunchAgent files make the file cutover reversible; the original files are retained rather than deleted.
+
+### Migration modes
+
+| Command | Behavior |
+|---|---|
+| `omon-gateway migrate` | Full import and cutover. Writes the authoritative `.env`, imports cron jobs, empties backed-up Hermes cron stores after verification, and stops/disables the Hermes gateway. |
+| `omon-gateway migrate --dry-run` | Read-only projection of configuration, cron, process, and LaunchAgent changes. It performs zero writes and does not run cron synchronization or destructive side effects. |
+| `omon-gateway migrate --no-cutover` | Import only. Writes the gateway `.env` and synchronizes cron jobs, but does not empty Hermes cron stores or stop/disable Hermes services. |
+
+Use `--no-cutover` when Hermes must remain available during a staged migration. Do not run both gateways against the same bot tokens and cron schedules after the final cutover.
+
+### What the importer maps
+
+The command performs these mappings automatically; this table is a reference, not a manual copy-and-paste procedure.
+
+| Hermes Location | Hermes Key | OMO Gateway `.env` Key | Mapping behavior |
+|---|---|---|---|
+| `$HERMES_HOME/.env` | `DISCORD_BOT_TOKEN` | `DISCORD_BOT_TOKEN` | Preserves the primary token. |
+| `$HERMES_HOME/profiles/*/.env` | `DISCORD_BOT_TOKEN` | `DISCORD_BOT_TOKENS` | Collects non-empty profile tokens in stable order and removes duplicates, including the primary token. |
+| `$HERMES_HOME/.env` or profile `.env` | `DISCORD_ALLOWED_USERS` | `DISCORD_ALLOWED_USERS` | The root value wins; otherwise the first profile value is used. |
+| `$HERMES_HOME/.env` or profile `.env` | `DISCORD_FREE_RESPONSE_CHANNELS` | `DISCORD_FREE_RESPONSE_CHANNELS` | The root value wins; otherwise the first profile value is used. |
+| `$HERMES_HOME/.env` or profile `.env` | `DISCORD_HOME_CHANNEL` | `DISCORD_HOME_CHANNEL` | Preserved; the gateway also treats these as free-response channels at runtime. |
+| `$HERMES_HOME/config.yaml` | `model.default` | `DEFAULT_MODEL` | Preserves the configured model identifier. |
+| `$HERMES_HOME/config.yaml` | `model.base_url`, `model.api_key` | `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` | Used when the default model name starts with `claude`. |
+| `$HERMES_HOME/config.yaml` | `model.base_url`, `model.api_key` | `OPENAI_API_BASE`, `OPENAI_API_KEY` | Used for other model names. |
+| `$HERMES_HOME/.env` or `config.yaml` | `APPROVAL_MODE` or `approvals.mode` | `APPROVAL_MODE` | The root `.env` value wins; otherwise the YAML approval mode is used. |
+
+Only mapped keys are written to the authoritative `.env`; unrelated values from a previous gateway `.env` are available in its timestamped backup but are not carried forward automatically.
+
+### Cron stores, workspace, and skills
+
+- **Cron stores**: Hermes jobs are read from `$HERMES_HOME/cron/jobs.json` and `$HERMES_HOME/profiles/*/cron/jobs.json`. `OMON_HERMES_PROFILES` can restrict the profiles synchronized by the runtime; when unset, the default store and profile directories are discovered automatically.
+- **Workspace**: When `OMON_WORKSPACE_ROOT` is unset, OMO Gateway isolates terminal and file tools under `$HOME/.omon/workspace`.
+- **Skills**: OMO Gateway scans `$HERMES_HOME/skills` (default: `~/.hermes/skills`) and `~/.omon/skills` for `SKILL.md` bundles.
 
 ---
 
@@ -193,8 +215,10 @@ launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 | `ANTHROPIC_BASE_URL` | Optional | Anthropic Messages endpoint URL |
 | `ANTHROPIC_API_KEY` | Optional | Anthropic API key |
 | `DATABASE_URL` | `sqlite://omon_gateway.db` | SQLite database path (WAL mode) |
-| `OMON_WORKSPACE_ROOT` | `~/.omon/workspace` | Dedicated sandboxed working directory |
-| `APPROVAL_MODE` | `smart` | `smart` (button approval) or `yolo` (auto-execute) |
+| `OMON_WORKSPACE_ROOT` | `$HOME/.omon/workspace` | Dedicated sandboxed working directory used by terminal and file tools |
+| `HERMES_HOME` | `$HOME/.hermes` | Hermes root used by migration, cron synchronization, and Hermes skill discovery |
+| `OMON_HERMES_PROFILES` | Auto-discover | Optional comma-separated Hermes cron profiles; when unset, synchronizes `default` plus discovered profile directories |
+| `APPROVAL_MODE` | `smart` | Enforced terminal approval policy: `smart` gates dangerous commands, `always` gates every command, and `never`/`yolo` bypass approval |
 
 ---
 
