@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full", "test-util"] }
+tokio-util = "0.7"
 poise = "0.6"
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }

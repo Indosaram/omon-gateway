@@ -19,8 +19,8 @@ impl TerminalTool {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            timeout: Duration::from_secs(30),
-            max_output_bytes: 1024 * 1024,
+            timeout: Duration::from_secs(600),
+            max_output_bytes: 50 * 1024 * 1024,
         }
     }
 

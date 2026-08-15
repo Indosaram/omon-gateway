@@ -21,7 +21,6 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-const MAX_TOOL_ROUNDS: usize = 8;
 const STREAM_BATCH_CHARS: usize = 1_500;
 
 struct Config {
@@ -350,7 +349,7 @@ impl LiveAgentRunner {
             _ => self.llm.clone(),
         };
 
-        for round in 0..MAX_TOOL_ROUNDS {
+        loop {
             let (mut stream, tool_calls) =
                 llm.stream_with_tool_calls(&messages, &definitions).await?;
             let mut response = String::new();
@@ -424,13 +423,7 @@ impl LiveAgentRunner {
                 )
                 .await?;
             }
-            if round + 1 == MAX_TOOL_ROUNDS {
-                return Err(OmonError::Llm(format!(
-                    "model exceeded the {MAX_TOOL_ROUNDS}-round tool-call limit"
-                )));
-            }
         }
-        unreachable!()
     }
 
     async fn emit(
@@ -486,6 +479,24 @@ impl AgentRunner for LiveAgentRunner {
         self.execute(session, event, None, None, true)
             .await
             .map(|_| ())
+    }
+
+    async fn cancel(&self, session: &SessionContext) -> Result<()> {
+        let stream = self.streams.lock().remove(&session.key.storage_key());
+        if let Some(stream) = stream {
+            self.dispatcher
+                .dispatch(OutboundAction::Stream {
+                    session: session.key.clone(),
+                    chunk: omon_gateway::StreamChunk {
+                        stream_id: stream.stream_id,
+                        sequence: stream.next_sequence,
+                        content: stream.content,
+                        is_final: true,
+                    },
+                })
+                .await?;
+        }
+        Ok(())
     }
 }
 

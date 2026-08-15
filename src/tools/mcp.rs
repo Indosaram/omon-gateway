@@ -54,7 +54,7 @@ impl McpClientTool {
             description: description.into(),
             input_schema,
             transport,
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(600),
             next_id: Arc::new(AtomicU64::new(1)),
             http: reqwest::Client::new(),
             stdio_lock: Arc::new(Mutex::new(())),

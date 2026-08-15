@@ -85,6 +85,25 @@ impl SessionHandle {
     }
 
     pub(crate) async fn send_event(&self, event: InboundEvent) -> Result<SendOutcome> {
+        self.send_command(ActorCommand::Event(Box::new(event)))
+            .await
+    }
+
+    pub(crate) async fn stop(&self) -> Result<(SendOutcome, Option<bool>)> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let outcome = self
+            .send_command(ActorCommand::Stop { reply: reply_tx })
+            .await?;
+        if outcome != SendOutcome::Sent {
+            return Ok((outcome, None));
+        }
+        match reply_rx.await {
+            Ok(result) => Ok((SendOutcome::Sent, Some(result?))),
+            Err(_) => Ok((SendOutcome::Closed, None)),
+        }
+    }
+
+    async fn send_command(&self, command: ActorCommand) -> Result<SendOutcome> {
         self.wait_started().await?;
         if self.finished.load(Ordering::Acquire) {
             return Ok(SendOutcome::Closed);
@@ -103,7 +122,7 @@ impl SessionHandle {
             });
         }
 
-        let result = self.sender.send(ActorCommand::Event(Box::new(event))).await;
+        let result = self.sender.send(command).await;
         self.finish_send();
         Ok(if result.is_ok() {
             SendOutcome::Sent
@@ -202,6 +221,24 @@ impl SessionMultiplexer {
                 }
                 SendOutcome::Closed => {
                     self.remove_handle(&key, &handle);
+                    handle.mark_finished();
+                }
+            }
+        }
+    }
+
+    /// Cancels the active turn for an existing session. Returns `false` when
+    /// the session has no active execution (or no actor at all).
+    pub async fn stop(&self, key: &SessionKey) -> Result<bool> {
+        loop {
+            let Some(handle) = self.sessions.get(key).map(|entry| entry.clone()) else {
+                return Ok(false);
+            };
+            match handle.stop().await? {
+                (SendOutcome::Sent, Some(interrupted)) => return Ok(interrupted),
+                (SendOutcome::Retiring, _) => handle.wait_until_reusable().await,
+                (SendOutcome::Closed, _) | (SendOutcome::Sent, None) => {
+                    self.remove_handle(key, &handle);
                     handle.mark_finished();
                 }
             }

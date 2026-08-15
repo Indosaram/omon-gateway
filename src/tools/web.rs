@@ -42,8 +42,8 @@ impl Tool for WebSearchTool {
         let max_results = args
             .get("max_results")
             .and_then(Value::as_u64)
-            .unwrap_or(5)
-            .clamp(1, 20) as usize;
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -147,8 +147,8 @@ impl Tool for WebFetchTool {
         let max_chars = args
             .get("max_chars")
             .and_then(Value::as_u64)
-            .unwrap_or(8000)
-            .clamp(1, 100_000) as usize;
+            .unwrap_or(100_000)
+            .clamp(1, 1_000_000) as usize;
         let parsed = reqwest::Url::parse(url)
             .map_err(|error| OmonError::ToolExecution(format!("invalid URL: {error}")))?;
         if !matches!(parsed.scheme(), "http" | "https") {

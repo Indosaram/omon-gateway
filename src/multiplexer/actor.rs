@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     render_user_prompt, DeliveryLedgerService, InboundEvent, OmonError, OutboundAction, Result,
@@ -14,6 +15,22 @@ use crate::{
 #[async_trait]
 pub trait AgentRunner: Send + Sync + 'static {
     async fn run(&self, session: &mut SessionContext, event: InboundEvent) -> Result<()>;
+
+    async fn run_cancelable(
+        &self,
+        session: &mut SessionContext,
+        event: InboundEvent,
+        cancellation: CancellationToken,
+    ) -> Result<()> {
+        tokio::select! {
+            result = self.run(session, event) => result,
+            _ = cancellation.cancelled() => Err(OmonError::Multiplexer("agent turn cancelled".into())),
+        }
+    }
+
+    async fn cancel(&self, _session: &SessionContext) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -23,10 +40,20 @@ pub trait OutboundDispatcher: Send + Sync + 'static {
 
 pub(crate) enum ActorCommand {
     Event(Box<InboundEvent>),
+    Stop {
+        reply: oneshot::Sender<Result<bool>>,
+    },
     EvictIfIdle {
         idle_timeout: Duration,
         reply: oneshot::Sender<Result<bool>>,
     },
+}
+
+enum TurnOutcome {
+    Completed(Result<()>),
+    Superseded(Box<InboundEvent>),
+    Stopped(oneshot::Sender<Result<bool>>),
+    Shutdown,
 }
 
 pub struct SessionActor {
@@ -60,7 +87,16 @@ impl SessionActor {
     }
 
     pub(crate) async fn run(mut self) {
-        while let Some(command) = self.receiver.recv().await {
+        let mut pending_event = None;
+        loop {
+            let command = match pending_event.take() {
+                Some(event) => ActorCommand::Event(event),
+                None => match self.receiver.recv().await {
+                    Some(command) => command,
+                    None => break,
+                },
+            };
+
             match command {
                 ActorCommand::Event(event) => {
                     self.last_active_at = tokio::time::Instant::now();
@@ -69,39 +105,98 @@ impl SessionActor {
                     if let Err(error) = self.persist_inbound(&event).await {
                         tracing::error!(session = %self.context.key, %error, "failed to persist inbound event");
                     }
+
+                    let event_id = event.id;
                     let reply_to = event.platform_message_id.clone();
                     let delivery_id = event.delivery_id.clone();
-                    let result = self.runner.run(&mut self.context, *event).await;
-                    if let Some(delivery_id) = delivery_id.as_deref() {
-                        let ledger = DeliveryLedgerService::new(self.pool.clone());
-                        match &result {
-                            Ok(()) => {
-                                if let Err(error) = ledger.mark_delivered(delivery_id).await {
-                                    tracing::error!(%delivery_id, %error, "failed to complete delivery claim");
+                    let cancellation = CancellationToken::new();
+                    let mut turn_context = self.context.clone();
+                    let runner = self.runner.clone();
+                    let mut run = Box::pin(runner.run_cancelable(
+                        &mut turn_context,
+                        *event,
+                        cancellation.clone(),
+                    ));
+                    let outcome = loop {
+                        tokio::select! {
+                            biased;
+                            command = self.receiver.recv() => {
+                                match command {
+                                    Some(ActorCommand::Event(next)) => {
+                                        cancellation.cancel();
+                                        break TurnOutcome::Superseded(next);
+                                    }
+                                    Some(ActorCommand::Stop { reply }) => {
+                                        cancellation.cancel();
+                                        break TurnOutcome::Stopped(reply);
+                                    }
+                                    Some(ActorCommand::EvictIfIdle { reply, .. }) => {
+                                        let _ = reply.send(Ok(false));
+                                    }
+                                    None => {
+                                        cancellation.cancel();
+                                        break TurnOutcome::Shutdown;
+                                    }
                                 }
                             }
-                            Err(error) => {
-                                if let Err(ledger_error) =
-                                    ledger.mark_failed(delivery_id, error.to_string()).await
-                                {
-                                    tracing::error!(%delivery_id, %ledger_error, "failed to mark delivery claim failed");
+                            result = &mut run => break TurnOutcome::Completed(result),
+                        }
+                    };
+                    drop(run);
+
+                    match outcome {
+                        TurnOutcome::Completed(result) => {
+                            if result.is_ok() {
+                                self.context = turn_context;
+                            }
+                            self.complete_delivery(delivery_id.as_deref(), &result)
+                                .await;
+                            if let Err(error) = result {
+                                tracing::error!(session = %self.context.key, %error, "agent runner failed");
+                                if let Some(dispatcher) = &self.dispatcher {
+                                    let _ = dispatcher
+                                        .dispatch(OutboundAction::SendMessage {
+                                            session: self.context.key.clone(),
+                                            content: error.to_string(),
+                                            reply_to: Some(reply_to),
+                                        })
+                                        .await;
                                 }
                             }
                         }
-                    }
-                    if let Err(error) = result {
-                        tracing::error!(session = %self.context.key, %error, "agent runner failed");
-                        if let Some(dispatcher) = &self.dispatcher {
-                            let _ = dispatcher
-                                .dispatch(OutboundAction::SendMessage {
-                                    session: self.context.key.clone(),
-                                    content: error.to_string(),
-                                    reply_to: Some(reply_to),
-                                })
-                                .await;
+                        TurnOutcome::Superseded(next) => {
+                            self.interrupt_turn(
+                                event_id,
+                                delivery_id.as_deref(),
+                                "superseded by a newer message",
+                            )
+                            .await;
+                            self.notify_interrupted(&reply_to);
+                            pending_event = Some(next);
+                        }
+                        TurnOutcome::Stopped(reply) => {
+                            self.interrupt_turn(
+                                event_id,
+                                delivery_id.as_deref(),
+                                "stopped by user",
+                            )
+                            .await;
+                            let _ = reply.send(Ok(true));
+                        }
+                        TurnOutcome::Shutdown => {
+                            self.interrupt_turn(
+                                event_id,
+                                delivery_id.as_deref(),
+                                "session actor shutting down",
+                            )
+                            .await;
                         }
                     }
                     self.context.updated_at = Utc::now();
+                }
+                ActorCommand::Stop { reply } => {
+                    self.last_active_at = tokio::time::Instant::now();
+                    let _ = reply.send(Ok(false));
                 }
                 ActorCommand::EvictIfIdle {
                     idle_timeout,
@@ -128,6 +223,66 @@ impl SessionActor {
         // without silently discarding the last in-memory session mutation.
         if let Err(error) = self.flush_if_dirty().await {
             tracing::error!(session = %self.context.key, %error, "failed to flush session actor during shutdown");
+        }
+    }
+
+    async fn interrupt_turn(&self, event_id: uuid::Uuid, delivery_id: Option<&str>, reason: &str) {
+        if let Err(error) = self.runner.cancel(&self.context).await {
+            tracing::warn!(session = %self.context.key, %error, "runner cancellation cleanup failed");
+        }
+        if let Err(error) = self.rollback_partial_history(event_id).await {
+            tracing::error!(session = %self.context.key, %error, "failed to roll back interrupted turn history");
+        }
+        if let Some(delivery_id) = delivery_id {
+            let ledger = DeliveryLedgerService::new(self.pool.clone());
+            if let Err(error) = ledger.mark_failed(delivery_id, reason).await {
+                tracing::error!(%delivery_id, %error, "failed to mark interrupted delivery claim failed");
+            }
+        }
+        tracing::info!(session = %self.context.key, %reason, "agent turn interrupted");
+    }
+
+    async fn rollback_partial_history(&self, event_id: uuid::Uuid) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM messages
+             WHERE session_key = ? AND sequence > (
+                 SELECT sequence FROM messages WHERE id = ? AND session_key = ?
+             )",
+        )
+        .bind(self.context.key.storage_key())
+        .bind(event_id.to_string())
+        .bind(self.context.key.storage_key())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn notify_interrupted(&self, reply_to: &str) {
+        if let Some(dispatcher) = self.dispatcher.clone() {
+            let action = OutboundAction::SendMessage {
+                session: self.context.key.clone(),
+                content: "Previous turn interrupted; following your latest message.".into(),
+                reply_to: Some(reply_to.to_owned()),
+            };
+            tokio::spawn(async move {
+                if let Err(error) = dispatcher.dispatch(action).await {
+                    tracing::warn!(%error, "failed to send turn interruption notice");
+                }
+            });
+        }
+    }
+
+    async fn complete_delivery(&self, delivery_id: Option<&str>, result: &Result<()>) {
+        let Some(delivery_id) = delivery_id else {
+            return;
+        };
+        let ledger = DeliveryLedgerService::new(self.pool.clone());
+        let completion = match result {
+            Ok(()) => ledger.mark_delivered(delivery_id).await,
+            Err(error) => ledger.mark_failed(delivery_id, error.to_string()).await,
+        };
+        if let Err(error) = completion {
+            tracing::error!(%delivery_id, %error, "failed to complete delivery claim");
         }
     }
 

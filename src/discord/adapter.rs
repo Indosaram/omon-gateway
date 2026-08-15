@@ -165,6 +165,12 @@ async fn handle_event(
 }
 
 async fn route_claimed_event(data: &PoiseData, mut event: InboundEvent) -> Result<bool> {
+    if event.content.trim().eq_ignore_ascii_case("/stop") {
+        let interrupted = data.multiplexer.stop(&event.session).await?;
+        tracing::info!(session = %event.session, interrupted, "processed Discord text stop command");
+        return Ok(true);
+    }
+
     let delivery_id = event
         .delivery_id
         .clone()

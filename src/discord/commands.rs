@@ -64,7 +64,7 @@ impl PoiseData {
 }
 
 pub fn all() -> Vec<poise::Command<PoiseData, CommandError>> {
-    vec![model(), reset(), status(), tools(), skill(), cron()]
+    vec![model(), reset(), stop(), status(), tools(), skill(), cron()]
 }
 
 pub fn is_user_allowed(allowed_users: &[u64], user_id: u64) -> bool {
@@ -303,6 +303,19 @@ pub async fn reset(ctx: PoiseContext<'_>) -> Result<(), CommandError> {
         .await?;
     transaction.commit().await?;
     ctx.say("Session context and memory cleared.").await?;
+    Ok(())
+}
+
+#[poise::command(slash_command, prefix_command)]
+/// Stop the active agent turn for this Discord session.
+pub async fn stop(ctx: PoiseContext<'_>) -> Result<(), CommandError> {
+    let key = session_key(ctx).await?;
+    let message = if ctx.data().multiplexer.stop(&key).await? {
+        "Stopped the active turn."
+    } else {
+        "No active turn to stop."
+    };
+    ctx.say(message).await?;
     Ok(())
 }
 

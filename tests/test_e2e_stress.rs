@@ -8,7 +8,7 @@ use omon_gateway::{
     AgentRunner, Database, DeliveryLedgerService, InboundEvent, MultiplexerConfig, OmonError,
     SessionContext, SessionKey, SessionMultiplexer,
 };
-use tokio::sync::{mpsc, Barrier, Mutex};
+use tokio::sync::{mpsc, oneshot, Barrier, Mutex};
 
 const SESSION_COUNT: usize = 20;
 const MESSAGES_PER_SESSION: usize = 6;
@@ -56,6 +56,7 @@ async fn routes_120_messages_in_order_per_session_and_in_parallel_across_session
         first_message_rendezvous: Barrier,
         started: mpsc::UnboundedSender<SessionKey>,
         completed: mpsc::UnboundedSender<(SessionKey, usize)>,
+        acknowledgements: Mutex<HashMap<String, oneshot::Sender<()>>>,
         active_sessions: Mutex<HashSet<SessionKey>>,
         global_active: AtomicUsize,
         maximum_global_active: AtomicUsize,
@@ -99,6 +100,14 @@ async fn routes_120_messages_in_order_per_session_and_in_parallel_across_session
             self.completed
                 .send((session.key.clone(), sequence))
                 .expect("completion observer should remain open");
+            if let Some(acknowledgement) = self
+                .acknowledgements
+                .lock()
+                .await
+                .remove(&event.platform_message_id)
+            {
+                let _ = acknowledgement.send(());
+            }
             Ok(())
         }
     }
@@ -106,10 +115,22 @@ async fn routes_120_messages_in_order_per_session_and_in_parallel_across_session
     let database = Database::connect("sqlite::memory:").await.unwrap();
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+    let mut acknowledgements = HashMap::new();
+    let mut acknowledgement_receivers = HashMap::new();
+    for session_index in 0..SESSION_COUNT {
+        for sequence in 0..MESSAGES_PER_SESSION {
+            let message_id = format!("message-{session_index}-{sequence}");
+            let (sender, receiver) = oneshot::channel();
+            acknowledgements.insert(message_id.clone(), sender);
+            acknowledgement_receivers.insert(message_id, receiver);
+        }
+    }
+    let acknowledgement_receivers = Arc::new(Mutex::new(acknowledgement_receivers));
     let runner = Arc::new(StressRunner {
         first_message_rendezvous: Barrier::new(SESSION_COUNT + 1),
         started: started_tx,
         completed: completed_tx,
+        acknowledgements: Mutex::new(acknowledgements),
         active_sessions: Mutex::new(HashSet::new()),
         global_active: AtomicUsize::new(0),
         maximum_global_active: AtomicUsize::new(0),
@@ -125,25 +146,33 @@ async fn routes_120_messages_in_order_per_session_and_in_parallel_across_session
     for session_index in 0..SESSION_COUNT {
         let multiplexer = multiplexer.clone();
         let route_rendezvous = route_rendezvous.clone();
+        let acknowledgement_receivers = acknowledgement_receivers.clone();
         producers.push(tokio::spawn(async move {
             let key = discord_session(session_index);
             route_rendezvous.wait().await;
             for sequence in 0..MESSAGES_PER_SESSION {
+                let message_id = format!("message-{session_index}-{sequence}");
+                let acknowledgement = acknowledgement_receivers
+                    .lock()
+                    .await
+                    .remove(&message_id)
+                    .unwrap();
                 multiplexer
                     .route(InboundEvent::message(
                         key.clone(),
-                        format!("message-{session_index}-{sequence}"),
+                        message_id,
                         sequence.to_string(),
                     ))
                     .await
                     .unwrap();
+                if sequence == 0 {
+                    route_rendezvous.wait().await;
+                }
+                acknowledgement.await.unwrap();
             }
         }));
     }
     route_rendezvous.wait().await;
-    for producer in producers {
-        producer.await.unwrap();
-    }
 
     let started = tokio::time::timeout(Duration::from_secs(5), async {
         let mut sessions = HashSet::with_capacity(SESSION_COUNT);
@@ -166,6 +195,10 @@ async fn routes_120_messages_in_order_per_session_and_in_parallel_across_session
         "every distinct session should be active before the rendezvous releases"
     );
     runner.first_message_rendezvous.wait().await;
+    route_rendezvous.wait().await;
+    for producer in producers {
+        producer.await.unwrap();
+    }
 
     let observed = tokio::time::timeout(Duration::from_secs(5), async {
         let mut by_session: HashMap<SessionKey, Vec<usize>> = HashMap::new();

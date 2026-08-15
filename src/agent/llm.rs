@@ -37,7 +37,7 @@ impl LlmConfig {
             model: model.into(),
             api_key: None,
             base_url: None,
-            max_tokens: 4096,
+            max_tokens: 32768,
             temperature: None,
         }
     }

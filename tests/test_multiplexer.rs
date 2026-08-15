@@ -8,7 +8,7 @@ use omon_gateway::{
     AgentRunner, Database, DeliveryLedgerService, InboundEvent, MultiplexerConfig, OmonError,
     SessionContext, SessionKey, SessionMultiplexer,
 };
-use tokio::sync::{mpsc, Barrier, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, Barrier, Mutex};
 
 fn session(user: &str) -> SessionKey {
     SessionKey::new("discord", Some("guild"), "channel", None::<String>, user)
@@ -120,6 +120,7 @@ async fn handles_events_sequentially_within_one_session() {
     );
     let key = session("one-user");
 
+    let mut observed = Vec::new();
     for index in 0..20 {
         multiplexer
             .route(InboundEvent::message(
@@ -129,10 +130,6 @@ async fn handles_events_sequentially_within_one_session() {
             ))
             .await
             .unwrap();
-    }
-
-    let mut observed = Vec::new();
-    while observed.len() < 20 {
         observed.push(
             tokio::time::timeout(Duration::from_secs(2), completed_rx.recv())
                 .await
@@ -144,6 +141,146 @@ async fn handles_events_sequentially_within_one_session() {
         observed,
         (0..20).map(|index| index.to_string()).collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn a_new_message_interrupts_the_active_turn_and_runs_promptly() {
+    struct InterruptRunner {
+        started: mpsc::UnboundedSender<String>,
+        first_release: Mutex<Option<oneshot::Receiver<()>>>,
+        first_dropped: Arc<AtomicBool>,
+        completed: mpsc::UnboundedSender<String>,
+    }
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl AgentRunner for InterruptRunner {
+        async fn run(
+            &self,
+            session: &mut SessionContext,
+            event: InboundEvent,
+        ) -> Result<(), OmonError> {
+            self.started.send(event.content.clone()).unwrap();
+            if event.content == "first" {
+                let _drop_signal = DropSignal(self.first_dropped.clone());
+                let release = self.first_release.lock().await.take().unwrap();
+                let _ = release.await;
+                session.state.metadata.insert("stale".into(), true.into());
+            } else {
+                session.state.metadata.insert("fresh".into(), true.into());
+                self.completed.send(event.content).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let key = session("interrupt-user");
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    let first_dropped = Arc::new(AtomicBool::new(false));
+    let multiplexer = SessionMultiplexer::new(
+        database.pool().clone(),
+        Arc::new(InterruptRunner {
+            started: started_tx,
+            first_release: Mutex::new(Some(release_rx)),
+            first_dropped: first_dropped.clone(),
+            completed: completed_tx,
+        }),
+        MultiplexerConfig::default(),
+    );
+
+    multiplexer
+        .route(InboundEvent::message(key.clone(), "interrupt-1", "first"))
+        .await
+        .unwrap();
+    assert_eq!(started_rx.recv().await.as_deref(), Some("first"));
+
+    multiplexer
+        .route(InboundEvent::message(key.clone(), "interrupt-2", "second"))
+        .await
+        .unwrap();
+    assert_eq!(started_rx.recv().await.as_deref(), Some("second"));
+    assert_eq!(completed_rx.recv().await.as_deref(), Some("second"));
+    assert!(first_dropped.load(Ordering::SeqCst));
+
+    let messages: Vec<String> =
+        sqlx::query_scalar("SELECT content FROM messages WHERE session_key = ? ORDER BY sequence")
+            .bind(key.storage_key())
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(messages, vec!["first", "second"]);
+}
+
+#[tokio::test]
+async fn stop_immediately_cancels_the_active_turn() {
+    struct StoppableRunner {
+        started: mpsc::UnboundedSender<()>,
+        release: Mutex<Option<oneshot::Receiver<()>>>,
+        dropped: Arc<AtomicBool>,
+        completed: Arc<AtomicBool>,
+    }
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl AgentRunner for StoppableRunner {
+        async fn run(
+            &self,
+            _session: &mut SessionContext,
+            _event: InboundEvent,
+        ) -> Result<(), OmonError> {
+            let _drop_signal = DropSignal(self.dropped.clone());
+            self.started.send(()).unwrap();
+            let release = self.release.lock().await.take().unwrap();
+            let _ = release.await;
+            self.completed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let key = session("stop-user");
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let completed = Arc::new(AtomicBool::new(false));
+    let multiplexer = SessionMultiplexer::new(
+        database.pool().clone(),
+        Arc::new(StoppableRunner {
+            started: started_tx,
+            release: Mutex::new(Some(release_rx)),
+            dropped: dropped.clone(),
+            completed: completed.clone(),
+        }),
+        MultiplexerConfig::default(),
+    );
+
+    multiplexer
+        .route(InboundEvent::message(key.clone(), "stop-1", "long turn"))
+        .await
+        .unwrap();
+    started_rx.recv().await.unwrap();
+
+    assert!(multiplexer.stop(&key).await.unwrap());
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(!completed.load(Ordering::SeqCst));
+    assert!(!multiplexer.stop(&key).await.unwrap());
 }
 
 #[tokio::test]
@@ -339,11 +476,11 @@ async fn dropping_multiplexer_releases_actor_cycle_and_flushes_dirty_state() {
 }
 
 #[tokio::test]
-async fn route_waits_while_gc_retires_an_actor_instead_of_enqueueing_behind_eviction() {
+async fn gc_does_not_evict_an_actor_with_an_active_turn() {
     struct BlockingRunner {
-        entered: mpsc::UnboundedSender<String>,
-        completed: mpsc::UnboundedSender<String>,
-        release_first: Arc<Semaphore>,
+        entered: mpsc::UnboundedSender<()>,
+        release: Mutex<Option<oneshot::Receiver<()>>>,
+        completed: mpsc::UnboundedSender<()>,
     }
 
     #[async_trait]
@@ -351,13 +488,12 @@ async fn route_waits_while_gc_retires_an_actor_instead_of_enqueueing_behind_evic
         async fn run(
             &self,
             _session: &mut SessionContext,
-            event: InboundEvent,
+            _event: InboundEvent,
         ) -> Result<(), OmonError> {
-            self.entered.send(event.content.clone()).unwrap();
-            if event.content == "first" {
-                self.release_first.acquire().await.unwrap().forget();
-            }
-            self.completed.send(event.content).unwrap();
+            self.entered.send(()).unwrap();
+            let release = self.release.lock().await.take().unwrap();
+            let _ = release.await;
+            self.completed.send(()).unwrap();
             Ok(())
         }
     }
@@ -366,13 +502,13 @@ async fn route_waits_while_gc_retires_an_actor_instead_of_enqueueing_behind_evic
     let key = session("gc-race-user");
     let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
-    let release_first = Arc::new(Semaphore::new(0));
+    let (release_tx, release_rx) = oneshot::channel();
     let multiplexer = SessionMultiplexer::new(
         database.pool().clone(),
         Arc::new(BlockingRunner {
             entered: entered_tx,
+            release: Mutex::new(Some(release_rx)),
             completed: completed_tx,
-            release_first: release_first.clone(),
         }),
         MultiplexerConfig {
             idle_timeout: Duration::ZERO,
@@ -384,36 +520,13 @@ async fn route_waits_while_gc_retires_an_actor_instead_of_enqueueing_behind_evic
         .route(InboundEvent::message(key.clone(), "race-1", "first"))
         .await
         .unwrap();
-    assert_eq!(entered_rx.recv().await.as_deref(), Some("first"));
+    entered_rx.recv().await.unwrap();
 
-    let gc = {
-        let multiplexer = multiplexer.clone();
-        tokio::spawn(async move { multiplexer.collect_garbage().await })
-    };
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(multiplexer.collect_garbage().await.unwrap(), 0);
+    assert!(multiplexer.contains_session(&key));
 
-    let mut second_route = {
-        let multiplexer = multiplexer.clone();
-        let key = key.clone();
-        tokio::spawn(async move {
-            multiplexer
-                .route(InboundEvent::message(key, "race-2", "second"))
-                .await
-        })
-    };
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut second_route)
-            .await
-            .is_err(),
-        "route must not acknowledge an event while its actor is retiring"
-    );
-
-    release_first.add_permits(1);
-    assert_eq!(completed_rx.recv().await.as_deref(), Some("first"));
-    assert_eq!(gc.await.unwrap().unwrap(), 1);
-    second_route.await.unwrap().unwrap();
-    assert_eq!(entered_rx.recv().await.as_deref(), Some("second"));
-    assert_eq!(completed_rx.recv().await.as_deref(), Some("second"));
+    release_tx.send(()).unwrap();
+    completed_rx.recv().await.unwrap();
 }
 
 #[tokio::test]

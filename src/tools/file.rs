@@ -19,8 +19,8 @@ impl FileTool {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            max_read_bytes: 1024 * 1024,
-            max_search_results: 100,
+            max_read_bytes: 100 * 1024 * 1024,
+            max_search_results: 1000,
         }
     }
 
