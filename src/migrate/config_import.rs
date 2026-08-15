@@ -65,7 +65,7 @@ pub fn import_config(
     let profiles = read_profiles(env, hermes_root)?;
 
     // Parse and validate every source before touching the target. This keeps malformed input from
-    // producing a partially migrated authoritative file.
+    // producing a partially migrated file.
     let mut profile_sources = Vec::with_capacity(profiles.len());
     for profile in profiles {
         let profile_env = read_optional_env(env, &profile.join(".env"))?;
@@ -81,12 +81,19 @@ pub fn import_config(
     let values = map_values(&root_config, &root_env, &profile_sources);
     validate_output_values(&values)?;
 
-    let old_values = if env.exists(target_env) {
-        Some(parse_env(target_env, &env.read_to_string(target_env)?)?)
+    let existing = if env.exists(target_env) {
+        Some(parse_env_document(
+            target_env,
+            &env.read_to_string(target_env)?,
+        )?)
     } else {
         None
     };
-    let diff = masked_diff(old_values.as_ref(), &values);
+    let merged_values = merged_values(existing.as_ref(), &values);
+    let diff = masked_diff(
+        existing.as_ref().map(|document| &document.values),
+        &merged_values,
+    );
 
     if dry_run {
         return Ok(ConfigImportResult {
@@ -105,7 +112,10 @@ pub fn import_config(
         None
     };
 
-    env.write(target_env, render_env(&values).as_bytes())?;
+    env.write(
+        target_env,
+        render_merged_env(existing.as_ref(), &values).as_bytes(),
+    )?;
 
     Ok(ConfigImportResult {
         values,
@@ -179,11 +189,29 @@ fn read_profiles(env: &dyn MigrationEnv, hermes_root: &Path) -> Result<Vec<PathB
     Ok(profiles)
 }
 
+#[derive(Debug)]
+struct EnvDocument {
+    lines: Vec<EnvLine>,
+    values: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+enum EnvLine {
+    Raw(String),
+    Assignment { key: String, raw: String },
+}
+
 fn parse_env(path: &Path, contents: &str) -> Result<BTreeMap<String, String>> {
+    Ok(parse_env_document(path, contents)?.values)
+}
+
+fn parse_env_document(path: &Path, contents: &str) -> Result<EnvDocument> {
+    let mut lines = Vec::new();
     let mut values = BTreeMap::new();
     for (index, raw_line) in contents.lines().enumerate() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
+            lines.push(EnvLine::Raw(raw_line.to_string()));
             continue;
         }
         let (key, value) = line.split_once('=').ok_or_else(|| {
@@ -205,8 +233,12 @@ fn parse_env(path: &Path, contents: &str) -> Result<BTreeMap<String, String>> {
             key.to_string(),
             strip_matching_quotes(value.trim()).to_string(),
         );
+        lines.push(EnvLine::Assignment {
+            key: key.to_string(),
+            raw: raw_line.to_string(),
+        });
     }
-    Ok(values)
+    Ok(EnvDocument { lines, values })
 }
 
 fn strip_matching_quotes(value: &str) -> &str {
@@ -330,6 +362,52 @@ fn validate_output_values(values: &BTreeMap<String, String>) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn merged_values(
+    existing: Option<&EnvDocument>,
+    overlay: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = existing
+        .map(|document| document.values.clone())
+        .unwrap_or_default();
+    merged.extend(overlay.clone());
+    merged
+}
+
+fn render_merged_env(existing: Option<&EnvDocument>, overlay: &BTreeMap<String, String>) -> String {
+    let Some(existing) = existing else {
+        return render_env(overlay);
+    };
+
+    let mut rendered = String::new();
+    let mut overlaid = HashSet::new();
+    for line in &existing.lines {
+        match line {
+            EnvLine::Assignment { key, raw } => {
+                if let Some(value) = overlay.get(key) {
+                    rendered.push_str(key);
+                    rendered.push('=');
+                    rendered.push_str(value);
+                    overlaid.insert(key.as_str());
+                } else {
+                    rendered.push_str(raw);
+                }
+            }
+            EnvLine::Raw(raw) => rendered.push_str(raw),
+        }
+        rendered.push('\n');
+    }
+    for (key, value) in overlay {
+        if overlaid.contains(key.as_str()) {
+            continue;
+        }
+        rendered.push_str(key);
+        rendered.push('=');
+        rendered.push_str(value);
+        rendered.push('\n');
+    }
+    rendered
 }
 
 fn render_env(values: &BTreeMap<String, String>) -> String {
@@ -664,11 +742,24 @@ mod tests {
     }
 
     #[test]
-    fn backs_up_existing_env_before_authoritative_overwrite() {
+    fn merges_into_existing_env_and_backs_up_original() {
         let env = fixture();
         write(&env, "/hermes/config.yaml", "model:\n  default: gpt-4o\n");
-        write(&env, "/hermes/.env", "DISCORD_BOT_TOKEN=primary\n");
-        write(&env, "/gateway/.env", "OLD=value\n");
+        write(
+            &env,
+            "/hermes/.env",
+            "DISCORD_BOT_TOKEN=primary\nDISCORD_ALLOWED_USERS=42\n",
+        );
+        write(
+            &env,
+            "/hermes/profiles/alpha/.env",
+            "DISCORD_BOT_TOKEN=secondary\n",
+        );
+        write(
+            &env,
+            "/gateway/.env",
+            "# gateway settings\nDATABASE_URL=sqlite://custom.db\nDEFAULT_MODEL=old\nOMON_WORKSPACE_ROOT=/x\n",
+        );
         let writes_before = env.write_calls().len();
 
         let result = import_config(
@@ -679,24 +770,27 @@ mod tests {
         )
         .unwrap();
 
+        let original = "# gateway settings\nDATABASE_URL=sqlite://custom.db\nDEFAULT_MODEL=old\nOMON_WORKSPACE_ROOT=/x\n";
+        let merged = "# gateway settings\nDATABASE_URL=sqlite://custom.db\nDEFAULT_MODEL=gpt-4o\nOMON_WORKSPACE_ROOT=/x\nDISCORD_ALLOWED_USERS=42\nDISCORD_BOT_TOKEN=primary\nDISCORD_BOT_TOKENS=secondary\n";
         let backup = PathBuf::from("/gateway/.env.bak-20260815T143045Z");
         assert_eq!(result.backup_path.as_deref(), Some(backup.as_path()));
         assert!(env.rename_calls().is_empty());
-        assert_eq!(env.read_to_string(&backup).unwrap(), "OLD=value\n");
+        assert_eq!(env.read_to_string(&backup).unwrap(), original);
+        assert_eq!(
+            env.read_to_string(Path::new("/gateway/.env")).unwrap(),
+            merged
+        );
         let writes = &env.write_calls()[writes_before..];
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].0, backup);
-        assert_eq!(writes[0].1, b"OLD=value\n");
+        assert_eq!(writes[0].1, original.as_bytes());
         assert_eq!(writes[1].0, PathBuf::from("/gateway/.env"));
-        assert_eq!(
-            String::from_utf8(writes[1].1.clone()).unwrap(),
-            "DEFAULT_MODEL=gpt-4o\nDISCORD_BOT_TOKEN=primary\n"
-        );
-        println!(
-            "backup={} then authoritative write={}",
-            writes[0].0.display(),
-            writes[1].0.display()
-        );
+        assert_eq!(writes[1].1, merged.as_bytes());
+        assert!(result.diff.contains("= DATABASE_URL="));
+        assert!(result.diff.contains("= OMON_WORKSPACE_ROOT="));
+        assert!(result.diff.contains("~ DEFAULT_MODEL="));
+        assert!(result.diff.contains("+ DISCORD_BOT_TOKEN="));
+        assert!(!result.diff.lines().any(|line| line.starts_with("- ")));
     }
 
     #[test]
@@ -708,7 +802,11 @@ mod tests {
             "model:\n  default: gpt-4o\n  api_key: api-secret\n",
         );
         write(&env, "/hermes/.env", "DISCORD_BOT_TOKEN=bot-secret\n");
-        write(&env, "/gateway/.env", "DEFAULT_MODEL=old\n");
+        write(
+            &env,
+            "/gateway/.env",
+            "DATABASE_URL=sqlite://custom.db\nDEFAULT_MODEL=old\nOMON_WORKSPACE_ROOT=/x\n",
+        );
         let writes_before = env.write_calls().len();
         let renames_before = env.rename_calls().len();
 
@@ -719,6 +817,9 @@ mod tests {
         assert_eq!(env.rename_calls().len(), renames_before);
         assert!(result.diff.contains("DEFAULT_MODEL"));
         assert!(result.diff.contains("OPENAI_API_KEY"));
+        assert!(result.diff.contains("= DATABASE_URL="));
+        assert!(result.diff.contains("= OMON_WORKSPACE_ROOT="));
+        assert!(!result.diff.lines().any(|line| line.starts_with("- ")));
         assert!(!result.diff.contains("api-secret"));
         assert!(!result.diff.contains("bot-secret"));
         assert!(result.backup_path.is_none());

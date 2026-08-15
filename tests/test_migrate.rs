@@ -60,7 +60,11 @@ fn seed_fake(env: &FakeMigrationEnv, fixture: &Fixture, include_cutover: bool) {
     .unwrap();
     env.write(&fixture.root.join("cron/jobs.json"), JOBS.as_bytes())
         .unwrap();
-    env.write(&fixture.target_env, b"OLD=value\n").unwrap();
+    env.write(
+        &fixture.target_env,
+        b"DATABASE_URL=sqlite://custom.db\nOMON_WORKSPACE_ROOT=/x\nDEFAULT_MODEL=old\n",
+    )
+    .unwrap();
 
     if include_cutover {
         env.write(
@@ -98,8 +102,10 @@ async fn full_migration_imports_config_and_cron_before_cutover() {
     .unwrap();
 
     let migrated_env = env.read_to_string(&fixture.target_env).unwrap();
-    assert!(migrated_env.contains("DEFAULT_MODEL=gpt-4o"));
-    assert!(migrated_env.contains("DISCORD_BOT_TOKEN=bot-secret"));
+    assert_eq!(
+        migrated_env,
+        "DATABASE_URL=sqlite://custom.db\nOMON_WORKSPACE_ROOT=/x\nDEFAULT_MODEL=gpt-4o\nAPPROVAL_MODE=smart\nDISCORD_ALLOWED_USERS=42\nDISCORD_BOT_TOKEN=bot-secret\nOPENAI_API_BASE=https://example.test/v1\nOPENAI_API_KEY=provider-secret\n"
+    );
     assert_eq!(
         env.read_to_string(
             &fixture
@@ -107,8 +113,14 @@ async fn full_migration_imports_config_and_cron_before_cutover() {
                 .with_file_name("gateway.env.bak-20260815T150000Z")
         )
         .unwrap(),
-        "OLD=value\n"
+        "DATABASE_URL=sqlite://custom.db\nOMON_WORKSPACE_ROOT=/x\nDEFAULT_MODEL=old\n"
     );
+    assert!(summary.config_diff.contains("= DATABASE_URL="));
+    assert!(summary.config_diff.contains("= OMON_WORKSPACE_ROOT="));
+    assert!(!summary
+        .config_diff
+        .lines()
+        .any(|line| line.starts_with("- ")));
 
     let imported: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM cron_jobs WHERE id = 'hermes:default:daily'")
