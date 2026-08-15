@@ -7,11 +7,11 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
-    AgentRunner, ChatMessage, CronJob, CronScheduler, CronTaskExecutor, CronTool, DiscordAdapter,
-    DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient,
-    LlmConfig, LlmProvider, McpTool, MemoryStore, MultiplexerConfig, OmonError, OutboundAction,
-    OutboundDispatcher, PoiseData, Result, ScaleToZero, SessionContext, SessionKey,
-    SessionMultiplexer, TerminalTool, ToolDefinition, ToolRegistry,
+    render_user_prompt, AgentRunner, ChatMessage, CronJob, CronScheduler, CronTaskExecutor,
+    CronTool, DiscordAdapter, DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer,
+    InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore, MultiplexerConfig,
+    OmonError, OutboundAction, OutboundDispatcher, PoiseData, Result, ScaleToZero, SessionContext,
+    SessionKey, SessionMultiplexer, TerminalTool, ToolDefinition, ToolRegistry,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -313,7 +313,7 @@ impl LiveAgentRunner {
         }
         info!(session = %session.key, user = %event.session.user_id, content = %event.content, "Starting agent execution for message");
         let mut messages = self.messages(session, &event).await?;
-        let mut user_content = event.content.clone();
+        let mut user_content = render_user_prompt(&event);
         let lower = user_content.to_lowercase();
         let is_ulw = lower.contains("ulw")
             || lower.contains("ultrawork")
@@ -947,7 +947,7 @@ async fn main() -> Result<()> {
     let default_bot_id = default_bot_id
         .ok_or_else(|| OmonError::Config("no Discord bot identities were configured".into()))?;
     let discord_egress = Arc::new(DiscordEgress::with_bot_clients(
-        default_bot_id,
+        default_bot_id.clone(),
         bot_http_clients,
     )?);
     shared_dispatcher.set(discord_egress.clone()).await;
@@ -970,6 +970,11 @@ async fn main() -> Result<()> {
     poise_data.tool_registry = tools.clone();
     poise_data.free_response_channels = config.free_response_channels.clone();
     poise_data.allowed_users = config.allowed_users.clone();
+    poise_data.primary_bot_id = Some(default_bot_id.parse().map_err(|_| {
+        OmonError::Config(format!(
+            "invalid primary Discord bot identity {default_bot_id}"
+        ))
+    })?);
     let adapter = DiscordAdapter::new(poise_data);
 
     let mut clients = Vec::new();

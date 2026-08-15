@@ -18,10 +18,42 @@ pub struct InboundEvent {
     pub id: Uuid,
     pub session: SessionKey,
     pub platform_message_id: String,
+    /// Durable delivery-ledger claim associated with this event, when ingress
+    /// deduplication is enabled for the transport.
+    #[serde(default)]
+    pub delivery_id: Option<String>,
     pub content: String,
     #[serde(default)]
     pub attachments: Vec<MessageAttachment>,
     pub received_at: DateTime<Utc>,
+}
+
+pub fn render_user_prompt(event: &InboundEvent) -> String {
+    if event.attachments.is_empty() {
+        return event.content.clone();
+    }
+
+    let attachments = event
+        .attachments
+        .iter()
+        .map(|attachment| {
+            format!(
+                "[Attachment: {} ({}, {} bytes) - {}]",
+                attachment.filename,
+                attachment.content_type.as_deref().unwrap_or("unknown"),
+                attachment
+                    .size_bytes
+                    .map_or_else(|| "unknown".to_owned(), |size| size.to_string()),
+                attachment.url
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if event.content.trim().is_empty() {
+        attachments
+    } else {
+        format!("{}\n\n{attachments}", event.content)
+    }
 }
 
 impl InboundEvent {
@@ -34,6 +66,7 @@ impl InboundEvent {
             id: Uuid::new_v4(),
             session,
             platform_message_id: platform_message_id.into(),
+            delivery_id: None,
             content: content.into(),
             attachments: Vec::new(),
             received_at: Utc::now(),
@@ -42,6 +75,11 @@ impl InboundEvent {
 
     pub fn with_attachments(mut self, attachments: Vec<MessageAttachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    pub fn with_delivery_id(mut self, delivery_id: impl Into<String>) -> Self {
+        self.delivery_id = Some(delivery_id.into());
         self
     }
 }

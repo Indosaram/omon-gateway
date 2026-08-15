@@ -19,6 +19,7 @@ pub struct PoiseData {
     pub approvals: SmartApprovalGuard,
     pub free_response_channels: Vec<u64>,
     pub allowed_users: Vec<u64>,
+    pub primary_bot_id: Option<u64>,
     pub tool_registry: crate::ToolRegistry,
 }
 
@@ -41,6 +42,7 @@ impl PoiseData {
             approvals: SmartApprovalGuard::new(),
             free_response_channels: Vec::new(),
             allowed_users: Vec::new(),
+            primary_bot_id: None,
             tool_registry: crate::ToolRegistry::new(),
         }
     }
@@ -63,6 +65,24 @@ impl PoiseData {
 
 pub fn all() -> Vec<poise::Command<PoiseData, CommandError>> {
     vec![model(), reset(), status(), tools(), skill(), cron()]
+}
+
+pub fn is_user_allowed(allowed_users: &[u64], user_id: u64) -> bool {
+    allowed_users.is_empty() || allowed_users.contains(&user_id)
+}
+
+pub async fn command_check(ctx: PoiseContext<'_>) -> Result<bool, CommandError> {
+    if is_user_allowed(&ctx.data().allowed_users, ctx.author().id.get()) {
+        return Ok(true);
+    }
+
+    ctx.send(
+        poise::CreateReply::default()
+            .content("You are not authorized to use this command.")
+            .ephemeral(true),
+    )
+    .await?;
+    Ok(false)
 }
 
 #[poise::command(slash_command)]

@@ -27,6 +27,15 @@ impl DeliveryLedgerService {
     }
 
     pub async fn record_incoming(&self, event: &InboundEvent) -> Result<bool> {
+        self.record_incoming_as(event, &event.platform_message_id)
+            .await
+    }
+
+    pub async fn record_incoming_as(
+        &self,
+        event: &InboundEvent,
+        delivery_id: &str,
+    ) -> Result<bool> {
         self.ensure_session(&event.session).await?;
         let result = sqlx::query(
             "INSERT INTO delivery_ledger (
@@ -37,8 +46,8 @@ impl DeliveryLedgerService {
         )
         .bind(Uuid::new_v4().to_string())
         .bind(event.session.storage_key())
-        .bind(event.id.to_string())
-        .bind(&event.platform_message_id)
+        .bind(delivery_id)
+        .bind(delivery_id)
         .bind(&event.platform_message_id)
         .bind(event.received_at)
         .bind(event.received_at)

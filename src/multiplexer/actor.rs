@@ -6,7 +6,10 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{InboundEvent, OmonError, OutboundAction, Result, SessionContext, SessionKey};
+use crate::{
+    render_user_prompt, DeliveryLedgerService, InboundEvent, OmonError, OutboundAction, Result,
+    SessionContext, SessionKey,
+};
 
 #[async_trait]
 pub trait AgentRunner: Send + Sync + 'static {
@@ -67,7 +70,26 @@ impl SessionActor {
                         tracing::error!(session = %self.context.key, %error, "failed to persist inbound event");
                     }
                     let reply_to = event.platform_message_id.clone();
-                    if let Err(error) = self.runner.run(&mut self.context, *event).await {
+                    let delivery_id = event.delivery_id.clone();
+                    let result = self.runner.run(&mut self.context, *event).await;
+                    if let Some(delivery_id) = delivery_id.as_deref() {
+                        let ledger = DeliveryLedgerService::new(self.pool.clone());
+                        match &result {
+                            Ok(()) => {
+                                if let Err(error) = ledger.mark_delivered(delivery_id).await {
+                                    tracing::error!(%delivery_id, %error, "failed to complete delivery claim");
+                                }
+                            }
+                            Err(error) => {
+                                if let Err(ledger_error) =
+                                    ledger.mark_failed(delivery_id, error.to_string()).await
+                                {
+                                    tracing::error!(%delivery_id, %ledger_error, "failed to mark delivery claim failed");
+                                }
+                            }
+                        }
+                    }
+                    if let Err(error) = result {
                         tracing::error!(session = %self.context.key, %error, "agent runner failed");
                         if let Some(dispatcher) = &self.dispatcher {
                             let _ = dispatcher
@@ -118,7 +140,7 @@ impl SessionActor {
         )
         .bind(event.id.to_string())
         .bind(self.context.key.storage_key())
-        .bind(&event.content)
+        .bind(render_user_prompt(event))
         .bind(serde_json::to_string(&event.attachments).map_err(serialization_error)?)
         .bind(event.received_at)
         .execute(&self.pool)

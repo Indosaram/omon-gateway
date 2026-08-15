@@ -2,10 +2,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use omon_gateway::discord::adapter::message_to_inbound;
+use omon_gateway::discord::adapter::{message_to_inbound, message_to_inbound_with_config};
+use omon_gateway::discord::commands::is_user_allowed;
 use omon_gateway::{
-    chunk_markdown, ApprovalDecision, ApprovalError, DiscordMessageTransport, LiveEditThrottler,
-    Result, SmartApprovalGuard,
+    chunk_markdown, render_user_prompt, ApprovalDecision, ApprovalError, Database,
+    DeliveryLedgerService, DiscordMessageTransport, InboundEvent, LiveEditThrottler,
+    MessageAttachment, Result, SessionKey, SmartApprovalGuard,
 };
 use serenity::all::{ChannelId, ChannelType, Message, MessageId, UserId};
 use tokio::sync::{mpsc, Mutex};
@@ -231,6 +233,137 @@ fn converts_serenity_dm_mentions_threads_and_attachments() {
     let thread = message_fixture(Some(9), "thread continuation", Vec::new());
     let event = message_to_inbound(&thread, bot_id, Some(ChannelType::PublicThread)).unwrap();
     assert_eq!(event.session.thread_id.as_deref(), Some("7"));
+}
+
+#[test]
+fn only_primary_bot_owns_unmentioned_threads_dms_and_free_channels() {
+    let primary = UserId::new(42);
+    let secondary = UserId::new(84);
+    let thread = message_fixture(Some(9), "continue", Vec::new());
+
+    assert!(message_to_inbound_with_config(
+        &thread,
+        primary,
+        Some(ChannelType::PublicThread),
+        &[],
+        &[],
+        Some(primary.get()),
+    )
+    .is_some());
+    assert!(message_to_inbound_with_config(
+        &thread,
+        secondary,
+        Some(ChannelType::PublicThread),
+        &[],
+        &[],
+        Some(primary.get()),
+    )
+    .is_none());
+
+    let dm = message_fixture(None, "hello", Vec::new());
+    assert!(message_to_inbound_with_config(
+        &dm,
+        secondary,
+        Some(ChannelType::Private),
+        &[],
+        &[],
+        Some(primary.get()),
+    )
+    .is_none());
+
+    let free = message_fixture(Some(9), "hello", Vec::new());
+    assert!(message_to_inbound_with_config(
+        &free,
+        secondary,
+        Some(ChannelType::Text),
+        &[7],
+        &[],
+        Some(primary.get()),
+    )
+    .is_none());
+}
+
+#[test]
+fn every_explicitly_mentioned_bot_owns_exactly_its_target() {
+    let message = message_fixture(Some(9), "<@42> <@84> compare", vec![42, 84]);
+
+    assert!(message_to_inbound_with_config(
+        &message,
+        UserId::new(42),
+        Some(ChannelType::Text),
+        &[],
+        &[],
+        Some(42),
+    )
+    .is_some());
+    assert!(message_to_inbound_with_config(
+        &message,
+        UserId::new(84),
+        Some(ChannelType::Text),
+        &[],
+        &[],
+        Some(42),
+    )
+    .is_some());
+    assert!(message_to_inbound_with_config(
+        &message,
+        UserId::new(126),
+        Some(ChannelType::Text),
+        &[],
+        &[],
+        Some(42),
+    )
+    .is_none());
+}
+
+#[tokio::test]
+async fn discord_delivery_claims_deduplicate_per_target_bot() {
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let ledger = DeliveryLedgerService::new(database.pool().clone());
+    let session =
+        SessionKey::new("discord", Some("9"), "7", None::<String>, "10").with_bot_id("42");
+    let event = InboundEvent::message(session, "8", "hello");
+
+    assert!(ledger
+        .record_incoming_as(&event, "discord:8")
+        .await
+        .unwrap());
+    assert!(!ledger
+        .record_incoming_as(&event, "discord:8")
+        .await
+        .unwrap());
+    assert!(ledger
+        .record_incoming_as(&event, "discord:8:84")
+        .await
+        .unwrap());
+}
+
+#[test]
+fn renders_complete_attachment_context_for_attachment_only_turns() {
+    let event = InboundEvent::message(
+        SessionKey::new("discord", Some("9"), "7", None::<String>, "10"),
+        "8",
+        "",
+    )
+    .with_attachments(vec![MessageAttachment {
+        id: "11".into(),
+        filename: "main.rs".into(),
+        url: "https://cdn.example/main.rs".into(),
+        content_type: Some("text/x-rust".into()),
+        size_bytes: Some(24),
+    }]);
+
+    assert_eq!(
+        render_user_prompt(&event),
+        "[Attachment: main.rs (text/x-rust, 24 bytes) - https://cdn.example/main.rs]"
+    );
+}
+
+#[test]
+fn slash_authorization_defaults_open_and_enforces_allowlist() {
+    assert!(is_user_allowed(&[], 10));
+    assert!(is_user_allowed(&[10, 11], 10));
+    assert!(!is_user_allowed(&[10, 11], 12));
 }
 
 fn message_fixture(guild_id: Option<u64>, content: &str, mentions: Vec<u64>) -> Message {

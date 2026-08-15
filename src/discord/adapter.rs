@@ -17,8 +17,8 @@ use super::throttler::{
     DISCORD_MESSAGE_LIMIT,
 };
 use crate::{
-    InboundEvent, MessageAttachment, OmonError, OutboundAction, OutboundDispatcher, Result,
-    SessionKey,
+    DeliveryLedgerService, InboundEvent, MessageAttachment, OmonError, OutboundAction,
+    OutboundDispatcher, Result, SessionKey,
 };
 
 #[derive(Clone)]
@@ -53,6 +53,7 @@ impl DiscordAdapter {
                 event_handler: |ctx, event, _framework, data| {
                     Box::pin(handle_event(ctx, event, data))
                 },
+                command_check: Some(|ctx| Box::pin(commands::command_check(ctx))),
                 ..Default::default()
             })
             .setup(move |ctx, _ready, framework| {
@@ -83,11 +84,17 @@ impl DiscordAdapter {
         bot_user_id: serenity::UserId,
         channel_type: Option<ChannelType>,
     ) -> Result<bool> {
-        let Some(event) = message_to_inbound(message, bot_user_id, channel_type) else {
+        let Some(event) = message_to_inbound_with_config(
+            message,
+            bot_user_id,
+            channel_type,
+            &self.data.free_response_channels,
+            &self.data.allowed_users,
+            self.data.primary_bot_id,
+        ) else {
             return Ok(false);
         };
-        self.data.multiplexer.route(event).await?;
-        Ok(true)
+        route_claimed_event(&self.data, event).await
     }
 }
 
@@ -126,9 +133,10 @@ async fn handle_event(
                 channel_type,
                 &data.free_response_channels,
                 &data.allowed_users,
+                data.primary_bot_id,
             ) {
                 tracing::info!(session = %event.session, bot_id = %bot_user_id, "Routing inbound message to multiplexer");
-                data.multiplexer.route(event).await?;
+                route_claimed_event(data, event).await?;
             } else {
                 tracing::info!("Message ignored by filter (not DM, not thread, not mentioned, not in free channels)");
             }
@@ -156,12 +164,37 @@ async fn handle_event(
     Ok(())
 }
 
+async fn route_claimed_event(data: &PoiseData, mut event: InboundEvent) -> Result<bool> {
+    let delivery_id = event
+        .delivery_id
+        .clone()
+        .unwrap_or_else(|| format!("discord:{}", event.platform_message_id));
+    let ledger = DeliveryLedgerService::new(data.pool.clone());
+    if !ledger.record_incoming_as(&event, &delivery_id).await? {
+        tracing::info!(delivery_id, "Ignoring duplicate Discord delivery");
+        return Ok(false);
+    }
+    event.delivery_id = Some(delivery_id.clone());
+    if let Err(error) = data.multiplexer.route(event).await {
+        ledger.mark_failed(&delivery_id, error.to_string()).await?;
+        return Err(error);
+    }
+    Ok(true)
+}
+
 pub fn message_to_inbound(
     message: &Message,
     bot_user_id: serenity::UserId,
     channel_type: Option<ChannelType>,
 ) -> Option<InboundEvent> {
-    message_to_inbound_with_config(message, bot_user_id, channel_type, &[], &[])
+    message_to_inbound_with_config(
+        message,
+        bot_user_id,
+        channel_type,
+        &[],
+        &[],
+        Some(bot_user_id.get()),
+    )
 }
 
 pub fn message_to_inbound_with_config(
@@ -170,8 +203,18 @@ pub fn message_to_inbound_with_config(
     channel_type: Option<ChannelType>,
     free_response_channels: &[u64],
     allowed_users: &[u64],
+    primary_bot_id: Option<u64>,
 ) -> Option<InboundEvent> {
     if message.author.bot || message.webhook_id.is_some() {
+        return None;
+    }
+
+    // Only process standard text messages and replies. Ignore system messages (thread joins, removals, pins, etc.)
+    if !matches!(
+        message.kind,
+        serenity::model::channel::MessageType::Regular
+            | serenity::model::channel::MessageType::InlineReply
+    ) {
         return None;
     }
 
@@ -181,15 +224,29 @@ pub fn message_to_inbound_with_config(
 
     let is_dm = message.guild_id.is_none();
     let is_thread = channel_type.is_some_and(is_thread);
-    let is_mentioned = message.mentions.iter().any(|user| user.id == bot_user_id);
+    let mentioned_bot_ids = message
+        .mentions
+        .iter()
+        .filter(|user| user.bot)
+        .map(|user| user.id)
+        .collect::<Vec<_>>();
+    let is_explicit_mention = mentioned_bot_ids.contains(&bot_user_id);
     let is_free_channel = free_response_channels.contains(&message.channel_id.get());
-    if !is_dm && !is_thread && !is_mentioned && !is_free_channel {
-        return None;
+
+    if !mentioned_bot_ids.is_empty() {
+        if !is_explicit_mention {
+            return None;
+        }
+    } else {
+        let is_implicit_response_channel = is_dm || is_thread || is_free_channel;
+        if !is_implicit_response_channel || primary_bot_id != Some(bot_user_id.get()) {
+            return None;
+        }
     }
 
-    let mut content = strip_bot_mention(&message.content, bot_user_id);
+    let content = strip_bot_mention(&message.content, bot_user_id);
     if content.trim().is_empty() && message.attachments.is_empty() {
-        content = "Hello!".to_owned();
+        return None; // Do NOT auto-inject "Hello!" for empty/system messages
     }
     let channel_id = message.channel_id.to_string();
     let session = SessionKey::new(
@@ -211,10 +268,15 @@ pub fn message_to_inbound_with_config(
             size_bytes: Some(u64::from(attachment.size)),
         })
         .collect();
-    Some(
-        InboundEvent::message(session, message.id.to_string(), content)
-            .with_attachments(attachments),
-    )
+    let mut event = InboundEvent::message(session, message.id.to_string(), content)
+        .with_attachments(attachments);
+    let delivery_id = if mentioned_bot_ids.len() > 1 {
+        format!("discord:{}:{}", message.id, bot_user_id.get())
+    } else {
+        format!("discord:{}", message.id)
+    };
+    event.delivery_id = Some(delivery_id);
+    Some(event)
 }
 
 fn is_thread(kind: ChannelType) -> bool {
