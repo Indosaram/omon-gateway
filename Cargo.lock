@@ -1726,6 +1726,7 @@ dependencies = [
  "dashmap 6.2.1",
  "dotenvy",
  "futures-util",
+ "libc",
  "parking_lot",
  "poise",
  "reqwest",

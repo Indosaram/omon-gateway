@@ -1,3 +1,5 @@
+pub mod sys;
+
 #[derive(clap::Args, Debug, Clone)]
 pub struct MigrateArgs {
     #[arg(long)]
