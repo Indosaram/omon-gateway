@@ -18,6 +18,7 @@ name = "omon-gateway"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.43", features = ["full", "test-util"] }
 tokio-util = "0.7"
 poise = "0.6"

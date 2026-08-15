@@ -4,7 +4,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
     render_user_prompt, AgentRunner, ChatMessage, CronJob, CronScheduler, CronTaskExecutor,
@@ -22,6 +24,25 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const STREAM_BATCH_CHARS: usize = 1_500;
+
+#[derive(Debug, Parser)]
+#[command(name = "omon-gateway")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Run,
+    Migrate(MigrateArgs),
+}
+
+impl Cli {
+    fn into_command(self) -> Command {
+        self.command.unwrap_or(Command::Run)
+    }
+}
 
 struct Config {
     discord_bot_tokens: Vec<String>,
@@ -899,6 +920,13 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    match Cli::parse().into_command() {
+        Command::Run => run_gateway().await,
+        Command::Migrate(args) => omon_gateway::migrate::run_migrate(args).await,
+    }
+}
+
+async fn run_gateway() -> Result<()> {
     let config = Config::from_env()?;
     let pool = init_pool(&config.database_url).await?;
     let memory = MemoryStore::new(pool.clone());
@@ -1043,7 +1071,39 @@ fn optional_env(name: &str) -> Option<String> {
 mod runner_tests {
     use std::fs;
 
-    use super::{canonical_authorized_directory, tool_enabled};
+    use clap::Parser;
+
+    use super::{canonical_authorized_directory, tool_enabled, Cli, Command};
+
+    #[test]
+    fn cli_defaults_to_run_without_a_subcommand() {
+        let cli = Cli::try_parse_from(["omon-gateway"]).unwrap();
+        assert!(matches!(cli.into_command(), Command::Run));
+    }
+
+    #[test]
+    fn cli_maps_explicit_run_to_the_run_path() {
+        let cli = Cli::try_parse_from(["omon-gateway", "run"]).unwrap();
+        assert!(matches!(cli.into_command(), Command::Run));
+    }
+
+    #[test]
+    fn cli_parses_migrate_flags() {
+        let cli =
+            Cli::try_parse_from(["omon-gateway", "migrate", "--dry-run", "--no-cutover"]).unwrap();
+        match cli.into_command() {
+            Command::Migrate(args) => {
+                assert!(args.dry_run);
+                assert!(args.no_cutover);
+            }
+            command => panic!("expected migrate command, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_unknown_subcommands() {
+        assert!(Cli::try_parse_from(["omon-gateway", "bogus"]).is_err());
+    }
 
     #[test]
     fn maps_hermes_web_toolset_to_both_web_tools() {

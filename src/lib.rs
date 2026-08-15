@@ -4,6 +4,7 @@ pub mod discord;
 pub mod error;
 pub mod ledger;
 pub mod memory;
+pub mod migrate;
 pub mod models;
 pub mod multiplexer;
 pub mod storage;
