@@ -1,8 +1,12 @@
 use crate::migrate::sys::{LaunchctlOutput, MigrationEnv};
 use crate::{OmonError, Result};
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const TERM_WAIT_POLLS: usize = 10;
+const TERM_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 
 const PLIST_PREFIX: &str = "ai.hermes.gateway";
 const PLIST_SUFFIX: &str = ".plist";
@@ -27,26 +31,36 @@ pub fn bring_gateway_down(
     launch_agents_dir: &Path,
     dry_run: bool,
 ) -> Result<GatewayDownSummary> {
-    let pids_found = discover_pids(env, hermes_root)?;
+    let pid_locks = discover_pid_locks(env, hermes_root)?;
+    let pids_found = pid_locks.keys().copied().collect::<Vec<_>>();
     let mut pids_terminated = Vec::new();
     let mut pids_killed = Vec::new();
 
-    for &pid in &pids_found {
-        if !env.pid_alive(pid) {
-            continue;
-        }
-        pids_terminated.push(pid);
+    for (&pid, locks) in &pid_locks {
         if dry_run {
-            pids_killed.push(pid);
+            if env.pid_alive(pid) {
+                pids_terminated.push(pid);
+                pids_killed.push(pid);
+            }
             continue;
         }
 
-        env.terminate(pid)?;
-        // One post-SIGTERM liveness check is deliberately bounded. The real implementation does
-        // not spin indefinitely, and fakes can model whether SIGTERM completed synchronously.
         if env.pid_alive(pid) {
-            env.kill(pid)?;
-            pids_killed.push(pid);
+            pids_terminated.push(pid);
+            env.terminate(pid)?;
+            if !wait_until_dead(env, pid) {
+                env.kill(pid)?;
+                pids_killed.push(pid);
+                if env.pid_alive(pid) {
+                    return Err(OmonError::Config(format!(
+                        "Hermes gateway pid {pid} remained alive after SIGKILL"
+                    )));
+                }
+            }
+        }
+
+        for lock in locks {
+            env.remove_file(lock)?;
         }
     }
 
@@ -84,7 +98,20 @@ pub fn bring_gateway_down(
     })
 }
 
-fn discover_pids(env: &dyn MigrationEnv, hermes_root: &Path) -> Result<Vec<i32>> {
+fn wait_until_dead(env: &dyn MigrationEnv, pid: i32) -> bool {
+    for _ in 0..TERM_WAIT_POLLS {
+        env.sleep(TERM_WAIT_INTERVAL);
+        if !env.pid_alive(pid) {
+            return true;
+        }
+    }
+    false
+}
+
+fn discover_pid_locks(
+    env: &dyn MigrationEnv,
+    hermes_root: &Path,
+) -> Result<BTreeMap<i32, Vec<PathBuf>>> {
     let mut locks = vec![hermes_root.join("gateway.lock")];
     let profiles_root = hermes_root.join("profiles");
     if env.is_dir(&profiles_root) {
@@ -97,7 +124,7 @@ fn discover_pids(env: &dyn MigrationEnv, hermes_root: &Path) -> Result<Vec<i32>>
         locks.extend(profiles.into_iter().map(|path| path.join("gateway.lock")));
     }
 
-    let mut pids = BTreeSet::new();
+    let mut pid_locks = BTreeMap::<i32, Vec<PathBuf>>::new();
     for lock in locks {
         if !env.is_file(&lock) {
             continue;
@@ -105,14 +132,14 @@ fn discover_pids(env: &dyn MigrationEnv, hermes_root: &Path) -> Result<Vec<i32>>
         let Ok(contents) = env.read_to_string(&lock) else {
             continue;
         };
-        let Ok(lock) = serde_json::from_str::<GatewayLock>(&contents) else {
+        let Ok(parsed) = serde_json::from_str::<GatewayLock>(&contents) else {
             continue;
         };
-        if lock.pid > 0 {
-            pids.insert(lock.pid);
+        if parsed.pid > 0 {
+            pid_locks.entry(parsed.pid).or_default().push(lock);
         }
     }
-    Ok(pids.into_iter().collect())
+    Ok(pid_locks)
 }
 
 fn discover_plists(
@@ -163,12 +190,15 @@ fn launchctl_bootout_succeeded(output: &LaunchctlOutput) -> bool {
 #[cfg(test)]
 mod tests {
     use super::bring_gateway_down;
-    use crate::migrate::sys::{FakeMigrationEnv, LaunchctlOutput, MigrationEnv};
+    use crate::migrate::sys::{
+        FakeMigrationEnv, LaunchctlOutput, MigrationEnv, MigrationOperation,
+    };
     use crate::Result;
     use chrono::{DateTime, TimeZone, Utc};
     use parking_lot::Mutex;
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     const ROOT: &str = "/fixtures/.hermes";
     const AGENTS: &str = "/fixtures/Library/LaunchAgents";
@@ -189,6 +219,7 @@ mod tests {
         alive: Mutex<HashMap<i32, VecDeque<bool>>>,
         alive_calls: Mutex<HashMap<i32, usize>>,
         signal_order: Mutex<Vec<(&'static str, i32)>>,
+        sleep_calls: Mutex<usize>,
     }
 
     impl ScriptedPidEnv {
@@ -198,6 +229,7 @@ mod tests {
                 alive: Mutex::new(HashMap::new()),
                 alive_calls: Mutex::new(HashMap::new()),
                 signal_order: Mutex::new(Vec::new()),
+                sleep_calls: Mutex::new(0),
             }
         }
 
@@ -231,6 +263,17 @@ mod tests {
 
         fn rename(&self, from: &Path, to: &Path) -> Result<()> {
             self.inner.rename(from, to)
+        }
+
+        fn remove_file(&self, path: &Path) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn acquire_jobs_lock(
+            &self,
+            path: &Path,
+        ) -> Result<Box<dyn crate::migrate::sys::MigrationLock>> {
+            self.inner.acquire_jobs_lock(path)
         }
 
         fn exists(&self, path: &Path) -> bool {
@@ -282,6 +325,10 @@ mod tests {
             self.inner.kill(pid)
         }
 
+        fn sleep(&self, _duration: Duration) {
+            *self.sleep_calls.lock() += 1;
+        }
+
         fn run_launchctl(&self, args: &[&str]) -> Result<LaunchctlOutput> {
             self.inner.run_launchctl(args)
         }
@@ -301,7 +348,10 @@ mod tests {
             r#"{"pid":4102,"kind":"hermes-gateway"}"#,
         );
         let env = ScriptedPidEnv::new(inner);
-        env.script_pid(4101, [true, true]);
+        env.script_pid(
+            4101,
+            std::iter::repeat_n(true, super::TERM_WAIT_POLLS + 1).chain([false]),
+        );
         env.script_pid(4102, [true, false]);
 
         let summary = bring_gateway_down(&env, Path::new(ROOT), Path::new(AGENTS), false).unwrap();
@@ -315,14 +365,74 @@ mod tests {
             env.signal_order(),
             [("TERM", 4101), ("KILL", 4101), ("TERM", 4102)]
         );
-        assert_eq!(env.alive_calls(4101), 2);
+        assert_eq!(env.alive_calls(4101), super::TERM_WAIT_POLLS + 2);
         assert_eq!(env.alive_calls(4102), 2);
+        assert_eq!(*env.sleep_calls.lock(), super::TERM_WAIT_POLLS + 1);
+        assert!(!env
+            .inner
+            .exists(Path::new("/fixtures/.hermes/gateway.lock")));
+        assert!(!env
+            .inner
+            .exists(Path::new("/fixtures/.hermes/profiles/work/gateway.lock")));
         println!(
             "signal-order={:?} terminated={:?} killed={:?}",
             env.signal_order(),
             summary.pids_terminated,
             summary.pids_killed
         );
+    }
+
+    #[test]
+    fn pid_that_dies_during_bounded_wait_is_not_killed() {
+        let env = fixture();
+        write(
+            &env,
+            "/fixtures/.hermes/gateway.lock",
+            r#"{"pid":4151,"kind":"hermes-gateway"}"#,
+        );
+        env.set_pid_alive(4151, true);
+        env.set_pid_death_after_sleeps(4151, 3);
+
+        let summary = bring_gateway_down(&env, Path::new(ROOT), Path::new(AGENTS), false).unwrap();
+
+        assert_eq!(summary.pids_terminated, [4151]);
+        assert!(summary.pids_killed.is_empty());
+        assert_eq!(env.terminate_calls(), [4151]);
+        assert!(env.kill_calls().is_empty());
+        assert_eq!(
+            env.operations()
+                .iter()
+                .filter(|operation| matches!(operation, MigrationOperation::Sleep(_)))
+                .count(),
+            3
+        );
+        assert!(!env.exists(Path::new("/fixtures/.hermes/gateway.lock")));
+    }
+
+    #[test]
+    fn pid_alive_after_bounded_wait_is_killed() {
+        let env = fixture();
+        write(
+            &env,
+            "/fixtures/.hermes/gateway.lock",
+            r#"{"pid":4152,"kind":"hermes-gateway"}"#,
+        );
+        env.set_pid_alive(4152, true);
+
+        let summary = bring_gateway_down(&env, Path::new(ROOT), Path::new(AGENTS), false).unwrap();
+
+        assert_eq!(summary.pids_terminated, [4152]);
+        assert_eq!(summary.pids_killed, [4152]);
+        assert_eq!(env.terminate_calls(), [4152]);
+        assert_eq!(env.kill_calls(), [4152]);
+        assert_eq!(
+            env.operations()
+                .iter()
+                .filter(|operation| matches!(operation, MigrationOperation::Sleep(_)))
+                .count(),
+            super::TERM_WAIT_POLLS
+        );
+        assert!(!env.exists(Path::new("/fixtures/.hermes/gateway.lock")));
     }
 
     #[test]
@@ -375,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn second_run_with_stale_pid_and_disabled_plists_is_a_no_op() {
+    fn stale_pid_lock_is_removed_and_disabled_plists_remain_a_no_op() {
         let env = fixture();
         write(
             &env,
@@ -399,7 +509,8 @@ mod tests {
         assert!(env.kill_calls().is_empty());
         assert!(env.launchctl_calls().is_empty());
         assert!(env.rename_calls().is_empty());
-        println!("idempotent-no-op summary={summary:?}");
+        assert!(!env.exists(Path::new("/fixtures/.hermes/gateway.lock")));
+        println!("stale-lock-cleanup summary={summary:?}");
     }
 
     #[test]
@@ -465,12 +576,15 @@ mod tests {
             r#"{"pid":4401}"#,
         );
         let env = ScriptedPidEnv::new(inner);
-        env.script_pid(4401, [true, true, true, true]);
+        env.script_pid(
+            4401,
+            std::iter::repeat_n(true, super::TERM_WAIT_POLLS + 1).chain([false]),
+        );
 
         let summary = bring_gateway_down(&env, Path::new(ROOT), Path::new(AGENTS), false).unwrap();
 
         assert_eq!(summary.pids_found, [4401]);
-        assert_eq!(env.alive_calls(4401), 2);
+        assert_eq!(env.alive_calls(4401), super::TERM_WAIT_POLLS + 2);
         assert_eq!(env.inner.terminate_calls(), [4401]);
         assert_eq!(env.inner.kill_calls(), [4401]);
         println!(

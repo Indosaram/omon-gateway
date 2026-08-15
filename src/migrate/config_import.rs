@@ -385,7 +385,50 @@ mod tests {
     use crate::migrate::sys::{FakeMigrationEnv, MigrationEnv};
     use crate::OmonError;
     use chrono::{TimeZone, Utc};
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+
+    struct RuntimeConfigProjection {
+        discord_bot_tokens: Vec<String>,
+        default_model: String,
+        openai_api_base: Option<String>,
+        openai_api_key: Option<String>,
+    }
+
+    impl RuntimeConfigProjection {
+        // `Config` and `Config::from_env` live privately in the binary crate (`main.rs`), so lib
+        // unit tests cannot name them without widening the production API or booting the binary.
+        // Parse the importer's key/value map with the same token, required-key, and optional-key
+        // semantics instead. This avoids process-global environment mutation in parallel tests.
+        fn from_values(values: &BTreeMap<String, String>) -> crate::Result<Self> {
+            let mut discord_bot_tokens = Vec::new();
+            for key in ["DISCORD_BOT_TOKEN", "DISCORD_BOT_TOKENS"] {
+                if let Some(tokens) = values.get(key) {
+                    for token in tokens.split(',') {
+                        let token = token.trim().trim_matches('"').trim_matches('\'');
+                        if !token.is_empty() && !discord_bot_tokens.iter().any(|item| item == token)
+                        {
+                            discord_bot_tokens.push(token.to_owned());
+                        }
+                    }
+                }
+            }
+            if discord_bot_tokens.is_empty() {
+                return Err(OmonError::Config(
+                    "missing required environment variable DISCORD_BOT_TOKEN".into(),
+                ));
+            }
+            let default_model = values.get("DEFAULT_MODEL").cloned().ok_or_else(|| {
+                OmonError::Config("missing required environment variable DEFAULT_MODEL".into())
+            })?;
+            Ok(Self {
+                discord_bot_tokens,
+                default_model,
+                openai_api_base: values.get("OPENAI_API_BASE").cloned(),
+                openai_api_key: values.get("OPENAI_API_KEY").cloned(),
+            })
+        }
+    }
 
     fn fixture() -> FakeMigrationEnv {
         FakeMigrationEnv::new(Utc.with_ymd_and_hms(2026, 8, 15, 14, 30, 45).unwrap())
@@ -449,6 +492,42 @@ mod tests {
         println!(
             "claude mapping keys={:?}",
             result.values.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn imported_values_round_trip_through_runtime_environment_parsing() {
+        let env = fixture();
+        write(
+            &env,
+            "/hermes/config.yaml",
+            "model:\n  default: gpt-5.6-luna\n  provider: custom:quotio\n  base_url: https://quotio.example/v1\n  api_key: quotio-secret\n",
+        );
+        write(&env, "/hermes/.env", "DISCORD_BOT_TOKEN=primary\n");
+
+        let result = import_config(
+            &env,
+            Path::new("/hermes"),
+            Path::new("/gateway/.env"),
+            false,
+        )
+        .unwrap();
+        let parsed = RuntimeConfigProjection::from_values(&result.values).unwrap();
+        assert_eq!(parsed.discord_bot_tokens, ["primary"]);
+        assert_eq!(parsed.default_model, "gpt-5.6-luna");
+        assert_eq!(
+            parsed.openai_api_base.as_deref(),
+            Some("https://quotio.example/v1")
+        );
+        assert_eq!(parsed.openai_api_key.as_deref(), Some("quotio-secret"));
+        assert_eq!(
+            result.values.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "DEFAULT_MODEL",
+                "DISCORD_BOT_TOKEN",
+                "OPENAI_API_BASE",
+                "OPENAI_API_KEY"
+            ]
         );
     }
 

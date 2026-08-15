@@ -1,9 +1,13 @@
 use crate::{OmonError, Result};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchctlOutput {
@@ -12,11 +16,28 @@ pub struct LaunchctlOutput {
     pub stderr: String,
 }
 
+pub trait MigrationLock: Send {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationOperation {
+    LockAcquired(PathBuf),
+    LockReleased(PathBuf),
+    PidAlive(i32),
+    Terminate(i32),
+    Kill(i32),
+    Sleep(Duration),
+    RemoveFile(PathBuf),
+    Write(PathBuf),
+    Rename(PathBuf, PathBuf),
+}
+
 pub trait MigrationEnv: Send + Sync {
     fn read_to_string(&self, path: &Path) -> Result<String>;
     fn read(&self, path: &Path) -> Result<Vec<u8>>;
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()>;
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+    fn remove_file(&self, path: &Path) -> Result<()>;
+    fn acquire_jobs_lock(&self, path: &Path) -> Result<Box<dyn MigrationLock>>;
     fn exists(&self, path: &Path) -> bool;
     fn is_file(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> bool;
@@ -29,12 +50,23 @@ pub trait MigrationEnv: Send + Sync {
     fn pid_alive(&self, pid: i32) -> bool;
     fn terminate(&self, pid: i32) -> Result<()>;
     fn kill(&self, pid: i32) -> Result<()>;
+    fn sleep(&self, duration: Duration);
 
     fn run_launchctl(&self, args: &[&str]) -> Result<LaunchctlOutput>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OsEnv;
+
+struct OsMigrationLock(File);
+
+impl MigrationLock for OsMigrationLock {}
+
+impl Drop for OsMigrationLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
 
 impl MigrationEnv for OsEnv {
     fn read_to_string(&self, path: &Path) -> Result<String> {
@@ -57,6 +89,26 @@ impl MigrationEnv for OsEnv {
                 to.display()
             ))
         })
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(fs_error("remove", path, error)),
+        }
+    }
+
+    fn acquire_jobs_lock(&self, path: &Path) -> Result<Box<dyn MigrationLock>> {
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(|error| fs_error("open lock file", path, error))?;
+        file.lock_exclusive()
+            .map_err(|error| fs_error("lock", path, error))?;
+        Ok(Box::new(OsMigrationLock(file)))
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -110,6 +162,10 @@ impl MigrationEnv for OsEnv {
         send_signal(pid, libc::SIGKILL, "SIGKILL")
     }
 
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+
     fn run_launchctl(&self, args: &[&str]) -> Result<LaunchctlOutput> {
         let output = Command::new("launchctl")
             .args(args)
@@ -150,6 +206,8 @@ pub struct FakeMigrationEnv {
     now: Mutex<DateTime<Utc>>,
     current_uid: Mutex<u32>,
     alive_pids: Mutex<HashSet<i32>>,
+    pid_death_after_sleeps: Mutex<HashMap<i32, usize>>,
+    operations: Arc<Mutex<Vec<MigrationOperation>>>,
     terminate_calls: Mutex<Vec<i32>>,
     kill_calls: Mutex<Vec<i32>>,
     rename_calls: Mutex<Vec<(PathBuf, PathBuf)>>,
@@ -168,6 +226,8 @@ impl FakeMigrationEnv {
             now: Mutex::new(now),
             current_uid: Mutex::new(0),
             alive_pids: Mutex::new(HashSet::new()),
+            pid_death_after_sleeps: Mutex::new(HashMap::new()),
+            operations: Arc::new(Mutex::new(Vec::new())),
             terminate_calls: Mutex::new(Vec::new()),
             kill_calls: Mutex::new(Vec::new()),
             rename_calls: Mutex::new(Vec::new()),
@@ -196,6 +256,14 @@ impl FakeMigrationEnv {
         } else {
             self.alive_pids.lock().remove(&pid);
         }
+    }
+
+    pub fn set_pid_death_after_sleeps(&self, pid: i32, sleeps: usize) {
+        self.pid_death_after_sleeps.lock().insert(pid, sleeps);
+    }
+
+    pub fn operations(&self) -> Vec<MigrationOperation> {
+        self.operations.lock().clone()
     }
 
     pub fn set_read_only(&self, path: impl Into<PathBuf>, read_only: bool) {
@@ -260,6 +328,21 @@ impl FakeMigrationEnv {
     }
 }
 
+struct FakeMigrationLock {
+    path: PathBuf,
+    operations: Arc<Mutex<Vec<MigrationOperation>>>,
+}
+
+impl MigrationLock for FakeMigrationLock {}
+
+impl Drop for FakeMigrationLock {
+    fn drop(&mut self) {
+        self.operations
+            .lock()
+            .push(MigrationOperation::LockReleased(self.path.clone()));
+    }
+}
+
 impl MigrationEnv for FakeMigrationEnv {
     fn read_to_string(&self, path: &Path) -> Result<String> {
         String::from_utf8(self.read(path)?).map_err(|error| {
@@ -283,6 +366,9 @@ impl MigrationEnv for FakeMigrationEnv {
         self.write_calls
             .lock()
             .push((path.to_path_buf(), bytes.to_vec()));
+        self.operations
+            .lock()
+            .push(MigrationOperation::Write(path.to_path_buf()));
         Ok(())
     }
 
@@ -297,7 +383,30 @@ impl MigrationEnv for FakeMigrationEnv {
         self.rename_calls
             .lock()
             .push((from.to_path_buf(), to.to_path_buf()));
+        self.operations.lock().push(MigrationOperation::Rename(
+            from.to_path_buf(),
+            to.to_path_buf(),
+        ));
         Ok(())
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        self.ensure_writable(path)?;
+        self.files.lock().remove(path);
+        self.operations
+            .lock()
+            .push(MigrationOperation::RemoveFile(path.to_path_buf()));
+        Ok(())
+    }
+
+    fn acquire_jobs_lock(&self, path: &Path) -> Result<Box<dyn MigrationLock>> {
+        self.operations
+            .lock()
+            .push(MigrationOperation::LockAcquired(path.to_path_buf()));
+        Ok(Box::new(FakeMigrationLock {
+            path: path.to_path_buf(),
+            operations: Arc::clone(&self.operations),
+        }))
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -350,18 +459,44 @@ impl MigrationEnv for FakeMigrationEnv {
     }
 
     fn pid_alive(&self, pid: i32) -> bool {
+        self.operations
+            .lock()
+            .push(MigrationOperation::PidAlive(pid));
         self.alive_pids.lock().contains(&pid)
     }
 
     fn terminate(&self, pid: i32) -> Result<()> {
         self.terminate_calls.lock().push(pid);
+        self.operations
+            .lock()
+            .push(MigrationOperation::Terminate(pid));
         Ok(())
     }
 
     fn kill(&self, pid: i32) -> Result<()> {
         self.kill_calls.lock().push(pid);
+        self.operations.lock().push(MigrationOperation::Kill(pid));
         self.alive_pids.lock().remove(&pid);
         Ok(())
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.operations
+            .lock()
+            .push(MigrationOperation::Sleep(duration));
+        let mut schedules = self.pid_death_after_sleeps.lock();
+        let mut dead = Vec::new();
+        for (&pid, remaining) in schedules.iter_mut() {
+            if *remaining <= 1 {
+                dead.push(pid);
+            } else {
+                *remaining -= 1;
+            }
+        }
+        for pid in dead {
+            schedules.remove(&pid);
+            self.alive_pids.lock().remove(&pid);
+        }
     }
 
     fn run_launchctl(&self, args: &[&str]) -> Result<LaunchctlOutput> {

@@ -176,6 +176,13 @@ fn parse_job_ids(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
 }
 
 fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
+    let directory = store.path.parent().ok_or_else(|| {
+        OmonError::Config(format!(
+            "invalid Hermes cron store path: {}",
+            store.path.display()
+        ))
+    })?;
+    let _lock = env.acquire_jobs_lock(&directory.join(".jobs.lock"))?;
     let current = env.read(&store.path)?;
     if current != store.original {
         return Err(OmonError::Config(format!(
@@ -187,12 +194,6 @@ fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
     let now = env.now();
     let timestamp = now.format("%Y%m%dT%H%M%S%.fZ").to_string();
     let file_name = store.path.file_name().ok_or_else(|| {
-        OmonError::Config(format!(
-            "invalid Hermes cron store path: {}",
-            store.path.display()
-        ))
-    })?;
-    let directory = store.path.parent().ok_or_else(|| {
         OmonError::Config(format!(
             "invalid Hermes cron store path: {}",
             store.path.display()
@@ -223,7 +224,7 @@ fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{cutover_cron_stores, cutover_store, PreparedStore};
-    use crate::migrate::sys::{FakeMigrationEnv, MigrationEnv};
+    use crate::migrate::sys::{FakeMigrationEnv, MigrationEnv, MigrationOperation};
     use crate::storage::Database;
     use crate::OmonError;
     use chrono::{TimeZone, Utc};
@@ -285,6 +286,28 @@ mod tests {
             serde_json::from_slice(&env.read(Path::new(STORE)).unwrap()).unwrap();
         assert_eq!(emptied["jobs"], serde_json::json!([]));
         assert_eq!(env.rename_calls().len(), 1);
+        let lock_path = PathBuf::from("/fixtures/.hermes/cron/.jobs.lock");
+        let operations = env.operations();
+        let lock_index = operations
+            .iter()
+            .position(|operation| operation == &MigrationOperation::LockAcquired(lock_path.clone()))
+            .expect("jobs lock acquisition");
+        let first_write_index = operations
+            .iter()
+            .position(|operation| {
+                matches!(operation, MigrationOperation::Write(path) if path.to_string_lossy().contains("bak-omon-migration-"))
+            })
+            .expect("first cutover write");
+        let release_index = operations
+            .iter()
+            .position(|operation| operation == &MigrationOperation::LockReleased(lock_path.clone()))
+            .expect("jobs lock release");
+        assert!(lock_index < first_write_index);
+        assert!(first_write_index < release_index);
+        assert!(
+            !env.exists(&lock_path),
+            "fake lock must not create/delete store files"
+        );
         println!("verified-delete summary={summary:?}");
     }
 
