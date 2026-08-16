@@ -33,6 +33,38 @@ pub fn safe_allowed_mentions() -> CreateAllowedMentions {
         .replied_user(true)
 }
 
+/// Maximum character length for hydrated referenced message context.
+pub const REFERENCED_CONTENT_CAP: usize = 500;
+
+/// Composes reply context prefixing the user body with a quote block of the referenced message.
+pub fn compose_reply_context(
+    referenced_author: &str,
+    referenced_content: &str,
+    body: &str,
+) -> String {
+    let truncated_content = if referenced_content.chars().count() > REFERENCED_CONTENT_CAP {
+        let capped: String = referenced_content
+            .chars()
+            .take(REFERENCED_CONTENT_CAP)
+            .collect();
+        format!("{capped}...")
+    } else {
+        referenced_content.to_string()
+    };
+    let clean_content = truncated_content.trim();
+    if clean_content.is_empty() {
+        if body.is_empty() {
+            format!("> [Replying to @{referenced_author}]")
+        } else {
+            format!("> [Replying to @{referenced_author}]\n\n{body}")
+        }
+    } else if body.is_empty() {
+        format!("> [Replying to @{referenced_author}]: {clean_content}")
+    } else {
+        format!("> [Replying to @{referenced_author}]: {clean_content}\n\n{body}")
+    }
+}
+
 /// Default debounce window for coalescing rapid client-split messages (~600ms).
 pub const DEFAULT_DEBOUNCE_DURATION: std::time::Duration = std::time::Duration::from_millis(600);
 
@@ -446,10 +478,33 @@ pub fn message_to_inbound_with_config(
         }
     }
 
-    let content = strip_bot_mention(&message.content, bot_user_id);
-    if content.trim().is_empty() && message.attachments.is_empty() {
+    let raw_content = strip_bot_mention(&message.content, bot_user_id);
+    if raw_content.trim().is_empty() && message.attachments.is_empty() {
         return None; // Do NOT auto-inject "Hello!" for empty/system messages
     }
+    let content = if let Some(parent) = &message.referenced_message {
+        let mut ref_content = parent.content.trim().to_string();
+        if !parent.attachments.is_empty() {
+            let att_summary = if parent.attachments.len() == 1 {
+                format!("[Attachment: {}]", parent.attachments[0].filename)
+            } else {
+                let filenames: Vec<&str> = parent
+                    .attachments
+                    .iter()
+                    .map(|att| att.filename.as_str())
+                    .collect();
+                format!("[Attachments: {}]", filenames.join(", "))
+            };
+            if ref_content.is_empty() {
+                ref_content = att_summary;
+            } else {
+                ref_content = format!("{ref_content} {att_summary}");
+            }
+        }
+        compose_reply_context(&parent.author.name, &ref_content, &raw_content)
+    } else {
+        raw_content
+    };
     let channel_id = message.channel_id.to_string();
     let session = SessionKey::new(
         "discord",
@@ -947,5 +1002,31 @@ mod tests {
         assert!(cancelled.is_some());
         assert_eq!(cancelled.unwrap().len(), 1);
         assert!(debouncer.is_empty().await);
+    }
+
+    #[test]
+    fn compose_reply_context_standard() {
+        let result = compose_reply_context("alice", "hello there", "general kenobi");
+        assert_eq!(result, "> [Replying to @alice]: hello there\n\ngeneral kenobi");
+    }
+
+    #[test]
+    fn compose_reply_context_caps_at_500_chars() {
+        let long_content = "x".repeat(600);
+        let result = compose_reply_context("bob", &long_content, "my reply");
+        let expected_quote = format!("> [Replying to @bob]: {}...\n\nmy reply", "x".repeat(500));
+        assert_eq!(result, expected_quote);
+    }
+
+    #[test]
+    fn compose_reply_context_empty_body() {
+        let result = compose_reply_context("carol", "check this file", "");
+        assert_eq!(result, "> [Replying to @carol]: check this file");
+    }
+
+    #[test]
+    fn compose_reply_context_empty_referenced_content() {
+        let result = compose_reply_context("dave", "", "my response");
+        assert_eq!(result, "> [Replying to @dave]\n\nmy response");
     }
 }

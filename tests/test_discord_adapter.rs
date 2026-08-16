@@ -10,12 +10,12 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use omon_gateway::discord::adapter::{message_to_inbound, message_to_inbound_with_config};
 use omon_gateway::discord::commands::is_user_allowed;
 use omon_gateway::{
-    approval_buttons, chunk_markdown, is_authorized_clicker, parse_custom_id, render_user_prompt,
-    safe_allowed_mentions, ApprovalDecision, ApprovalError, AttachmentDownloader, ChatMessage,
-    Database, DeliveryLedgerService, DiscordEgress, DiscordFileUploader, DiscordMessageTransport,
-    InboundEvent, LiveEditThrottler, LlmClient, LlmConfig, LlmProvider, MessageAttachment,
-    OutboundAction, OutboundDispatcher, Result, SessionKey, SmartApprovalGuard,
-    DISCORD_ATTACHMENT_MAX_BYTES,
+    approval_buttons, chunk_markdown, compose_reply_context, is_authorized_clicker,
+    parse_custom_id, render_user_prompt, safe_allowed_mentions, ApprovalDecision, ApprovalError,
+    AttachmentDownloader, ChatMessage, Database, DeliveryLedgerService, DiscordEgress,
+    DiscordFileUploader, DiscordMessageTransport, InboundEvent, LiveEditThrottler, LlmClient,
+    LlmConfig, LlmProvider, MessageAttachment, OutboundAction, OutboundDispatcher, Result,
+    SessionKey, SmartApprovalGuard, DISCORD_ATTACHMENT_MAX_BYTES,
 };
 use serenity::all::{ChannelId, ChannelType, Message, MessageId, UserId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -212,6 +212,66 @@ fn test_safe_allowed_mentions() {
     assert_eq!(json["replied_user"], serde_json::json!(true));
     assert_eq!(json["roles"], serde_json::json!([]));
     assert_eq!(json["users"], serde_json::json!([]));
+}
+
+#[test]
+fn test_compose_reply_context() {
+    // Normal reply
+    assert_eq!(
+        compose_reply_context("alice", "Original question?", "Here is the answer"),
+        "> [Replying to @alice]: Original question?\n\nHere is the answer"
+    );
+
+    // Capping long referenced content at 500 chars
+    let long_text = "w".repeat(750);
+    let result = compose_reply_context("bob", &long_text, "Follow up");
+    let expected = format!("> [Replying to @bob]: {}...\n\nFollow up", "w".repeat(500));
+    assert_eq!(result, expected);
+
+    // Empty body
+    assert_eq!(
+        compose_reply_context("carol", "check logs", ""),
+        "> [Replying to @carol]: check logs"
+    );
+
+    // Empty referenced content
+    assert_eq!(
+        compose_reply_context("dave", "", "my feedback"),
+        "> [Replying to @dave]\n\nmy feedback"
+    );
+}
+
+#[test]
+fn test_inbound_hydrates_reply_context_and_attachments() {
+    let bot_id = UserId::new(42);
+
+    // Reply with parent text and attachment in a DM
+    let reply_msg = reply_message_fixture(
+        None,
+        "what does this error mean?",
+        "bob",
+        "Error trace attached",
+        vec![("trace.log", "text/plain")],
+    );
+    let event = message_to_inbound(&reply_msg, bot_id, Some(ChannelType::Private)).unwrap();
+    assert_eq!(
+        event.content,
+        "> [Replying to @bob]: Error trace attached [Attachment: trace.log]\n\nwhat does this error mean?"
+    );
+
+    // Reply with parent multiple attachments only
+    let att_only_reply = reply_message_fixture(
+        None,
+        "can you analyze these?",
+        "charlie",
+        "",
+        vec![("doc1.pdf", "application/pdf"), ("doc2.pdf", "application/pdf")],
+    );
+    let event2 = message_to_inbound(&att_only_reply, bot_id, Some(ChannelType::Private)).unwrap();
+    assert_eq!(
+        event2.content,
+        "> [Replying to @charlie]: [Attachments: doc1.pdf, doc2.pdf]\n\ncan you analyze these?"
+    );
 }
 
 #[test]
@@ -784,6 +844,69 @@ fn message_fixture(guild_id: Option<u64>, content: &str, mentions: Vec<u64>) -> 
         "embeds": [], "reactions": [], "nonce": null, "pinned": false, "webhook_id": null,
         "type": 0, "activity": null, "application": null, "application_id": null,
         "message_reference": null, "flags": null, "referenced_message": null,
+        "message_snapshots": [], "interaction": null, "interaction_metadata": null,
+        "thread": null, "components": [], "sticker_items": [], "position": null,
+        "role_subscription_data": null, "member": null, "poll": null
+    }))
+    .unwrap()
+}
+
+fn reply_message_fixture(
+    guild_id: Option<u64>,
+    content: &str,
+    ref_author: &str,
+    ref_content: &str,
+    ref_attachments: Vec<(&str, &str)>,
+) -> Message {
+    let parent_attachments = ref_attachments
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, ct))| {
+            serde_json::json!({
+                "id": (100 + i).to_string(), "filename": name, "description": null, "height": null,
+                "width": null, "proxy_url": format!("https://cdn.example/{name}"), "size": 100,
+                "url": format!("https://cdn.example/{name}"), "content_type": ct,
+                "ephemeral": false, "duration_secs": null, "waveform": null
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let referenced_message = serde_json::json!({
+        "id": "1", "channel_id": "7", "guild_id": guild_id.map(|id| id.to_string()),
+        "author": {
+            "id": "20", "username": ref_author, "discriminator": "0001", "avatar": null,
+            "bot": false, "system": false, "mfa_enabled": false, "banner": null,
+            "accent_color": null, "locale": null, "verified": false, "email": null,
+            "flags": 0, "premium_type": 0, "public_flags": 0, "global_name": null,
+            "avatar_decoration_data": null, "collectibles": null, "primary_guild": null
+        },
+        "content": ref_content, "timestamp": "2026-08-14T00:00:00Z", "edited_timestamp": null,
+        "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
+        "mention_channels": [], "attachments": parent_attachments,
+        "embeds": [], "reactions": [], "nonce": null, "pinned": false, "webhook_id": null,
+        "type": 0, "activity": null, "application": null, "application_id": null,
+        "message_reference": null, "flags": null, "referenced_message": null,
+        "message_snapshots": [], "interaction": null, "interaction_metadata": null,
+        "thread": null, "components": [], "sticker_items": [], "position": null,
+        "role_subscription_data": null, "member": null, "poll": null
+    });
+
+    serde_json::from_value(serde_json::json!({
+        "id": "8", "channel_id": "7", "guild_id": guild_id.map(|id| id.to_string()),
+        "author": {
+            "id": "10", "username": "alice", "discriminator": "0001", "avatar": null,
+            "bot": false, "system": false, "mfa_enabled": false, "banner": null,
+            "accent_color": null, "locale": null, "verified": false, "email": null,
+            "flags": 0, "premium_type": 0, "public_flags": 0, "global_name": null,
+            "avatar_decoration_data": null, "collectibles": null, "primary_guild": null
+        },
+        "content": content, "timestamp": "2026-08-14T00:00:00Z", "edited_timestamp": null,
+        "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
+        "mention_channels": [],
+        "attachments": [],
+        "embeds": [], "reactions": [], "nonce": null, "pinned": false, "webhook_id": null,
+        "type": 19, "activity": null, "application": null, "application_id": null,
+        "message_reference": null, "flags": null, "referenced_message": referenced_message,
         "message_snapshots": [], "interaction": null, "interaction_metadata": null,
         "thread": null, "components": [], "sticker_items": [], "position": null,
         "role_subscription_data": null, "member": null, "poll": null
