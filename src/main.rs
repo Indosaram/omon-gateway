@@ -2316,6 +2316,19 @@ async fn run_gateway() -> Result<()> {
         clients.push(client);
     }
 
+    let readiness = omon_gateway::collect_runtime_readiness(
+        &pool,
+        &config.workspace_root,
+        &config.default_model,
+        clients.len(),
+    )
+    .await;
+    if readiness.is_ok() {
+        info!(status = %readiness.status, checks = ?readiness.checks, "runtime readiness probes passed");
+    } else {
+        warn!(status = %readiness.status, checks = ?readiness.checks, "runtime readiness probes reported degraded status");
+    }
+
     info!(
         model = %config.default_model,
         database = %config.database_url,
