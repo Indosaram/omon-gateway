@@ -25,7 +25,10 @@ use crate::{
 };
 
 /// Determines if a chunk at `chunk_index` should reference a triggering message.
-pub fn should_chunk_reference(chunk_index: usize, reply_to: Option<MessageId>) -> Option<MessageId> {
+pub fn should_chunk_reference(
+    chunk_index: usize,
+    reply_to: Option<MessageId>,
+) -> Option<MessageId> {
     if chunk_index == 0 {
         reply_to
     } else {
