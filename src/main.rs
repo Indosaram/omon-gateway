@@ -1625,9 +1625,23 @@ fn load_cron_skills(job: &HermesJob) -> Result<String> {
             names.join(", ")
         ));
     };
+
+    let mut expanded_names = Vec::new();
+    for name in names {
+        if let Some(members) = resolve_skill_bundle(&root, Some(&home), &name) {
+            for member in members {
+                if !expanded_names.contains(&member) {
+                    expanded_names.push(member);
+                }
+            }
+        } else if !expanded_names.contains(&name) {
+            expanded_names.push(name);
+        }
+    }
+
     let mut assembled = String::new();
     let mut skipped = Vec::new();
-    for name in names {
+    for name in expanded_names {
         let path = match find_skill_file(&root, &name) {
             Some(p) => p,
             None => {
@@ -1668,6 +1682,111 @@ fn load_cron_skills(job: &HermesJob) -> Result<String> {
     } else {
         Ok(assembled)
     }
+}
+
+fn resolve_skill_bundle(
+    skills_root: &Path,
+    hermes_home: Option<&Path>,
+    name: &str,
+) -> Option<Vec<String>> {
+    if Path::new(name).components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+
+    fn parse_bundle_manifest(content: &str) -> Option<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct Manifest {
+            #[serde(default)]
+            skills: Vec<String>,
+        }
+        if let Ok(m) = serde_yaml::from_str::<Manifest>(content) {
+            if !m.skills.is_empty() {
+                return Some(m.skills);
+            }
+        }
+        if let Ok(m) = serde_json::from_str::<Manifest>(content) {
+            if !m.skills.is_empty() {
+                return Some(m.skills);
+            }
+        }
+        None
+    }
+
+    // 1. Check <hermes_home>/skill-bundles/<name>.yaml / .yml / .json
+    if let Some(home) = hermes_home {
+        let bundles_dir = home.join("skill-bundles");
+        for ext in &["yaml", "yml", "json"] {
+            let path = bundles_dir.join(format!("{name}.{ext}"));
+            if path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Some(skills) = parse_bundle_manifest(&content) {
+                        return Some(skills);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check <skills_root>/<name>.yaml / .yml / .json
+    for ext in &["yaml", "yml", "json"] {
+        let path = skills_root.join(format!("{name}.{ext}"));
+        if path.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Some(skills) = parse_bundle_manifest(&content) {
+                    return Some(skills);
+                }
+            }
+        }
+    }
+
+    // 3. Check <skills_root>/<name>/bundle.yaml / .yml / .json / manifest.yaml ...
+    let dir = skills_root.join(name);
+    if dir.is_dir() {
+        for filename in &[
+            "bundle.yaml",
+            "bundle.yml",
+            "bundle.json",
+            "manifest.yaml",
+            "manifest.yml",
+            "manifest.json",
+        ] {
+            let path = dir.join(filename);
+            if path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Some(skills) = parse_bundle_manifest(&content) {
+                        return Some(skills);
+                    }
+                }
+            }
+        }
+
+        // 4. Directory containing multiple member skills (subdirectories with SKILL.md),
+        // provided the directory itself does not have a direct SKILL.md.
+        if !dir.join("SKILL.md").exists() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut members = Vec::new();
+                for entry in entries.flatten() {
+                    let sub_path = entry.path();
+                    if sub_path.is_dir() && sub_path.join("SKILL.md").is_file() {
+                        if let Some(file_name) = sub_path.file_name().and_then(|n| n.to_str()) {
+                            members.push(format!("{name}/{file_name}"));
+                        }
+                    }
+                }
+                if !members.is_empty() {
+                    members.sort();
+                    return Some(members);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn find_skill_file(root: &Path, name: &str) -> Option<PathBuf> {
@@ -3629,6 +3748,115 @@ mod runner_tests {
         assert!(err
             .to_string()
             .contains("empty prompt and all skills were missing"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_skill_bundle_and_expansion() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("omon-test-bundles-{}", uuid::Uuid::new_v4()));
+        let skills_dir = temp_dir.join("skills");
+        let bundles_dir = temp_dir.join("skill-bundles");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::create_dir_all(&bundles_dir).unwrap();
+
+        // 1. Create a regular single skill
+        let s1_dir = skills_dir.join("skill_1");
+        std::fs::create_dir_all(&s1_dir).unwrap();
+        std::fs::write(s1_dir.join("SKILL.md"), "Skill 1 instructions").unwrap();
+
+        // 2. Create another single skill
+        let s2_dir = skills_dir.join("skill_2");
+        std::fs::create_dir_all(&s2_dir).unwrap();
+        std::fs::write(s2_dir.join("SKILL.md"), "Skill 2 instructions").unwrap();
+
+        // 3. Create a YAML bundle in skill-bundles/
+        std::fs::write(
+            bundles_dir.join("backend_bundle.yaml"),
+            "name: backend_bundle\nskills:\n  - skill_1\n  - skill_2\n",
+        )
+        .unwrap();
+
+        // 4. Create a multi-skill directory bundle in skills/group_bundle/
+        let group_dir = skills_dir.join("group_bundle");
+        let member_a = group_dir.join("member_a");
+        let member_b = group_dir.join("member_b");
+        std::fs::create_dir_all(&member_a).unwrap();
+        std::fs::create_dir_all(&member_b).unwrap();
+        std::fs::write(member_a.join("SKILL.md"), "Member A instructions").unwrap();
+        std::fs::write(member_b.join("SKILL.md"), "Member B instructions").unwrap();
+
+        // Verify resolve_skill_bundle for YAML manifest bundle
+        let resolved_yaml =
+            super::resolve_skill_bundle(&skills_dir, Some(&temp_dir), "backend_bundle");
+        assert_eq!(
+            resolved_yaml,
+            Some(vec!["skill_1".to_string(), "skill_2".to_string()])
+        );
+
+        // Verify resolve_skill_bundle for directory bundle
+        let resolved_dir =
+            super::resolve_skill_bundle(&skills_dir, Some(&temp_dir), "group_bundle");
+        assert_eq!(
+            resolved_dir,
+            Some(vec![
+                "group_bundle/member_a".to_string(),
+                "group_bundle/member_b".to_string()
+            ])
+        );
+
+        // Verify single skill returns None (not a bundle)
+        let resolved_single = super::resolve_skill_bundle(&skills_dir, Some(&temp_dir), "skill_1");
+        assert_eq!(resolved_single, None);
+
+        // Verify load_cron_skills expands the bundle and loads skill bodies
+        let mut extra = HashMap::new();
+        extra.insert(
+            "_omon_hermes_home".into(),
+            serde_json::Value::String(temp_dir.to_string_lossy().into_owned()),
+        );
+
+        let bundle_job = HermesJob {
+            id: "job_bundle".into(),
+            name: "Bundle Job".into(),
+            prompt: "Perform bundle task".into(),
+            skills: vec!["backend_bundle".into()],
+            skill: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            script: None,
+            no_agent: false,
+            context_from: None,
+            schedule: omon_gateway::HermesSchedule::default(),
+            schedule_display: "".into(),
+            repeat: omon_gateway::HermesRepeat::default(),
+            enabled: true,
+            state: "".into(),
+            created_at: None,
+            next_run_at: None,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            deliver: None,
+            origin: None,
+            enabled_toolsets: None,
+            workdir: None,
+            attach_to_session: None,
+            extra,
+        };
+
+        let loaded = load_cron_skills(&bundle_job).unwrap();
+        assert!(
+            loaded.contains("[Skill: skill_1]\nSkill 1 instructions"),
+            "Loaded skills must include skill_1: {loaded}"
+        );
+        assert!(
+            loaded.contains("[Skill: skill_2]\nSkill 2 instructions"),
+            "Loaded skills must include skill_2: {loaded}"
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
