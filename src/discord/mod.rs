@@ -15,7 +15,8 @@ pub use approval::{
     ApprovalPrompt, ApprovalRequester, DiscordApprovalRequester, SmartApprovalGuard,
 };
 pub use attachments::{
-    AttachmentDownloader, DISCORD_ATTACHMENT_MAX_BYTES, DISCORD_ATTACHMENT_TIMEOUT,
+    is_text_attachment, AttachmentDownloader, DISCORD_ATTACHMENT_MAX_BYTES,
+    DISCORD_ATTACHMENT_TIMEOUT, MAX_INLINED_ATTACHMENT_BYTES,
 };
 pub use commands::{is_user_authorized, GatewayStats, PoiseContext, PoiseData};
 pub use throttler::{chunk_markdown, DiscordMessageTransport, LiveEditThrottler};

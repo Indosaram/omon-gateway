@@ -841,6 +841,7 @@ fn renders_complete_attachment_context_for_attachment_only_turns() {
         content_type: Some("text/x-rust".into()),
         size_bytes: Some(24),
         local_path: None,
+        text_content: None,
     }]);
 
     assert_eq!(
@@ -864,6 +865,7 @@ fn renders_downloaded_attachment_local_path() {
         content_type: Some("image/png".into()),
         size_bytes: Some(24),
         local_path: Some(local_path.clone()),
+        text_content: None,
     }]);
 
     let prompt = render_user_prompt(&event);
@@ -886,6 +888,7 @@ async fn downloads_discord_attachment_once_and_reuses_cache() {
         content_type: Some("image/png".into()),
         size_bytes: Some(body.len() as u64),
         local_path: None,
+        text_content: None,
     };
 
     let first = downloader.download_attachment(&attachment).await.unwrap();
@@ -913,6 +916,7 @@ async fn rejects_discord_attachment_over_size_limit_before_network() {
         content_type: Some("application/octet-stream".into()),
         size_bytes: Some(DISCORD_ATTACHMENT_MAX_BYTES + 1),
         local_path: None,
+        text_content: None,
     };
 
     let error = downloader
@@ -920,6 +924,78 @@ async fn rejects_discord_attachment_over_size_limit_before_network() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("25 MB"));
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn hydrates_and_inlines_small_text_attachment() {
+    let workspace = test_workspace("text-inline");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let file_content = b"fn main() {\n    println!(\"hello world\");\n}\n".to_vec();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let (url, server) =
+        spawn_single_response_server(file_content.clone(), request_count.clone()).await;
+    let downloader = AttachmentDownloader::new(&workspace).unwrap();
+    let mut attachment = MessageAttachment {
+        id: "attachment/text-1".into(),
+        filename: "main.rs".into(),
+        url,
+        content_type: Some("text/x-rust".into()),
+        size_bytes: Some(file_content.len() as u64),
+        local_path: None,
+        text_content: None,
+    };
+
+    downloader.hydrate(&mut attachment).await.unwrap();
+    server.await.unwrap();
+
+    assert!(attachment.local_path.is_some());
+    assert_eq!(
+        attachment.text_content.as_deref(),
+        Some("fn main() {\n    println!(\"hello world\");\n}\n")
+    );
+
+    let event = InboundEvent::message(
+        SessionKey::new("discord", Some("9"), "7", None::<String>, "10"),
+        "8",
+        "please explain this",
+    )
+    .with_attachments(vec![attachment]);
+
+    let prompt = render_user_prompt(&event);
+    assert!(prompt.contains("please explain this"));
+    assert!(prompt.contains("[Attachment: main.rs (text/x-rust, 43 bytes)"));
+    assert!(prompt
+        .contains("[Content of main.rs]:\n\nfn main() {\n    println!(\"hello world\");\n}\n"));
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn hydrate_does_not_inline_binary_attachment() {
+    let workspace = test_workspace("binary-no-inline");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let binary_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]; // PNG magic
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let (url, server) =
+        spawn_single_response_server(binary_bytes.clone(), request_count.clone()).await;
+    let downloader = AttachmentDownloader::new(&workspace).unwrap();
+    let mut attachment = MessageAttachment {
+        id: "attachment/img-1".into(),
+        filename: "image.png".into(),
+        url,
+        content_type: Some("image/png".into()),
+        size_bytes: Some(binary_bytes.len() as u64),
+        local_path: None,
+        text_content: None,
+    };
+
+    downloader.hydrate(&mut attachment).await.unwrap();
+    server.await.unwrap();
+
+    assert!(attachment.local_path.is_some());
+    assert!(attachment.text_content.is_none());
 
     let _ = std::fs::remove_dir_all(workspace);
 }
@@ -945,6 +1021,7 @@ fn encodes_supported_images_as_openai_and_anthropic_vision_blocks() {
             content_type: Some((*media_type).into()),
             size_bytes: Some(bytes.len() as u64),
             local_path: Some(path),
+            text_content: None,
         });
     }
     let message = ChatMessage::new("user", "inspect these").with_attachments(attachments.clone());
@@ -1188,6 +1265,7 @@ async fn coalesces_split_messages_and_unions_attachments() {
         content_type: Some("text/plain".into()),
         size_bytes: Some(123),
         local_path: None,
+        text_content: None,
     });
 
     let mut event2 =
@@ -1200,6 +1278,7 @@ async fn coalesces_split_messages_and_unions_attachments() {
         content_type: Some("image/png".into()),
         size_bytes: Some(456),
         local_path: None,
+        text_content: None,
     });
 
     let coalesced = omon_gateway::coalesce_inbound_events(vec![event1, event2]).unwrap();

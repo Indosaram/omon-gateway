@@ -9,7 +9,74 @@ use crate::{MessageAttachment, OmonError, Result};
 
 pub const DISCORD_ATTACHMENT_MAX_BYTES: u64 = 25 * 1024 * 1024;
 pub const DISCORD_ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const MAX_INLINED_ATTACHMENT_BYTES: u64 = 100 * 1024;
 const ATTACHMENT_DIR: &str = ".discord-attachments";
+
+/// Determines whether an inbound attachment is a text or code document
+/// that should have its content inlined directly into the prompt context.
+pub fn is_text_attachment(filename: &str, content_type: Option<&str>) -> bool {
+    if let Some(ct) = content_type {
+        let ct_lower = ct.to_ascii_lowercase();
+        let mime = ct_lower.split(';').next().unwrap_or("").trim();
+        if mime.starts_with("text/")
+            || mime == "application/json"
+            || mime == "application/xml"
+            || mime == "application/javascript"
+            || mime == "application/x-javascript"
+            || mime == "application/typescript"
+            || mime == "application/x-typescript"
+            || mime == "application/x-sh"
+            || mime == "application/x-bash"
+            || mime == "application/x-shellscript"
+            || mime == "application/x-yaml"
+            || mime == "application/yaml"
+            || mime == "application/x-toml"
+            || mime == "application/toml"
+            || mime == "application/sql"
+            || mime == "application/graphql"
+            || mime == "application/x-httpd-php"
+            || mime.ends_with("+json")
+            || mime.ends_with("+xml")
+            || mime.ends_with("+yaml")
+        {
+            return true;
+        }
+    }
+
+    let path = Path::new(filename);
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_ascii_lowercase();
+        match ext_lower.as_str() {
+            "txt" | "md" | "markdown" | "csv" | "tsv" | "log" | "json" | "jsonl" | "ndjson"
+            | "xml" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf" | "env" | "properties"
+            | "html" | "htm" | "css" | "scss" | "sass" | "less" | "py" | "pyi" | "js" | "mjs"
+            | "cjs" | "ts" | "tsx" | "jsx" | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat"
+            | "c" | "h" | "cpp" | "cc" | "hpp" | "cs" | "java" | "kt" | "go" | "rs" | "rb"
+            | "php" | "pl" | "lua" | "r" | "jl" | "swift" | "m" | "scala" | "clj" | "ex"
+            | "exs" | "erl" | "sql" | "graphql" | "proto" | "tf" | "hcl" | "dockerfile"
+            | "makefile" | "cmake" | "gradle" | "rst" | "tex" | "srt" | "vtt" | "diff"
+            | "patch" => return true,
+            _ => {}
+        }
+    }
+
+    if let Some(file_stem) = path.file_name().and_then(|s| s.to_str()) {
+        let stem_lower = file_stem.to_ascii_lowercase();
+        if stem_lower == "dockerfile"
+            || stem_lower == "makefile"
+            || stem_lower == "gemfile"
+            || stem_lower == "licence"
+            || stem_lower == "license"
+            || stem_lower == ".env"
+            || stem_lower == ".gitignore"
+            || stem_lower == "cargo.lock"
+        {
+            return true;
+        }
+    }
+
+    false
+}
 
 #[derive(Clone)]
 pub struct AttachmentDownloader {
@@ -78,7 +145,20 @@ impl AttachmentDownloader {
 
     pub async fn hydrate(&self, attachment: &mut MessageAttachment) -> Result<()> {
         let path = self.download(attachment).await?;
-        attachment.local_path = Some(path);
+        attachment.local_path = Some(path.clone());
+        if is_text_attachment(&attachment.filename, attachment.content_type.as_deref()) {
+            let size = attachment.size_bytes.unwrap_or(0);
+            if size <= MAX_INLINED_ATTACHMENT_BYTES {
+                if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                    if metadata.len() <= MAX_INLINED_ATTACHMENT_BYTES {
+                        if let Ok(bytes) = tokio::fs::read(&path).await {
+                            let text = String::from_utf8_lossy(&bytes).into_owned();
+                            attachment.text_content = Some(text);
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -289,4 +369,61 @@ fn sanitize_component(value: &str, fallback: &str) -> String {
 
 fn attachment_error(message: impl Into<String>) -> OmonError {
     OmonError::Config(format!("Discord attachment error: {}", message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_text_attachment_by_content_type() {
+        assert!(is_text_attachment("unknown_file", Some("text/plain")));
+        assert!(is_text_attachment("file.bin", Some("text/x-rust")));
+        assert!(is_text_attachment("data", Some("application/json")));
+        assert!(is_text_attachment(
+            "data",
+            Some("application/problem+json; charset=utf-8")
+        ));
+        assert!(is_text_attachment("build", Some("application/xml")));
+        assert!(is_text_attachment("script", Some("application/javascript")));
+        assert!(is_text_attachment("script", Some("application/x-sh")));
+        assert!(is_text_attachment("config", Some("application/x-yaml")));
+        assert!(is_text_attachment("config", Some("application/toml")));
+
+        // Binary types must return false
+        assert!(!is_text_attachment("photo.png", Some("image/png")));
+        assert!(!is_text_attachment("doc.pdf", Some("application/pdf")));
+        assert!(!is_text_attachment("archive.zip", Some("application/zip")));
+        assert!(!is_text_attachment(
+            "binary.bin",
+            Some("application/octet-stream")
+        ));
+    }
+
+    #[test]
+    fn test_is_text_attachment_by_extension_and_name() {
+        assert!(is_text_attachment("main.rs", None));
+        assert!(is_text_attachment(
+            "script.py",
+            Some("application/octet-stream")
+        ));
+        assert!(is_text_attachment("app.ts", None));
+        assert!(is_text_attachment("index.js", None));
+        assert!(is_text_attachment("README.md", None));
+        assert!(is_text_attachment("data.csv", None));
+        assert!(is_text_attachment("Cargo.toml", None));
+        assert!(is_text_attachment("config.yaml", None));
+        assert!(is_text_attachment("config.yml", None));
+        assert!(is_text_attachment("run.sh", None));
+        assert!(is_text_attachment("Dockerfile", None));
+        assert!(is_text_attachment("Makefile", None));
+        assert!(is_text_attachment(".env", None));
+        assert!(is_text_attachment(".gitignore", None));
+
+        // Binary extensions must return false
+        assert!(!is_text_attachment("photo.jpg", None));
+        assert!(!is_text_attachment("document.pdf", None));
+        assert!(!is_text_attachment("archive.tar.gz", None));
+        assert!(!is_text_attachment("audio.mp3", None));
+    }
 }

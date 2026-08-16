@@ -15,6 +15,12 @@ pub struct MessageAttachment {
     pub size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_content: Option<String>,
+}
+
+pub fn format_inlined_text(filename: &str, content: &str) -> String {
+    format!("\n\n[Content of {filename}]:\n\n{content}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +52,7 @@ pub fn render_user_prompt(event: &InboundEvent) -> String {
                 .as_ref()
                 .map(|path| format!(" | local path: {}", path.display()))
                 .unwrap_or_default();
-            format!(
+            let mut formatted = format!(
                 "[Attachment: {} ({}, {} bytes) - {}{}]",
                 attachment.filename,
                 attachment.content_type.as_deref().unwrap_or("unknown"),
@@ -55,7 +61,11 @@ pub fn render_user_prompt(event: &InboundEvent) -> String {
                     .map_or_else(|| "unknown".to_owned(), |size| size.to_string()),
                 attachment.url,
                 local
-            )
+            );
+            if let Some(text) = &attachment.text_content {
+                formatted.push_str(&format_inlined_text(&attachment.filename, text));
+            }
+            formatted
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -144,7 +154,10 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{InboundEvent, MessageAttachment, OutboundAction, StreamChunk};
+    use super::{
+        format_inlined_text, render_user_prompt, InboundEvent, MessageAttachment, OutboundAction,
+        StreamChunk,
+    };
     use crate::models::SessionKey;
 
     fn session() -> SessionKey {
@@ -160,6 +173,7 @@ mod tests {
             content_type: Some("text/plain".into()),
             size_bytes: Some(42),
             local_path: Some(PathBuf::from("/workspace/attachments/notes.txt")),
+            text_content: None,
         };
         let event = InboundEvent::message(session(), "message-1", "hello")
             .with_attachments(vec![attachment.clone()]);
@@ -209,5 +223,35 @@ mod tests {
         let decoded: OutboundAction =
             serde_json::from_str(&json).expect("stream action should deserialize");
         assert_eq!(decoded, action);
+    }
+
+    #[test]
+    fn render_user_prompt_inlines_text_content() {
+        let attachment = MessageAttachment {
+            id: "attachment-1".into(),
+            filename: "main.rs".into(),
+            url: "https://cdn.example/main.rs".into(),
+            content_type: Some("text/x-rust".into()),
+            size_bytes: Some(21),
+            local_path: Some(PathBuf::from("/workspace/main.rs")),
+            text_content: Some("fn main() {\n}\n".into()),
+        };
+        let event = InboundEvent::message(session(), "message-1", "review this code")
+            .with_attachments(vec![attachment]);
+
+        let rendered = render_user_prompt(&event);
+        assert_eq!(
+            rendered,
+            "review this code\n\n[Attachment: main.rs (text/x-rust, 21 bytes) - https://cdn.example/main.rs | local path: /workspace/main.rs]\n\n[Content of main.rs]:\n\nfn main() {\n}\n"
+        );
+    }
+
+    #[test]
+    fn format_inlined_text_delimiters() {
+        let formatted = format_inlined_text("config.toml", "key = \"value\"\n");
+        assert_eq!(
+            formatted,
+            "\n\n[Content of config.toml]:\n\nkey = \"value\"\n"
+        );
     }
 }

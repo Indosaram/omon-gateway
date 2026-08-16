@@ -686,6 +686,7 @@ pub fn message_to_inbound_with_config(
             content_type: attachment.content_type.clone(),
             size_bytes: Some(u64::from(attachment.size)),
             local_path: None,
+            text_content: None,
         })
         .collect();
     let mut event = InboundEvent::message(session, message.id.to_string(), content)
@@ -1038,6 +1039,7 @@ mod tests {
                 content_type: Some("text/plain".into()),
                 size_bytes: Some(100),
                 local_path: None,
+                text_content: None,
             },
             MessageAttachment {
                 id: "att-2".into(),
@@ -1046,6 +1048,7 @@ mod tests {
                 content_type: Some("image/png".into()),
                 size_bytes: Some(200),
                 local_path: None,
+                text_content: None,
             },
         ];
 
@@ -1060,6 +1063,7 @@ mod tests {
                 content_type: Some("image/png".into()),
                 size_bytes: Some(200),
                 local_path: None,
+                text_content: None,
             },
             MessageAttachment {
                 id: "att-3".into(),
@@ -1068,6 +1072,7 @@ mod tests {
                 content_type: Some("application/pdf".into()),
                 size_bytes: Some(300),
                 local_path: None,
+                text_content: None,
             },
         ];
 
