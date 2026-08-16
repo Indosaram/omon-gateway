@@ -566,6 +566,27 @@ async fn handle_event(
                     }
                 }
 
+                if data.processing_reactions {
+                    if let Err(error) = new_message
+                        .channel_id
+                        .create_reaction(
+                            &ctx.http,
+                            new_message.id,
+                            serenity::all::ReactionType::Unicode(
+                                crate::models::PROCESSING_START_EMOJI.to_string(),
+                            ),
+                        )
+                        .await
+                    {
+                        tracing::debug!(
+                            %error,
+                            message_id = %new_message.id,
+                            channel = %new_message.channel_id,
+                            "Failed to add start processing reaction to message"
+                        );
+                    }
+                }
+
                 if channel_type.is_some_and(is_thread) {
                     data.mark_thread_active(new_message.channel_id.get());
                 } else if data.auto_thread && is_guild_text && is_explicit_mention {
@@ -1153,6 +1174,47 @@ impl OutboundDispatcher for DiscordEgress {
                         .insert(session.storage_key(), guard);
                 } else {
                     self.typing.lock().await.remove(&session.storage_key());
+                }
+            }
+            OutboundAction::React {
+                session,
+                message_id,
+                emoji,
+                remove_others,
+            } => {
+                let http = self.http_for(&session)?;
+                let channel = Self::target(&session)?;
+                let msg_id = message_id.parse::<u64>().map(MessageId::new).map_err(|_| {
+                    OmonError::Config(format!("invalid Discord message ID: {message_id}"))
+                })?;
+                if remove_others {
+                    if let Err(error) = channel
+                        .delete_reaction(
+                            &http,
+                            msg_id,
+                            None,
+                            serenity::all::ReactionType::Unicode(
+                                crate::models::PROCESSING_START_EMOJI.to_string(),
+                            ),
+                        )
+                        .await
+                    {
+                        tracing::debug!(
+                            %error,
+                            %message_id,
+                            "Failed to remove start processing reaction"
+                        );
+                    }
+                }
+                if let Err(error) = channel
+                    .create_reaction(&http, msg_id, serenity::all::ReactionType::Unicode(emoji))
+                    .await
+                {
+                    tracing::debug!(
+                        %error,
+                        %message_id,
+                        "Failed to add reaction to message"
+                    );
                 }
             }
             OutboundAction::ApprovalRequest {

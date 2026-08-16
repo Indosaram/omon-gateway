@@ -374,6 +374,7 @@ struct Config {
     auto_thread: bool,
     channel_context: bool,
     channel_context_limit: usize,
+    processing_reactions: bool,
     approval_policy: ApprovalPolicy,
     approval_timeout_secs: u64,
     profile_routes: Vec<ProfileRoute>,
@@ -475,6 +476,10 @@ impl Config {
                 .and_then(|val| val.trim().parse::<usize>().ok())
                 .unwrap_or(omon_gateway::DEFAULT_CHANNEL_CONTEXT_LIMIT)
                 .min(omon_gateway::MAX_CHANNEL_CONTEXT_LIMIT),
+            processing_reactions: parse_bool_from(
+                optional_env("DISCORD_PROCESSING_REACTIONS").as_deref(),
+                true,
+            ),
             approval_policy: ApprovalPolicy::parse(optional_env("APPROVAL_MODE").as_deref()),
             approval_timeout_secs: approval_timeout_secs_from(
                 optional_env("APPROVAL_TIMEOUT_SECS").as_deref(),
@@ -543,6 +548,7 @@ struct LiveAgentRunner {
     dispatcher: Arc<dyn OutboundDispatcher>,
     workspace_root: PathBuf,
     streams: ParkingMutex<HashMap<String, StreamEmissionState>>,
+    processing_reactions: bool,
 }
 
 impl LiveAgentRunner {
@@ -845,6 +851,19 @@ impl LiveAgentRunner {
                 .dispatch(OutboundAction::Typing {
                     session: session.key.clone(),
                     active: false,
+                })
+                .await;
+        }
+
+        if self.processing_reactions && !event.platform_message_id.is_empty() {
+            let emoji = omon_gateway::reaction_emoji_for_outcome(outcome.is_ok());
+            let _ = self
+                .dispatcher
+                .dispatch(OutboundAction::React {
+                    session: session.key.clone(),
+                    message_id: event.platform_message_id.clone(),
+                    emoji: emoji.to_string(),
+                    remove_others: true,
                 })
                 .await;
         }
@@ -1696,6 +1715,7 @@ async fn run_gateway() -> Result<()> {
         dispatcher: shared_dispatcher.clone(),
         workspace_root: config.workspace_root.clone(),
         streams: ParkingMutex::new(HashMap::new()),
+        processing_reactions: config.processing_reactions,
     });
     let profile_router = ProfileRouter::new(config.profile_routes.clone());
     let multiplexer = SessionMultiplexer::with_profile_router(
@@ -1771,6 +1791,7 @@ async fn run_gateway() -> Result<()> {
     poise_data.auto_thread = config.auto_thread;
     poise_data.channel_context = config.channel_context;
     poise_data.channel_context_limit = config.channel_context_limit;
+    poise_data.processing_reactions = config.processing_reactions;
     poise_data.attachment_downloader = Some(AttachmentDownloader::new(&config.workspace_root)?);
     poise_data.primary_bot_id = Some(default_bot_id.parse().map_err(|_| {
         OmonError::Config(format!(
@@ -2071,6 +2092,7 @@ mod runner_tests {
             dispatcher,
             workspace_root: temp_dir.path().to_path_buf(),
             streams: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            processing_reactions: true,
         };
         (runner, temp_dir)
     }
@@ -2176,8 +2198,12 @@ mod runner_tests {
             !has_tool_status,
             "Non-streaming (cron) run must not emit tool-call status chunks"
         );
+        let stream_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, omon_gateway::OutboundAction::Stream { .. }))
+            .collect();
         assert!(
-            actions.is_empty(),
+            stream_actions.is_empty(),
             "Non-streaming run should not dispatch any stream actions, got: {actions:?}"
         );
 
@@ -2307,16 +2333,35 @@ mod runner_tests {
             "First action dispatched in interactive turn must be Typing {{ active: true }}"
         );
 
-        assert_eq!(
-            actions.last(),
-            Some(&omon_gateway::OutboundAction::Typing {
+        assert!(
+            actions.contains(&omon_gateway::OutboundAction::Typing {
                 session: session_key.clone(),
                 active: false,
             }),
-            "Last action dispatched in interactive turn must be Typing {{ active: false }}"
+            "Interactive turn must dispatch Typing {{ active: false }}"
         );
 
-        let intermediate_actions = &actions[1..actions.len() - 1];
+        assert_eq!(
+            actions.last(),
+            Some(&omon_gateway::OutboundAction::React {
+                session: session_key.clone(),
+                message_id: "msg-1".into(),
+                emoji: "✅".into(),
+                remove_others: true,
+            }),
+            "Last action dispatched on success must be React with check mark"
+        );
+
+        let typing_stop_idx = actions
+            .iter()
+            .position(|a| {
+                matches!(
+                    a,
+                    omon_gateway::OutboundAction::Typing { active: false, .. }
+                )
+            })
+            .expect("typing stop action present");
+        let intermediate_actions = &actions[1..typing_stop_idx];
         assert!(
             !intermediate_actions.is_empty(),
             "Expected intermediate stream/tool actions between typing start and stop"
@@ -2348,11 +2393,64 @@ mod runner_tests {
         assert_eq!(response_non_stream, "Final result content");
 
         let non_stream_actions = dispatcher_non_stream.actions.lock().await.clone();
+        let non_stream_typing_or_stream: Vec<_> = non_stream_actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    omon_gateway::OutboundAction::Typing { .. }
+                        | omon_gateway::OutboundAction::Stream { .. }
+                )
+            })
+            .collect();
         assert!(
-            non_stream_actions.is_empty(),
+            non_stream_typing_or_stream.is_empty(),
             "Non-streaming turn must not dispatch typing or stream actions, got: {non_stream_actions:?}"
         );
+        assert_eq!(
+            non_stream_actions.last(),
+            Some(&omon_gateway::OutboundAction::React {
+                session: session_key.clone(),
+                message_id: "msg-2".into(),
+                emoji: "✅".into(),
+                remove_others: true,
+            }),
+            "Non-streaming turn must still dispatch success reaction"
+        );
         server_handle_non_stream.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_suppresses_reactions_when_processing_reactions_is_false() {
+        let (base_url, server_handle) = spawn_two_turn_tool_llm_server().await;
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (mut runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
+        runner.processing_reactions = false;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-1",
+            None::<String>,
+            "user-1",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        let event = omon_gateway::InboundEvent::message(session_key, "msg-1", "Run a tool");
+
+        let response = runner
+            .execute(&mut session, event, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(response, "Final result content");
+
+        let actions = dispatcher.actions.lock().await.clone();
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, omon_gateway::OutboundAction::React { .. })),
+            "Must not dispatch React actions when processing_reactions is false, got: {actions:?}"
+        );
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -2400,11 +2498,17 @@ mod runner_tests {
                     active: true,
                 },
                 omon_gateway::OutboundAction::Typing {
-                    session: session_key,
+                    session: session_key.clone(),
                     active: false,
                 },
+                omon_gateway::OutboundAction::React {
+                    session: session_key,
+                    message_id: "msg-err".into(),
+                    emoji: "❌".into(),
+                    remove_others: true,
+                },
             ],
-            "Both typing start and stop must be dispatched even when execution fails"
+            "Both typing start and stop and failure reaction must be dispatched even when execution fails"
         );
 
         server_handle.await.unwrap();

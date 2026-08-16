@@ -19,6 +19,18 @@ pub struct MessageAttachment {
     pub text_content: Option<String>,
 }
 
+pub const PROCESSING_START_EMOJI: &str = "👀";
+pub const PROCESSING_SUCCESS_EMOJI: &str = "✅";
+pub const PROCESSING_FAILURE_EMOJI: &str = "❌";
+
+pub fn reaction_emoji_for_outcome(success: bool) -> &'static str {
+    if success {
+        PROCESSING_SUCCESS_EMOJI
+    } else {
+        PROCESSING_FAILURE_EMOJI
+    }
+}
+
 pub fn format_inlined_text(filename: &str, content: &str) -> String {
     format!("\n\n[Content of {filename}]:\n\n{content}")
 }
@@ -141,6 +153,12 @@ pub enum OutboundAction {
         session: SessionKey,
         active: bool,
     },
+    React {
+        session: SessionKey,
+        message_id: String,
+        emoji: String,
+        remove_others: bool,
+    },
     ApprovalRequest {
         session: SessionKey,
         request_id: Uuid,
@@ -155,8 +173,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        format_inlined_text, render_user_prompt, InboundEvent, MessageAttachment, OutboundAction,
-        StreamChunk,
+        format_inlined_text, reaction_emoji_for_outcome, render_user_prompt, InboundEvent,
+        MessageAttachment, OutboundAction, StreamChunk, PROCESSING_FAILURE_EMOJI,
+        PROCESSING_START_EMOJI, PROCESSING_SUCCESS_EMOJI,
     };
     use crate::models::SessionKey;
 
@@ -205,6 +224,35 @@ mod tests {
             serde_json::to_value(&typing_action).expect("typing action should serialize");
         assert_eq!(typing_value["type"], "typing");
         assert_eq!(typing_value["active"], true);
+    }
+
+    #[test]
+    fn serializes_and_deserializes_react_outbound_action() {
+        let action = OutboundAction::React {
+            session: session(),
+            message_id: "msg-42".into(),
+            emoji: "👀".into(),
+            remove_others: true,
+        };
+
+        let value = serde_json::to_value(&action).expect("react action should serialize");
+        assert_eq!(value["type"], "react");
+        assert_eq!(value["message_id"], "msg-42");
+        assert_eq!(value["emoji"], "👀");
+        assert_eq!(value["remove_others"], true);
+
+        let decoded: OutboundAction =
+            serde_json::from_value(value).expect("react action should deserialize");
+        assert_eq!(decoded, action);
+    }
+
+    #[test]
+    fn emoji_by_outcome_selection() {
+        assert_eq!(reaction_emoji_for_outcome(true), PROCESSING_SUCCESS_EMOJI);
+        assert_eq!(reaction_emoji_for_outcome(false), PROCESSING_FAILURE_EMOJI);
+        assert_eq!(PROCESSING_START_EMOJI, "👀");
+        assert_eq!(PROCESSING_SUCCESS_EMOJI, "✅");
+        assert_eq!(PROCESSING_FAILURE_EMOJI, "❌");
     }
 
     #[test]
