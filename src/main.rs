@@ -10,7 +10,7 @@ use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
     augmented_path_from_environment, cron_runs_retention_days_from_environment,
-    format_context_from_block, parse_context_from_ids, parse_profile_routes,
+    format_context_from_block, parse_context_from_ids, parse_profile_routes, parse_wake_gate,
     prune_terminal_cron_runs, render_user_prompt, resolve_predecessor_output,
     truncate_context_output, AgentRunner, ApprovalPolicy, AttachmentDownloader, ChatMessage,
     CronJob, CronScheduler, CronTaskExecutor, CronTool, DeliveryLedgerService, DiscordAdapter,
@@ -1190,6 +1190,12 @@ impl CronTaskExecutor for AgentCronExecutor {
         if hermes.no_agent {
             return Ok(script_output.filter(|output| !output.trim().is_empty()));
         }
+        if let Some(output) = script_output.as_deref() {
+            if !parse_wake_gate(output) {
+                tracing::info!(job_id = %hermes.id, "wakeAgent:false detected in script output, skipping agent execution");
+                return Ok(None);
+            }
+        }
         if hermes.prompt.trim().is_empty() && script_output.is_none() {
             return Err(OmonError::Config(format!(
                 "Hermes job {} has neither prompt nor executable script",
@@ -1317,6 +1323,12 @@ async fn execute_native_cron(
         } else {
             None
         };
+    if let Some(output) = script_output.as_deref() {
+        if !parse_wake_gate(output) {
+            tracing::info!(job_id = %job.id, "wakeAgent:false detected in script output, skipping agent execution");
+            return Ok(None);
+        }
+    }
     let prompt = payload
         .get("prompt")
         .and_then(serde_json::Value::as_str)

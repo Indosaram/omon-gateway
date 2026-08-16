@@ -140,6 +140,40 @@ pub async fn resolve_predecessor_output(
     None
 }
 
+pub fn parse_wake_gate(stdout: &str) -> bool {
+    let stripped_lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let Some(&last_line) = stripped_lines.last() else {
+        return true;
+    };
+
+    // 1. Try parsing JSON
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(last_line) {
+        if let Some(obj) = value.as_object() {
+            if let Some(wake) = obj.get("wakeAgent").or_else(|| obj.get("wake_agent")) {
+                if let Some(b) = wake.as_bool() {
+                    return b;
+                }
+            }
+        }
+    }
+
+    // 2. Try parsing plain-text / YAML pattern (e.g. "wakeAgent: false")
+    let lower = last_line.to_ascii_lowercase();
+    if lower == "wakeagent: false"
+        || lower == "wake_agent: false"
+        || lower == "{\"wakeagent\": false}"
+        || lower == "{\"wakeagent\":false}"
+    {
+        return false;
+    }
+
+    true
+}
+
 const CRON_SILENCE_TOKENS: &[&str] = &["[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"];
 
 fn is_silence_token_line(line: &str) -> bool {
@@ -1492,5 +1526,26 @@ mod tests {
         assert_eq!(resolved_disk.as_deref(), Some("Disk output from beta"));
 
         let _ = tokio::fs::remove_dir_all(temp_dir).await;
+    }
+
+    #[test]
+    fn test_parse_wake_gate() {
+        assert!(parse_wake_gate(""));
+        assert!(parse_wake_gate("All systems normal\nChecked 10 records"));
+        assert!(parse_wake_gate("{\"wakeAgent\": true}"));
+        assert!(parse_wake_gate("wakeAgent: true"));
+        assert!(parse_wake_gate("Checked logs\n{\"wakeAgent\": true}"));
+
+        assert!(!parse_wake_gate("{\"wakeAgent\": false}"));
+        assert!(!parse_wake_gate("{\"wake_agent\": false}"));
+        assert!(!parse_wake_gate("wakeAgent: false"));
+        assert!(!parse_wake_gate("wake_agent: false"));
+        assert!(!parse_wake_gate("{\"wakeAgent\":false}"));
+        assert!(!parse_wake_gate(
+            "Running daily health check...\nFound no pending alerts.\n{\"wakeAgent\": false}"
+        ));
+        assert!(!parse_wake_gate(
+            "Running daily health check...\nFound no pending alerts.\nwakeAgent: false"
+        ));
     }
 }
