@@ -743,6 +743,19 @@ impl LiveAgentRunner {
                         .await?;
                     return Ok(response);
                 }
+                if stream_output {
+                    if !pending.is_empty() {
+                        let _ = self.emit(session, std::mem::take(&mut pending), true).await;
+                    } else {
+                        let has_active_stream = self
+                            .streams
+                            .lock()
+                            .contains_key(&session.key.storage_key());
+                        if has_active_stream {
+                            let _ = self.emit(session, String::new(), true).await;
+                        }
+                    }
+                }
                 if !response.is_empty() {
                     messages.push(ChatMessage::new("assistant", response));
                 }
@@ -753,8 +766,7 @@ impl LiveAgentRunner {
                     .await?;
                 for call in calls {
                     if stream_output {
-                        let status_msg = format!("\n\n⚙️ Running tool `{}`...", call.name);
-                        let _ = self.emit(session, status_msg, false).await;
+                        let _ = self.emit_tool_status(session, &call.name).await;
                     }
 
                     let tool_session = stream_output.then_some(&session.key);
@@ -798,6 +810,22 @@ impl LiveAgentRunner {
         }
 
         outcome
+    }
+
+    async fn emit_tool_status(&self, session: &SessionContext, tool_name: &str) -> Result<()> {
+        let status_msg = format!("⚙️ Running tool `{tool_name}`...");
+        let chunk = omon_gateway::StreamChunk {
+            stream_id: Uuid::new_v4(),
+            sequence: 0,
+            content: status_msg,
+            is_final: true,
+        };
+        self.dispatcher
+            .dispatch(OutboundAction::Stream {
+                session: session.key.clone(),
+                chunk,
+            })
+            .await
     }
 
     async fn emit(
@@ -1912,25 +1940,71 @@ mod runner_tests {
             "user-1",
         );
         let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event = omon_gateway::InboundEvent::message(session_key, "msg-1", "Run a tool");
+        let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-1", "Run a tool");
 
         let response = runner
             .execute(&mut session, event, None, None, true)
             .await
             .unwrap();
         assert_eq!(response, "Final result content");
+        assert!(
+            !response.contains("Running tool"),
+            "Final assistant response must not contain tool status lines"
+        );
 
         let actions = dispatcher.actions.lock().await.clone();
-        let has_tool_status = actions.iter().any(|action| match action {
-            omon_gateway::OutboundAction::Stream { chunk, .. } => {
-                chunk.content.contains("Running tool `mock_tool`")
-            }
-            _ => false,
-        });
+        let tool_status_actions: Vec<_> = actions
+            .iter()
+            .filter(|action| match action {
+                omon_gateway::OutboundAction::Stream { chunk, .. } => {
+                    chunk.content.contains("Running tool `mock_tool`")
+                }
+                _ => false,
+            })
+            .collect();
         assert!(
-            has_tool_status,
+            !tool_status_actions.is_empty(),
             "Streaming run must emit tool-call status chunks"
         );
+
+        // Verify final assistant stream chunk does NOT contain tool-status text
+        let final_stream_actions: Vec<_> = actions
+            .iter()
+            .filter(|action| match action {
+                omon_gateway::OutboundAction::Stream { chunk, .. } => {
+                    chunk.is_final && chunk.content.contains("Final result content")
+                }
+                _ => false,
+            })
+            .collect();
+        assert!(
+            !final_stream_actions.is_empty(),
+            "Expected final assistant prose stream chunk"
+        );
+        for action in &final_stream_actions {
+            if let omon_gateway::OutboundAction::Stream { chunk, .. } = action {
+                assert!(
+                    !chunk.content.contains("Running tool"),
+                    "Final stream chunk content polluted with tool-status: {:?}",
+                    chunk.content
+                );
+            }
+        }
+
+        // Verify assistant message persisted in db has only model prose
+        let history: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, content FROM messages WHERE session_key = ? AND role = 'assistant' ORDER BY sequence ASC",
+        )
+        .bind(session_key.storage_key())
+        .fetch_all(&runner.pool)
+        .await
+        .unwrap();
+        for (_, content) in history {
+            assert!(
+                !content.contains("Running tool"),
+                "Persisted assistant message polluted with tool-status: {content}"
+            );
+        }
 
         server_handle.await.unwrap();
     }

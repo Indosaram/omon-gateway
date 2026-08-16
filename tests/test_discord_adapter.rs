@@ -265,7 +265,10 @@ fn test_inbound_hydrates_reply_context_and_attachments() {
         "can you analyze these?",
         "charlie",
         "",
-        vec![("doc1.pdf", "application/pdf"), ("doc2.pdf", "application/pdf")],
+        vec![
+            ("doc1.pdf", "application/pdf"),
+            ("doc2.pdf", "application/pdf"),
+        ],
     );
     let event2 = message_to_inbound(&att_only_reply, bot_id, Some(ChannelType::Private)).unwrap();
     assert_eq!(

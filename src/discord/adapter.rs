@@ -1007,7 +1007,10 @@ mod tests {
     #[test]
     fn compose_reply_context_standard() {
         let result = compose_reply_context("alice", "hello there", "general kenobi");
-        assert_eq!(result, "> [Replying to @alice]: hello there\n\ngeneral kenobi");
+        assert_eq!(
+            result,
+            "> [Replying to @alice]: hello there\n\ngeneral kenobi"
+        );
     }
 
     #[test]
