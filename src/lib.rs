@@ -21,7 +21,7 @@ pub use memory::{Memory, MemoryStore};
 pub use models::*;
 pub use multiplexer::{
     parse_profile_routes, AgentRunner, MultiplexerConfig, OutboundDispatcher, ProfileRoute,
-    ProfileRouter, ScaleToZero, SessionActor, SessionMultiplexer,
+    ProfileRouter, RestartLoopGuard, ScaleToZero, SessionActor, SessionMultiplexer,
 };
 pub use security::*;
 pub use storage::Database;

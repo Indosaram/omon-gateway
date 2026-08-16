@@ -17,8 +17,8 @@ use omon_gateway::{
     CronTool, DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress,
     FileTool, HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider,
     McpTool, MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher,
-    PoiseData, ProfileRoute, ProfileRouter, Result, ScaleToZero, SessionContext, SessionKey,
-    SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry,
+    PoiseData, ProfileRoute, ProfileRouter, RestartLoopGuard, Result, ScaleToZero, SessionContext,
+    SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry,
     DISCORD_ATTACHMENT_MAX_BYTES, MAX_CONTEXT_CHARS,
 };
 use parking_lot::Mutex as ParkingMutex;
@@ -1960,11 +1960,24 @@ async fn run_gateway() -> Result<()> {
         "recovered pending outbound delivery obligations on boot"
     );
 
-    let recovered_sessions = recover_resume_pending_sessions(&pool, &multiplexer).await?;
-    info!(
-        recovered_sessions,
-        "recovered resume_pending sessions on boot"
-    );
+    let restart_guard_path = config.workspace_root.join("restart_loop.json");
+    let restart_guard = RestartLoopGuard::new(restart_guard_path);
+    let pending_sessions_count =
+        omon_gateway::storage::count_resume_pending_sessions(&pool).await?;
+    if pending_sessions_count > 0 {
+        if restart_guard.check_and_record() {
+            warn!(
+                pending_sessions_count,
+                "Restart-loop breaker TRIPPED: skipping auto-resume of in-flight sessions to break crash loop"
+            );
+        } else {
+            let recovered_sessions = recover_resume_pending_sessions(&pool, &multiplexer).await?;
+            info!(
+                recovered_sessions,
+                "recovered resume_pending sessions on boot"
+            );
+        }
+    }
 
     let scheduler = CronScheduler::with_dispatcher(
         pool.clone(),
@@ -3156,6 +3169,100 @@ mod runner_tests {
             .await
             .unwrap();
         assert_eq!(recovered_second, 0);
+    }
+
+    #[tokio::test]
+    async fn test_restart_loop_guard_suppresses_crash_loop_auto_resume() {
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let guard_file = temp.path().join("restart_loop.json");
+        let guard = omon_gateway::RestartLoopGuard::with_config(&guard_file, 3, 60);
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            Some("guild-1"),
+            "chan-poison",
+            None::<String>,
+            "user-poison",
+        );
+        super::ensure_agent_session(
+            &pool,
+            &omon_gateway::SessionContext::new(session_key.clone()),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, metadata_json)
+             VALUES ('msg-poison', ?, 'user', 'crash daemon command', '[]')",
+        )
+        .bind(session_key.storage_key())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        omon_gateway::storage::mark_session_resume_pending(&pool, &session_key.storage_key())
+            .await
+            .unwrap();
+
+        // Simulate 2 previous boots within window
+        guard.record_boot_at(10.0);
+        guard.record_boot_at(20.0);
+
+        // 3rd boot at t=30.0 trips the breaker!
+        let tripped = guard.check_and_record_at(30.0);
+        assert!(tripped, "Breaker must be tripped on 3rd boot");
+
+        let dispatch_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_counter_clone = dispatch_counter.clone();
+
+        struct PoisonMockRunner {
+            counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl omon_gateway::AgentRunner for PoisonMockRunner {
+            async fn run(
+                &self,
+                _session: &mut omon_gateway::SessionContext,
+                _event: omon_gateway::InboundEvent,
+            ) -> omon_gateway::Result<()> {
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let multiplexer = omon_gateway::SessionMultiplexer::new(
+            pool.clone(),
+            std::sync::Arc::new(PoisonMockRunner {
+                counter: dispatch_counter_clone,
+            }),
+            omon_gateway::MultiplexerConfig::default(),
+        );
+
+        // Because breaker is tripped, gateway startup skips auto-resume:
+        let pending_count = omon_gateway::storage::count_resume_pending_sessions(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending_count, 1);
+        if !tripped {
+            let _ = super::recover_resume_pending_sessions(&pool, &multiplexer).await;
+        }
+
+        // Verify that no task was dispatched
+        assert_eq!(
+            dispatch_counter.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        // Session remains marked resume_pending for manual resolution / next real user event
+        assert_eq!(
+            omon_gateway::storage::count_resume_pending_sessions(&pool)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     fn drive_stripper(chunks: &[&str]) -> String {
