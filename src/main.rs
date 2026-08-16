@@ -427,8 +427,10 @@ impl LiveAgentRunner {
             self.persist_message(session, "assistant", "", json!({"tool_calls": calls}))
                 .await?;
             for call in calls {
-                let status_msg = format!("\n\n⚙️ Running tool `{}`...", call.name);
-                let _ = self.emit(session, status_msg, false).await;
+                if stream_output {
+                    let status_msg = format!("\n\n⚙️ Running tool `{}`...", call.name);
+                    let _ = self.emit(session, status_msg, false).await;
+                }
 
                 let tool_session = stream_output.then_some(&session.key);
                 let result = tools
@@ -1192,5 +1194,186 @@ mod runner_tests {
         assert!(canonical_authorized_directory(&outside, &roots, "workdir").is_err());
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    struct MockTool;
+
+    #[async_trait::async_trait]
+    impl omon_gateway::Tool for MockTool {
+        fn name(&self) -> &str {
+            "mock_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Mock test tool"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, omon_gateway::OmonError> {
+            Ok(serde_json::json!({"status": "ok"}))
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingDispatcher {
+        actions: tokio::sync::Mutex<Vec<omon_gateway::OutboundAction>>,
+    }
+
+    #[async_trait::async_trait]
+    impl omon_gateway::OutboundDispatcher for CapturingDispatcher {
+        async fn dispatch(&self, action: omon_gateway::OutboundAction) -> omon_gateway::Result<()> {
+            self.actions.lock().await.push(action);
+            Ok(())
+        }
+    }
+
+    async fn spawn_two_turn_tool_llm_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            // Turn 1: LLM returns tool call for "mock_tool"
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"mock_tool\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+
+            // Turn 2: LLM returns final text content
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Final result content\"}}]}\n\ndata: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{address}/v1"), handle)
+    }
+
+    async fn build_test_runner(
+        base_url: String,
+        dispatcher: std::sync::Arc<CapturingDispatcher>,
+    ) -> (super::LiveAgentRunner, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        let memory = omon_gateway::MemoryStore::new(pool.clone());
+        let mut tools = omon_gateway::ToolRegistry::new();
+        tools.register(MockTool);
+
+        let mut config =
+            omon_gateway::LlmConfig::new(omon_gateway::LlmProvider::OpenAi, "gpt-test");
+        config.base_url = Some(base_url);
+        let llm = omon_gateway::LlmClient::new(config).unwrap();
+
+        let runner = super::LiveAgentRunner {
+            pool,
+            memory,
+            tools,
+            llm,
+            dispatcher,
+            workspace_root: temp_dir.path().to_path_buf(),
+            streams: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        };
+        (runner, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn execute_suppresses_tool_status_when_stream_output_is_false() {
+        let (base_url, server_handle) = spawn_two_turn_tool_llm_server().await;
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-1",
+            None::<String>,
+            "user-1",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        let event = omon_gateway::InboundEvent::message(session_key, "msg-1", "Run a tool");
+
+        let response = runner
+            .execute(&mut session, event, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(response, "Final result content");
+
+        let actions = dispatcher.actions.lock().await.clone();
+        let has_tool_status = actions.iter().any(|action| match action {
+            omon_gateway::OutboundAction::Stream { chunk, .. } => {
+                chunk.content.contains("Running tool")
+            }
+            _ => false,
+        });
+        assert!(
+            !has_tool_status,
+            "Non-streaming (cron) run must not emit tool-call status chunks"
+        );
+        assert!(
+            actions.is_empty(),
+            "Non-streaming run should not dispatch any stream actions, got: {actions:?}"
+        );
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_emits_tool_status_when_stream_output_is_true() {
+        let (base_url, server_handle) = spawn_two_turn_tool_llm_server().await;
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-1",
+            None::<String>,
+            "user-1",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        let event = omon_gateway::InboundEvent::message(session_key, "msg-1", "Run a tool");
+
+        let response = runner
+            .execute(&mut session, event, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(response, "Final result content");
+
+        let actions = dispatcher.actions.lock().await.clone();
+        let has_tool_status = actions.iter().any(|action| match action {
+            omon_gateway::OutboundAction::Stream { chunk, .. } => {
+                chunk.content.contains("Running tool `mock_tool`")
+            }
+            _ => false,
+        });
+        assert!(
+            has_tool_status,
+            "Streaming run must emit tool-call status chunks"
+        );
+
+        server_handle.await.unwrap();
     }
 }
