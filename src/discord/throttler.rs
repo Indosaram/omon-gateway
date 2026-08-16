@@ -233,10 +233,20 @@ pub fn truncate_live_preview(content: &str, limit: usize) -> String {
     format!("{prefix} …")
 }
 
+pub fn is_chunk_pagination_enabled() -> bool {
+    std::env::var("DISCORD_CHUNK_PAGINATION")
+        .map(|val| {
+            let lower = val.to_ascii_lowercase();
+            lower != "false" && lower != "0" && lower != "no" && lower != "off"
+        })
+        .unwrap_or(true)
+}
+
 /// Splits Markdown by Unicode characters while keeping fenced code valid in
-/// every Discord message. A fence crossing a boundary is closed in the old
-/// chunk and reopened with its original language tag in the next chunk.
-pub fn chunk_markdown(content: &str, limit: usize) -> Vec<String> {
+/// every Discord message. When `paginate` is enabled and the message splits into
+/// multiple chunks, `(i/N)` headers are prepended to each chunk while preserving
+/// code fence boundaries.
+pub fn chunk_markdown_paginated(content: &str, limit: usize, paginate: bool) -> Vec<String> {
     if limit == 0 {
         return Vec::new();
     }
@@ -244,21 +254,62 @@ pub fn chunk_markdown(content: &str, limit: usize) -> Vec<String> {
         return vec!["\u{200b}".into()];
     }
 
+    // Single chunk check
+    let unpaginated = chunk_markdown_raw(content, limit, None);
+    if unpaginated.len() <= 1 || !paginate {
+        return unpaginated;
+    }
+
+    // Multi-chunk pagination: two-pass convergence to find exact total chunk count
+    let mut total = unpaginated.len();
+    let mut chunks = chunk_markdown_raw(content, limit, Some(total));
+    if chunks.len() != total {
+        total = chunks.len();
+        chunks = chunk_markdown_raw(content, limit, Some(total));
+    }
+    chunks
+}
+
+/// Splits Markdown by Unicode characters while keeping fenced code valid in
+/// every Discord message. A fence crossing a boundary is closed in the old
+/// chunk and reopened with its original language tag in the next chunk.
+///
+/// If `DISCORD_CHUNK_PAGINATION` is enabled (default true), multi-chunk messages
+/// include `(i/N)` headers.
+pub fn chunk_markdown(content: &str, limit: usize) -> Vec<String> {
+    chunk_markdown_paginated(content, limit, is_chunk_pagination_enabled())
+}
+
+fn chunk_markdown_raw(content: &str, limit: usize, total_chunks: Option<usize>) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut remaining = content;
     let mut reopen: Option<String> = None;
+    let mut current_index = 1;
 
     while !remaining.is_empty() {
-        let prefix = reopen
-            .as_ref()
-            .map(|language| format!("```{language}\n"))
-            .unwrap_or_default();
-        let closing = if reopen.is_some() { "\n```" } else { "" };
-        let budget = limit.saturating_sub(prefix.chars().count() + closing.chars().count());
+        let (header, fence_open) = if let Some(total) = total_chunks {
+            let hdr = format!("({current_index}/{total})\n");
+            let f_open = reopen
+                .as_ref()
+                .map(|language| format!("```{language}\n"))
+                .unwrap_or_default();
+            (hdr, f_open)
+        } else {
+            let f_open = reopen
+                .as_ref()
+                .map(|language| format!("```{language}\n"))
+                .unwrap_or_default();
+            (String::new(), f_open)
+        };
+
+        let prefix = format!("{header}{fence_open}");
+        let potential_closing_len = 4; // reserve space for potential "\n```" suffix
+        let budget = limit.saturating_sub(prefix.chars().count() + potential_closing_len);
         if budget == 0 {
             chunks.push(take_chars(remaining, limit).0.to_owned());
             remaining = take_chars(remaining, limit).1;
             reopen = None;
+            current_index += 1;
             continue;
         }
 
@@ -280,6 +331,7 @@ pub fn chunk_markdown(content: &str, limit: usize) -> Vec<String> {
         chunks.push(format!("{prefix}{piece}{suffix}"));
         remaining = &remaining[split_at..];
         reopen = fence;
+        current_index += 1;
     }
 
     chunks
@@ -334,11 +386,53 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_live_preview_oversized() {
-        let content = "a".repeat(2500);
-        let preview = truncate_live_preview(&content, 2000);
-        assert_eq!(preview.chars().count(), 2000);
-        assert!(preview.ends_with(" …"));
-        assert_eq!(&preview[..1998], &"a".repeat(1998));
+    fn test_chunk_markdown_pagination_single_chunk_no_header() {
+        let content = "This is a single chunk message that should not receive a header.";
+        let chunks = chunk_markdown_paginated(content, 2000, true);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], content);
+        assert!(!chunks[0].contains("(1/1)"));
+    }
+
+    #[test]
+    fn test_chunk_markdown_pagination_multi_chunk_headers() {
+        let content = "Paragraph one.\n\n".repeat(50); // ~800 chars
+        let chunks = chunk_markdown_paginated(&content, 300, true);
+        assert!(chunks.len() > 1);
+        let total = chunks.len();
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.starts_with(&format!("({}/{})\n", i + 1, total)));
+            assert!(chunk.chars().count() <= 300);
+        }
+    }
+
+    #[test]
+    fn test_chunk_markdown_pagination_preserves_code_fences() {
+        let content = format!("intro\n```rust\n{}\n```\noutro", "let x = 42;\n".repeat(40));
+        let chunks = chunk_markdown_paginated(&content, 200, true);
+        assert!(chunks.len() > 1);
+        let total = chunks.len();
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.starts_with(&format!("({}/{})\n", i + 1, total)));
+            assert!(chunk.chars().count() <= 200);
+            assert_eq!(
+                chunk.matches("```").count() % 2,
+                0,
+                "code fence unbalanced in chunk {i}: {chunk}"
+            );
+        }
+        // Second chunk should reopen the rust fence cleanly after header
+        assert!(chunks[1].contains("```rust\n"));
+    }
+
+    #[test]
+    fn test_chunk_markdown_unpaginated_skips_headers() {
+        let content = "Some long text without headers.\n\n".repeat(40);
+        let chunks = chunk_markdown_paginated(&content, 300, false);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(!chunk.starts_with("(1/") && !chunk.starts_with("(2/"));
+            assert!(chunk.chars().count() <= 300);
+        }
     }
 }

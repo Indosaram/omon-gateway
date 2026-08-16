@@ -12,10 +12,10 @@ use omon_gateway::discord::adapter::{
 };
 use omon_gateway::discord::commands::{is_user_allowed, is_user_authorized};
 use omon_gateway::{
-    approval_buttons, chunk_markdown, compose_reply_context, derive_auto_thread_name,
-    is_authorized_clicker, parse_custom_id, render_user_prompt, safe_allowed_mentions,
-    ApprovalDecision, ApprovalError, AttachmentDownloader, ChatMessage, Database,
-    DeliveryLedgerService, DiscordEgress, DiscordFileUploader, DiscordMessageTransport,
+    approval_buttons, chunk_markdown, chunk_markdown_paginated, compose_reply_context,
+    derive_auto_thread_name, is_authorized_clicker, parse_custom_id, render_user_prompt,
+    safe_allowed_mentions, ApprovalDecision, ApprovalError, AttachmentDownloader, ChatMessage,
+    Database, DeliveryLedgerService, DiscordEgress, DiscordFileUploader, DiscordMessageTransport,
     InboundEvent, LiveEditThrottler, LlmClient, LlmConfig, LlmProvider, MessageAttachment,
     OutboundAction, OutboundDispatcher, Result, SessionKey, SmartApprovalGuard,
     DISCORD_ATTACHMENT_MAX_BYTES,
@@ -100,8 +100,15 @@ fn chunks_markdown_at_discord_limit_and_balances_code_fences() {
     assert!(chunks
         .iter()
         .all(|chunk| chunk.matches("```").count() % 2 == 0));
+    assert!(chunks[0].starts_with("(1/"));
     assert!(chunks[0].ends_with("\n```"));
-    assert!(chunks[1].starts_with("```rust\n"));
+    assert!(chunks[1].starts_with("(2/"));
+    assert!(chunks[1].contains("```rust\n"));
+
+    let unpaginated = chunk_markdown_paginated(&content, 2_000, false);
+    assert!(unpaginated.len() > 1);
+    assert!(unpaginated[0].ends_with("\n```"));
+    assert!(unpaginated[1].starts_with("```rust\n"));
 }
 
 #[tokio::test(start_paused = true)]

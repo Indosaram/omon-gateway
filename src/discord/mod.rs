@@ -23,5 +23,6 @@ pub use attachments::{
 };
 pub use commands::{is_user_authorized, GatewayStats, PoiseContext, PoiseData};
 pub use throttler::{
-    chunk_markdown, truncate_live_preview, DiscordMessageTransport, LiveEditThrottler,
+    chunk_markdown, chunk_markdown_paginated, is_chunk_pagination_enabled, truncate_live_preview,
+    DiscordMessageTransport, LiveEditThrottler,
 };
