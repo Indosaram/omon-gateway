@@ -197,12 +197,88 @@ async fn final_live_edit_deletes_surplus_chunk_messages() {
         Duration::from_millis(800),
     );
 
+    // 1. During streaming, long text (> 2000 chars) maintains a single preview (no Send)
     throttler.update(&"x".repeat(2_100), false).await.unwrap();
+    {
+        let calls = transport.calls.lock().await;
+        assert!(
+            !calls.iter().any(|call| matches!(call, Call::Send(_))),
+            "Streaming mid-stream must NOT send continuation messages"
+        );
+        let preview_edits: Vec<_> = calls
+            .iter()
+            .filter_map(|call| match call {
+                Call::Edit(id, text) => Some((*id, text.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(preview_edits.len(), 1);
+        assert_eq!(preview_edits[0].0, MessageId::new(8));
+        assert!(preview_edits[0].1.ends_with(" …"));
+        assert_eq!(preview_edits[0].1.chars().count(), 2000);
+    }
+
+    // 2. On finalize with long text, splits into chunks and sends continuation message
+    throttler.update(&"x".repeat(2_100), true).await.unwrap();
+    {
+        let calls = transport.calls.lock().await;
+        assert!(
+            calls.iter().any(|call| matches!(call, Call::Send(_))),
+            "Finalize must send continuation chunks for oversized content"
+        );
+    }
+
+    // 3. Subsequent finalize with short text deletes the surplus continuation message
     throttler.update("short", true).await.unwrap();
+    {
+        let calls = transport.calls.lock().await;
+        assert!(
+            calls.contains(&Call::Delete(MessageId::new(99))),
+            "Finalize with reduced chunks must delete surplus continuation messages"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn single_preview_during_streaming_truncates_without_sending_extra_messages() {
+    let (typing_tx, _typing_rx) = mpsc::unbounded_channel();
+    let transport = Arc::new(MockTransport {
+        calls: Mutex::new(Vec::new()),
+        typing: typing_tx,
+    });
+    let throttler = LiveEditThrottler::with_debounce(
+        transport.clone(),
+        ChannelId::new(7),
+        MessageId::new(8),
+        Duration::from_millis(800),
+    );
+
+    // Stream progressive oversized updates
+    throttler.update(&"a".repeat(2_500), false).await.unwrap();
+    tokio::time::advance(Duration::from_millis(800)).await;
+    throttler.update(&"b".repeat(3_000), false).await.unwrap();
+    tokio::time::advance(Duration::from_millis(800)).await;
+    throttler.update(&"c".repeat(4_000), false).await.unwrap();
 
     let calls = transport.calls.lock().await;
-    assert!(calls.iter().any(|call| matches!(call, Call::Send(_))));
-    assert!(calls.contains(&Call::Delete(MessageId::new(99))));
+    // Verify zero Send calls occurred mid-stream
+    assert!(
+        !calls.iter().any(|call| matches!(call, Call::Send(_))),
+        "Must not send any extra messages mid-stream"
+    );
+    // Verify edits only targeted initial message ID 8 and stayed within limit
+    let edit_targets: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::Edit(id, text) => Some((*id, text.chars().count())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(edit_targets.len(), 3);
+    for (target_id, count) in edit_targets {
+        assert_eq!(target_id, MessageId::new(8));
+        assert_eq!(count, 2000);
+    }
 }
 
 #[test]

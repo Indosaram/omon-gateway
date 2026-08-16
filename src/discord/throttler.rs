@@ -160,34 +160,34 @@ impl<T: DiscordMessageTransport> LiveEditThrottler<T> {
         }
 
         self.transport.start_typing(self.channel_id).await?;
-        let chunks = chunk_markdown(content, DISCORD_MESSAGE_LIMIT);
-        for (index, chunk) in chunks.iter().enumerate() {
-            if index < state.message_ids.len() {
-                self.transport
-                    .edit_message(self.channel_id, state.message_ids[index], chunk.clone())
-                    .await?;
-            } else {
-                let message_id = self
-                    .transport
-                    .send_message(self.channel_id, chunk.clone())
-                    .await?;
-                state.message_ids.push(message_id);
-            }
-        }
 
-        if is_final {
+        if !is_final {
+            let preview = truncate_live_preview(content, DISCORD_MESSAGE_LIMIT);
+            if let Some(&first_id) = state.message_ids.first() {
+                self.transport
+                    .edit_message(self.channel_id, first_id, preview)
+                    .await?;
+            }
+        } else {
+            let chunks = chunk_markdown(content, DISCORD_MESSAGE_LIMIT);
+            for (index, chunk) in chunks.iter().enumerate() {
+                if index < state.message_ids.len() {
+                    self.transport
+                        .edit_message(self.channel_id, state.message_ids[index], chunk.clone())
+                        .await?;
+                } else {
+                    let message_id = self
+                        .transport
+                        .send_message(self.channel_id, chunk.clone())
+                        .await?;
+                    state.message_ids.push(message_id);
+                }
+            }
+
             let stale: Vec<_> = state.message_ids.drain(chunks.len()..).collect();
             for message_id in stale {
                 self.transport
                     .delete_message(self.channel_id, message_id)
-                    .await?;
-            }
-        } else {
-            // Keep surplus IDs for reuse if the stream grows again. This avoids
-            // orphaning blank Discord messages on every shrink/grow cycle.
-            for message_id in state.message_ids.iter().skip(chunks.len()).copied() {
-                self.transport
-                    .edit_message(self.channel_id, message_id, "\u{200b}".into())
                     .await?;
             }
         }
@@ -214,6 +214,23 @@ impl<T: DiscordMessageTransport> LiveEditThrottler<T> {
             tokio::time::sleep_until(deadline).await;
         }
     }
+}
+
+/// Truncates streamed live content for a single preview message up to `limit` characters,
+/// appending a trailing indicator (` …`) when content exceeds the limit.
+pub fn truncate_live_preview(content: &str, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    if content.is_empty() {
+        return "\u{200b}".into();
+    }
+    if content.chars().count() <= limit {
+        return content.to_string();
+    }
+    let max_chars = limit.saturating_sub(2);
+    let (prefix, _) = take_chars(content, max_chars);
+    format!("{prefix} …")
 }
 
 /// Splits Markdown by Unicode characters while keeping fenced code valid in
@@ -302,5 +319,26 @@ fn scan_fences(text: &str, open: &mut Option<String>) {
                 *open = Some(after_fence.trim().to_owned());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_live_preview_empty_and_short() {
+        assert_eq!(truncate_live_preview("", 2000), "\u{200b}");
+        assert_eq!(truncate_live_preview("hello world", 2000), "hello world");
+        assert_eq!(truncate_live_preview("hello", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_live_preview_oversized() {
+        let content = "a".repeat(2500);
+        let preview = truncate_live_preview(&content, 2000);
+        assert_eq!(preview.chars().count(), 2000);
+        assert!(preview.ends_with(" …"));
+        assert_eq!(&preview[..1998], &"a".repeat(1998));
     }
 }

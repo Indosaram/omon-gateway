@@ -21,4 +21,6 @@ pub use attachments::{
     DISCORD_ATTACHMENT_TIMEOUT, MAX_INLINED_ATTACHMENT_BYTES,
 };
 pub use commands::{is_user_authorized, GatewayStats, PoiseContext, PoiseData};
-pub use throttler::{chunk_markdown, DiscordMessageTransport, LiveEditThrottler};
+pub use throttler::{
+    chunk_markdown, truncate_live_preview, DiscordMessageTransport, LiveEditThrottler,
+};
