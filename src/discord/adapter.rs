@@ -9,7 +9,7 @@ use serenity::all::{
     ChannelId, ChannelType, Color, CreateAllowedMentions, CreateAttachment, CreateEmbed,
     CreateForumPost, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
     CreateThread, EditMessage, FullEvent, GatewayIntents, GetMessages, HttpBuilder, Interaction,
-    Message, MessageId, Typing,
+    Message, MessageFlags, MessageId, Typing,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -206,9 +206,8 @@ pub fn derive_auto_thread_name(content: &str, bot_user_id: serenity::UserId) -> 
     }
 }
 
-static MENTION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<@!?[0-9]+>|<#[0-9]+>|<@&[0-9]+>").expect("valid mention regex")
-});
+static MENTION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<@!?[0-9]+>|<#[0-9]+>|<@&[0-9]+>").expect("valid mention regex"));
 
 /// Derives a clean forum thread post title from the message or its first line.
 ///
@@ -1003,6 +1002,71 @@ pub trait DiscordFileUploader: Send + Sync {
     ) -> Result<()>;
 }
 
+pub const DISCORD_VOICE_MESSAGE_FLAG: u64 = 8192;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VoiceMetadata {
+    pub duration_secs: f64,
+    pub waveform: String,
+    pub flags: u64,
+}
+
+/// Builds Discord voice note metadata (flags 8192, duration in seconds, base64 sampled waveform).
+pub fn build_voice_metadata(audio_bytes: &[u8], duration_hint: Option<f64>) -> VoiceMetadata {
+    let waveform_samples: Vec<u8> = if audio_bytes.is_empty() {
+        vec![0u8; 64]
+    } else {
+        let sample_count = 128.min(audio_bytes.len());
+        let step = (audio_bytes.len() / sample_count).max(1);
+        let mut samples = Vec::with_capacity(sample_count);
+        for chunk in audio_bytes.chunks(step).take(sample_count) {
+            let max_val = chunk.iter().copied().max().unwrap_or(0);
+            samples.push(max_val);
+        }
+        if samples.is_empty() {
+            vec![0u8; 64]
+        } else {
+            samples
+        }
+    };
+
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    let waveform = BASE64_STANDARD.encode(&waveform_samples);
+
+    let duration_secs = duration_hint.unwrap_or_else(|| {
+        if audio_bytes.is_empty() {
+            1.0
+        } else {
+            let est = audio_bytes.len() as f64 / 3500.0;
+            (est.max(0.5) * 10.0).round() / 10.0
+        }
+    });
+
+    VoiceMetadata {
+        duration_secs,
+        waveform,
+        flags: DISCORD_VOICE_MESSAGE_FLAG,
+    }
+}
+
+/// Determines whether a file or attachment represents a Discord voice message.
+pub fn is_voice_audio_file(filename: &str, content_type: Option<&str>) -> bool {
+    if let Some(ct) = content_type {
+        let ct_lower = ct.to_ascii_lowercase();
+        if ct_lower.starts_with("audio/ogg")
+            || ct_lower.starts_with("audio/opus")
+            || ct_lower.contains("voice")
+        {
+            return true;
+        }
+    }
+    let lower = filename.to_ascii_lowercase();
+    lower.ends_with(".ogg")
+        || lower.ends_with(".opus")
+        || lower.contains("voice-message")
+        || lower.contains("voice_message")
+}
+
 #[derive(Clone, Default)]
 pub struct SerenityFileUploader;
 
@@ -1031,33 +1095,39 @@ impl DiscordFileUploader for SerenityFileUploader {
             ))
         })?;
 
+        let is_voice = is_voice_audio_file(&filename, None);
         let is_forum = match channel.to_channel(&http).await {
-            Ok(serenity::Channel::Guild(guild_channel)) => {
-                guild_channel.kind == ChannelType::Forum
-            }
+            Ok(serenity::Channel::Guild(guild_channel)) => guild_channel.kind == ChannelType::Forum,
             _ => false,
         };
 
         if is_forum {
-            let title = format!("Upload: {filename}");
+            let title = if is_voice {
+                format!("Voice Note: {filename}")
+            } else {
+                format!("Upload: {filename}")
+            };
             let attachment = CreateAttachment::bytes(bytes, filename);
-            let builder = CreateForumPost::new(
-                title,
-                CreateMessage::new()
-                    .add_file(attachment)
-                    .allowed_mentions(safe_allowed_mentions()),
-            );
+            let mut create_msg = CreateMessage::new()
+                .add_file(attachment)
+                .allowed_mentions(safe_allowed_mentions());
+            if is_voice {
+                create_msg =
+                    create_msg.flags(MessageFlags::from_bits_truncate(DISCORD_VOICE_MESSAGE_FLAG));
+            }
+            let builder = CreateForumPost::new(title, create_msg);
             channel.create_forum_post(&http, builder).await?;
             return Ok(());
         }
 
         let attachment = CreateAttachment::bytes(bytes, filename);
+        let mut create_msg = CreateMessage::new().allowed_mentions(safe_allowed_mentions());
+        if is_voice {
+            create_msg =
+                create_msg.flags(MessageFlags::from_bits_truncate(DISCORD_VOICE_MESSAGE_FLAG));
+        }
         channel
-            .send_files(
-                &http,
-                vec![attachment],
-                CreateMessage::new().allowed_mentions(safe_allowed_mentions()),
-            )
+            .send_files(&http, vec![attachment], create_msg)
             .await?;
         Ok(())
     }
@@ -1415,8 +1485,10 @@ impl OutboundDispatcher for DiscordEgress {
                                     if let Some((code, reason)) =
                                         is_discord_dead_target_error(&error)
                                     {
-                                        self.dead_targets
-                                            .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                                        self.dead_targets.mark_dead(
+                                            channel_id,
+                                            format!("HTTP {code}: {reason}"),
+                                        );
                                     }
                                     return Err(error.into());
                                 }
@@ -1856,6 +1928,38 @@ mod tests {
 
     fn test_session(name: &str) -> SessionKey {
         SessionKey::new("discord", Some("guild"), "channel", None::<String>, name)
+    }
+
+    #[test]
+    fn test_build_voice_metadata() {
+        let dummy_audio = vec![10u8, 20, 50, 100, 200, 255, 128, 64];
+        let meta = build_voice_metadata(&dummy_audio, Some(2.5));
+        assert_eq!(meta.duration_secs, 2.5);
+        assert_eq!(meta.flags, DISCORD_VOICE_MESSAGE_FLAG);
+        assert!(!meta.waveform.is_empty());
+
+        // Empty audio fallback
+        let empty_meta = build_voice_metadata(&[], None);
+        assert_eq!(empty_meta.duration_secs, 1.0);
+        assert_eq!(empty_meta.flags, 8192);
+        assert!(!empty_meta.waveform.is_empty());
+    }
+
+    #[test]
+    fn test_is_voice_audio_file() {
+        assert!(is_voice_audio_file("recording.ogg", None));
+        assert!(is_voice_audio_file("speech.opus", None));
+        assert!(is_voice_audio_file("voice-message.ogg", None));
+        assert!(is_voice_audio_file("test.mp3", Some("audio/ogg")));
+        assert!(is_voice_audio_file("audio.bin", Some("audio/opus")));
+        assert!(is_voice_audio_file(
+            "attachment",
+            Some("audio/ogg; codecs=opus")
+        ));
+
+        assert!(!is_voice_audio_file("document.pdf", None));
+        assert!(!is_voice_audio_file("image.png", Some("image/png")));
+        assert!(!is_voice_audio_file("song.mp3", Some("audio/mpeg")));
     }
 
     #[test]

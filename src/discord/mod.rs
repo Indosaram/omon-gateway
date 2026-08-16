@@ -5,13 +5,14 @@ pub mod commands;
 pub mod throttler;
 
 pub use adapter::{
-    coalesce_inbound_events, compose_reply_context, derive_auto_thread_name,
+    build_voice_metadata, coalesce_inbound_events, compose_reply_context, derive_auto_thread_name,
     derive_forum_post_title, extract_media_directives, format_channel_context, global_debouncer,
-    is_authorized_clicker, is_discord_dead_target_error, is_silence_response,
+    is_authorized_clicker, is_discord_dead_target_error, is_silence_response, is_voice_audio_file,
     safe_allowed_mentions, should_chunk_reference, DeadTargetEntry, DeadTargetRegistry,
     DiscordAdapter, DiscordEgress, DiscordFileUploader, InboundFilterConfig, SerenityFileUploader,
-    SplitMessageDebouncer, DEFAULT_CHANNEL_CONTEXT_LIMIT, DEFAULT_DEBOUNCE_DURATION,
-    MAX_CHANNEL_CONTEXT_LIMIT, MAX_CONTEXT_LINE_CHARS, REFERENCED_CONTENT_CAP,
+    SplitMessageDebouncer, VoiceMetadata, DEFAULT_CHANNEL_CONTEXT_LIMIT, DEFAULT_DEBOUNCE_DURATION,
+    DISCORD_VOICE_MESSAGE_FLAG, MAX_CHANNEL_CONTEXT_LIMIT, MAX_CONTEXT_LINE_CHARS,
+    REFERENCED_CONTENT_CAP,
 };
 pub use approval::{
     approval_buttons, is_approval_custom_id, parse_custom_id, ApprovalDecision, ApprovalError,
