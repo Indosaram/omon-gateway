@@ -121,6 +121,8 @@ pub fn all() -> Vec<poise::Command<PoiseData, CommandError>> {
         status(),
         tools(),
         skill(),
+        skills(),
+        memory(),
         cron(),
         steer(),
         undo(),
@@ -189,14 +191,93 @@ pub async fn command_check(ctx: PoiseContext<'_>) -> Result<bool, CommandError> 
 /// Execute or inspect an OMO skill
 pub async fn skill(
     ctx: PoiseContext<'_>,
-    #[description = "Skill action: list, search, read, run"] action: String,
-    #[description = "Skill name or query"] name_or_query: Option<String>,
+    #[description = "Skill action: list, search, read, run, pending, approve, reject"]
+    action: String,
+    #[description = "Skill name, query, or pending ID"] name_or_query: Option<String>,
+) -> Result<(), CommandError> {
+    skill_dispatch(ctx, &action, name_or_query).await
+}
+
+#[poise::command(slash_command)]
+/// Execute, inspect, or manage capability skills
+pub async fn skills(
+    ctx: PoiseContext<'_>,
+    #[description = "Skill action: list, search, read, run, pending, approve, reject"]
+    action: Option<String>,
+    #[description = "Skill name, query, or pending ID"] name_or_query: Option<String>,
+) -> Result<(), CommandError> {
+    let act = action.unwrap_or_else(|| "list".to_string());
+    skill_dispatch(ctx, &act, name_or_query).await
+}
+
+async fn skill_dispatch(
+    ctx: PoiseContext<'_>,
+    action: &str,
+    name_or_query: Option<String>,
 ) -> Result<(), CommandError> {
     ctx.defer().await?;
     let data = ctx.data();
     let query_val = name_or_query.clone().unwrap_or_default();
+    let pool = &data.pool;
 
-    match action.as_str() {
+    match action {
+        "pending" => {
+            let pending = crate::storage::list_pending_writes(pool, Some("skill")).await?;
+            if pending.is_empty() {
+                ctx.say("No pending skill writes.").await?;
+                return Ok(());
+            }
+            let mut lines = vec![format!("**Pending skill writes ({})**:", pending.len())];
+            for item in pending {
+                let payload_val: serde_json::Value =
+                    serde_json::from_str(&item.payload).unwrap_or(serde_json::json!({}));
+                let name = payload_val
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&item.id);
+                lines.push(format!("• `{}` — skill `{}`", item.id, name));
+            }
+            lines.push("\n*Apply: `/skills approve <id>` | Reject: `/skills reject <id>`*".into());
+            ctx.say(lines.join("\n")).await?;
+        }
+        "approve" | "apply" => {
+            let id = query_val.trim();
+            if id.is_empty() {
+                ctx.say(
+                    "Please specify the pending skill write ID to approve: `/skills approve <id>`",
+                )
+                .await?;
+                return Ok(());
+            }
+            match crate::storage::approve_pending_write(pool, id, None).await? {
+                Some(msg) => {
+                    ctx.say(format!("✅ {msg}")).await?;
+                }
+                None => {
+                    ctx.say(format!("Pending skill write `{id}` not found."))
+                        .await?;
+                }
+            }
+        }
+        "reject" | "deny" | "drop" => {
+            let id = query_val.trim();
+            if id.is_empty() {
+                ctx.say(
+                    "Please specify the pending skill write ID to reject: `/skills reject <id>`",
+                )
+                .await?;
+                return Ok(());
+            }
+            if crate::storage::reject_pending_write(pool, id).await? {
+                ctx.say(format!(
+                    "🗑️ Rejected and discarded pending skill write `{id}`."
+                ))
+                .await?;
+            } else {
+                ctx.say(format!("Pending skill write `{id}` not found."))
+                    .await?;
+            }
+        }
         "list" => {
             let res = data
                 .tool_registry
@@ -295,8 +376,93 @@ pub async fn skill(
             let _ = data.multiplexer.route(event).await;
         }
         _ => {
-            ctx.say("Usage: `/skill action:<list|search|read|run> name_or_query:<name>`")
+            ctx.say("Usage: `/skills action:<list|search|read|run|pending|approve|reject> name_or_query:<name_or_id>`")
                 .await?;
+        }
+    }
+    Ok(())
+}
+
+#[poise::command(slash_command)]
+/// Inspect or review persistent memories and pending memory writes
+pub async fn memory(
+    ctx: PoiseContext<'_>,
+    #[description = "Memory action: pending, approve, reject, list"] action: Option<String>,
+    #[description = "Pending write ID or query"] id_or_query: Option<String>,
+) -> Result<(), CommandError> {
+    ctx.defer().await?;
+    let action_str = action.unwrap_or_else(|| "list".to_string()).to_lowercase();
+    let pool = &ctx.data().pool;
+    let key = session_key(ctx).await?;
+
+    match action_str.as_str() {
+        "pending" => {
+            let pending = crate::storage::list_pending_writes(pool, Some("memory")).await?;
+            if pending.is_empty() {
+                ctx.say("No pending memory writes.").await?;
+                return Ok(());
+            }
+            let mut lines = vec![format!("**Pending memory writes ({})**:", pending.len())];
+            for item in pending {
+                let payload_val: serde_json::Value =
+                    serde_json::from_str(&item.payload).unwrap_or(serde_json::json!({}));
+                let content = payload_val
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&item.payload);
+                let preview = preview_text(content, 80);
+                lines.push(format!("• `{}` — `{}`", item.id, preview));
+            }
+            lines.push("\n*Apply: `/memory approve <id>` | Reject: `/memory reject <id>`*".into());
+            ctx.say(lines.join("\n")).await?;
+        }
+        "approve" | "apply" => {
+            let Some(id) = id_or_query else {
+                ctx.say("Please specify the pending write ID to approve: `/memory approve <id>`")
+                    .await?;
+                return Ok(());
+            };
+            match crate::storage::approve_pending_write(pool, &id, None).await? {
+                Some(msg) => {
+                    ctx.say(format!("✅ {msg}")).await?;
+                }
+                None => {
+                    ctx.say(format!("Pending write `{id}` not found.")).await?;
+                }
+            }
+        }
+        "reject" | "deny" | "drop" => {
+            let Some(id) = id_or_query else {
+                ctx.say("Please specify the pending write ID to reject: `/memory reject <id>`")
+                    .await?;
+                return Ok(());
+            };
+            if crate::storage::reject_pending_write(pool, &id).await? {
+                ctx.say(format!("🗑️ Rejected and discarded pending write `{id}`."))
+                    .await?;
+            } else {
+                ctx.say(format!("Pending write `{id}` not found.")).await?;
+            }
+        }
+        _ => {
+            let memories: Vec<(String, String)> = sqlx::query_as(
+                "SELECT id, content FROM memories WHERE session_key = ? ORDER BY updated_at DESC LIMIT 10",
+            )
+            .bind(key.storage_key())
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+
+            if memories.is_empty() {
+                ctx.say("No memories stored for this session.").await?;
+            } else {
+                let mut lines = vec![format!("**Stored memories ({})**:", memories.len())];
+                for (id, content) in memories {
+                    let preview = preview_text(&content, 100);
+                    lines.push(format!("• `{id}`: {preview}"));
+                }
+                ctx.say(lines.join("\n")).await?;
+            }
         }
     }
     Ok(())
@@ -956,11 +1122,11 @@ mod tests {
     #[test]
     fn test_all_commands_count() {
         let commands = all();
-        assert_eq!(commands.len(), 15);
+        assert_eq!(commands.len(), 17);
         let names: HashSet<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         for expected in &[
-            "model", "reset", "stop", "status", "tools", "skill", "cron", "steer", "undo", "retry",
-            "compress", "title", "thread", "deny", "yolo",
+            "model", "reset", "stop", "status", "tools", "skill", "skills", "memory", "cron",
+            "steer", "undo", "retry", "compress", "title", "thread", "deny", "yolo",
         ] {
             assert!(names.contains(expected), "missing command {expected}");
         }

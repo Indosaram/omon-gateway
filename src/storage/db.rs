@@ -1,8 +1,12 @@
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use uuid::Uuid;
 
 use crate::error::Result;
 
@@ -187,6 +191,175 @@ pub async fn has_platform_message_id(
     Ok(exists.is_some())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PendingWrite {
+    pub id: String,
+    pub kind: String,
+    pub payload: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub fn write_approval_enabled() -> bool {
+    std::env::var("WRITE_APPROVAL")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub async fn stage_pending_write(pool: &SqlitePool, kind: &str, payload: &str) -> Result<String> {
+    let raw_uuid = Uuid::new_v4().to_string();
+    let short_id = raw_uuid.replace('-', "")[..8].to_string();
+    let now = Utc::now();
+    sqlx::query("INSERT INTO pending_writes (id, kind, payload, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&short_id)
+        .bind(kind)
+        .bind(payload)
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(short_id)
+}
+
+pub async fn list_pending_writes(
+    pool: &SqlitePool,
+    kind: Option<&str>,
+) -> Result<Vec<PendingWrite>> {
+    if let Some(kind) = kind {
+        let rows = sqlx::query_as::<_, PendingWrite>(
+            "SELECT id, kind, payload, created_at FROM pending_writes WHERE kind = ? ORDER BY created_at ASC",
+        )
+        .bind(kind)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
+    } else {
+        let rows = sqlx::query_as::<_, PendingWrite>(
+            "SELECT id, kind, payload, created_at FROM pending_writes ORDER BY created_at ASC",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
+    }
+}
+
+pub async fn get_pending_write(pool: &SqlitePool, id: &str) -> Result<Option<PendingWrite>> {
+    let row = sqlx::query_as::<_, PendingWrite>(
+        "SELECT id, kind, payload, created_at FROM pending_writes WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn delete_pending_write(pool: &SqlitePool, id: &str) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM pending_writes WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn approve_pending_write(
+    pool: &SqlitePool,
+    id: &str,
+    target_skills_dir: Option<&Path>,
+) -> Result<Option<String>> {
+    let Some(item) = get_pending_write(pool, id).await? else {
+        return Ok(None);
+    };
+
+    match item.kind.as_str() {
+        "memory" => {
+            let val: serde_json::Value = serde_json::from_str(&item.payload)
+                .map_err(|e| crate::OmonError::Database(format!("invalid memory payload: {e}")))?;
+            let session_key_str = val
+                .get("session_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let content = val.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let metadata = val
+                .get("metadata")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            let memory_id = Uuid::new_v4().to_string();
+            let metadata_json = serde_json::to_string(&metadata)
+                .map_err(|e| crate::OmonError::Database(e.to_string()))?;
+
+            // Ensure dummy session row exists for foreign key constraints if needed
+            let _ = sqlx::query(
+                "INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json) VALUES (?, 'discord', 'unknown', 'unknown', '{}') ON CONFLICT(session_key) DO NOTHING"
+            )
+            .bind(session_key_str)
+            .execute(pool)
+            .await;
+
+            sqlx::query(
+                "INSERT INTO memories (id, session_key, content, metadata_json) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&memory_id)
+            .bind(session_key_str)
+            .bind(content)
+            .bind(metadata_json)
+            .execute(pool)
+            .await?;
+
+            delete_pending_write(pool, id).await?;
+            Ok(Some(format!("Approved memory write [{id}]: \"{content}\"")))
+        }
+        "skill" => {
+            let val: serde_json::Value = serde_json::from_str(&item.payload)
+                .map_err(|e| crate::OmonError::Database(format!("invalid skill payload: {e}")))?;
+            let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let content = val.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                return Err(crate::OmonError::ToolExecution(
+                    "empty skill name in payload".into(),
+                ));
+            }
+
+            let base_dir = if let Some(dir) = target_skills_dir {
+                dir.to_path_buf()
+            } else if let Ok(home) = std::env::var("HOME") {
+                PathBuf::from(&home).join(".omon").join("skills")
+            } else {
+                PathBuf::from(".omon").join("skills")
+            };
+
+            let skill_dir = base_dir.join(name);
+            std::fs::create_dir_all(&skill_dir).map_err(|e| {
+                crate::OmonError::ToolExecution(format!("failed to create skill dir: {e}"))
+            })?;
+            let skill_file = skill_dir.join("SKILL.md");
+            std::fs::write(&skill_file, content).map_err(|e| {
+                crate::OmonError::ToolExecution(format!("failed to write SKILL.md: {e}"))
+            })?;
+
+            delete_pending_write(pool, id).await?;
+            Ok(Some(format!(
+                "Approved skill write [{id}]: skill '{name}' written to {}",
+                skill_file.display()
+            )))
+        }
+        _ => {
+            delete_pending_write(pool, id).await?;
+            Ok(Some(format!(
+                "Discarded unknown pending write kind: {}",
+                item.kind
+            )))
+        }
+    }
+}
+
+pub async fn reject_pending_write(pool: &SqlitePool, id: &str) -> Result<bool> {
+    delete_pending_write(pool, id).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -223,10 +396,130 @@ mod tests {
             "cron_runs",
             "delivery_obligations",
             "approval_allowlist",
+            "pending_writes",
         ] {
             assert!(tables.contains(expected), "missing table {expected}");
         }
         assert!(tables.contains("_sqlx_migrations"));
+    }
+
+    #[tokio::test]
+    async fn migration_creates_pending_writes_table_and_indexes() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+
+        let rows = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'pending_writes'",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("indexes should be queryable");
+
+        let indexes: HashSet<String> = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+
+        assert!(indexes.contains("idx_pending_writes_kind_created"));
+    }
+
+    #[tokio::test]
+    async fn test_pending_writes_store_round_trip() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+        let pool = database.pool();
+
+        // 1. Stage memory write
+        let mem_payload = serde_json::json!({
+            "session_key": "sess:test",
+            "content": "User prefers dark mode",
+            "metadata": {"source": "test"}
+        });
+        let mem_id = super::stage_pending_write(pool, "memory", &mem_payload.to_string())
+            .await
+            .unwrap();
+
+        // List pending writes
+        let pending = super::list_pending_writes(pool, Some("memory"))
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, mem_id);
+        assert_eq!(pending[0].kind, "memory");
+
+        // Approve memory write
+        let approve_res = super::approve_pending_write(pool, &mem_id, None)
+            .await
+            .unwrap();
+        assert!(approve_res.is_some());
+        assert!(approve_res.unwrap().contains("User prefers dark mode"));
+
+        // Verify removed from pending
+        let pending_after = super::list_pending_writes(pool, Some("memory"))
+            .await
+            .unwrap();
+        assert!(pending_after.is_empty());
+
+        // Verify inserted into memories
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE session_key = 'sess:test'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+
+        // 2. Stage and Reject memory write
+        let mem_id2 = super::stage_pending_write(pool, "memory", &mem_payload.to_string())
+            .await
+            .unwrap();
+        let rejected = super::reject_pending_write(pool, &mem_id2).await.unwrap();
+        assert!(rejected);
+        let pending_after2 = super::list_pending_writes(pool, Some("memory"))
+            .await
+            .unwrap();
+        assert!(pending_after2.is_empty());
+
+        // 3. Stage and Approve skill write
+        let skill_dir = tempfile::tempdir().unwrap();
+        let skill_payload = serde_json::json!({
+            "name": "super-agent",
+            "content": "# Super Agent Skill\n\nInstructions here."
+        });
+        let skill_id = super::stage_pending_write(pool, "skill", &skill_payload.to_string())
+            .await
+            .unwrap();
+
+        let pending_skills = super::list_pending_writes(pool, Some("skill"))
+            .await
+            .unwrap();
+        assert_eq!(pending_skills.len(), 1);
+        assert_eq!(pending_skills[0].id, skill_id);
+
+        let approve_skill = super::approve_pending_write(pool, &skill_id, Some(skill_dir.path()))
+            .await
+            .unwrap();
+        assert!(approve_skill.is_some());
+        assert!(skill_dir
+            .path()
+            .join("super-agent")
+            .join("SKILL.md")
+            .exists());
+        let written_content =
+            std::fs::read_to_string(skill_dir.path().join("super-agent").join("SKILL.md")).unwrap();
+        assert_eq!(written_content, "# Super Agent Skill\n\nInstructions here.");
+
+        // 4. Stage and Reject skill write
+        let skill_id2 = super::stage_pending_write(pool, "skill", &skill_payload.to_string())
+            .await
+            .unwrap();
+        let rejected_skill = super::reject_pending_write(pool, &skill_id2).await.unwrap();
+        assert!(rejected_skill);
+        let pending_skills2 = super::list_pending_writes(pool, Some("skill"))
+            .await
+            .unwrap();
+        assert!(pending_skills2.is_empty());
     }
 
     #[tokio::test]

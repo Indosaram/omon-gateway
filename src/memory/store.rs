@@ -35,9 +35,29 @@ impl MemoryStore {
         content: impl Into<String>,
         metadata: Value,
     ) -> Result<Memory> {
+        let content = content.into();
+        if crate::storage::write_approval_enabled() {
+            let payload = serde_json::json!({
+                "session_key": session.storage_key(),
+                "content": &content,
+                "metadata": &metadata,
+            });
+            let id =
+                crate::storage::stage_pending_write(&self.pool, "memory", &payload.to_string())
+                    .await?;
+            let now = Utc::now();
+            return Ok(Memory {
+                id,
+                session_key: session.storage_key(),
+                content,
+                metadata,
+                created_at: now,
+                updated_at: now,
+                score: 0.0,
+            });
+        }
         ensure_session(&self.pool, session).await?;
         let id = Uuid::new_v4().to_string();
-        let content = content.into();
         let metadata_json = serde_json::to_string(&metadata)
             .map_err(|error| OmonError::Database(error.to_string()))?;
         sqlx::query(

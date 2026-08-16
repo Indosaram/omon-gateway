@@ -1900,10 +1900,10 @@ async fn run_gateway() -> Result<()> {
     let hermes_root = env::var_os("HERMES_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".hermes"));
-    tools.register(omon_gateway::SkillsTool::new(hermes_skill_dirs(
-        &hermes_root,
-        &home,
-    )));
+    tools.register(
+        omon_gateway::SkillsTool::new(hermes_skill_dirs(&hermes_root, &home))
+            .with_pool(pool.clone()),
+    );
     let tool_names = tools.names();
 
     let llm = LlmClient::new(config.llm_config(config.default_model.clone()))?;

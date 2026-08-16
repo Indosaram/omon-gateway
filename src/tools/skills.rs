@@ -1,6 +1,8 @@
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use sqlx::SqlitePool;
 
 use super::Tool;
 use crate::OmonError;
@@ -8,6 +10,7 @@ use crate::OmonError;
 #[derive(Clone)]
 pub struct SkillsTool {
     skills_dirs: Vec<PathBuf>,
+    pool: Option<SqlitePool>,
 }
 
 impl Default for SkillsTool {
@@ -17,13 +20,24 @@ impl Default for SkillsTool {
             dirs.push(PathBuf::from(&home).join(".hermes").join("skills"));
             dirs.push(PathBuf::from(&home).join(".omon").join("skills"));
         }
-        Self { skills_dirs: dirs }
+        Self {
+            skills_dirs: dirs,
+            pool: None,
+        }
     }
 }
 
 impl SkillsTool {
     pub fn new(skills_dirs: Vec<PathBuf>) -> Self {
-        Self { skills_dirs }
+        Self {
+            skills_dirs,
+            pool: None,
+        }
+    }
+
+    pub fn with_pool(mut self, pool: SqlitePool) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     fn find_all_skills(&self) -> Vec<(String, PathBuf)> {
@@ -69,7 +83,7 @@ impl Tool for SkillsTool {
     }
 
     fn description(&self) -> &str {
-        "Discover, list, and read specialized capability skills. Actions: 'list' (shows all available skills), 'search' (find skill by keyword), 'read' (reads the complete SKILL.md guide for a specific skill)."
+        "Discover, list, read, and write specialized capability skills. Actions: 'list' (shows all available skills), 'search' (find skill by keyword), 'read' (reads the complete SKILL.md guide for a specific skill), 'write' (creates or updates a skill)."
     }
 
     fn input_schema(&self) -> Value {
@@ -78,12 +92,16 @@ impl Tool for SkillsTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "search", "read"],
-                    "description": "Action to perform (list, search, read)."
+                    "enum": ["list", "search", "read", "write"],
+                    "description": "Action to perform (list, search, read, write)."
                 },
                 "name": {
                     "type": "string",
-                    "description": "Skill name to read (required for read action)."
+                    "description": "Skill name to read or write."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Skill content in Markdown format (required for write action)."
                 },
                 "query": {
                     "type": "string",
@@ -149,6 +167,55 @@ impl Tool for SkillsTool {
                         "skill '{name}' not found. Use action='list' to see all skills."
                     ))),
                 }
+            }
+            "write" => {
+                let name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| OmonError::ToolExecution("missing 'name'".into()))?;
+                let content = args
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| OmonError::ToolExecution("missing 'content'".into()))?;
+
+                if crate::storage::write_approval_enabled() {
+                    if let Some(pool) = &self.pool {
+                        let payload = json!({
+                            "name": name,
+                            "content": content
+                        })
+                        .to_string();
+                        let id =
+                            crate::storage::stage_pending_write(pool, "skill", &payload).await?;
+                        return Ok(json!({
+                            "name": name,
+                            "status": "staged",
+                            "id": id,
+                            "message": format!("Skill '{name}' write staged for approval with id {id}. Run /skills approve {id} to apply.")
+                        }));
+                    }
+                }
+
+                let target_dir = self.skills_dirs.first().cloned().unwrap_or_else(|| {
+                    if let Ok(home) = std::env::var("HOME") {
+                        PathBuf::from(&home).join(".omon").join("skills")
+                    } else {
+                        PathBuf::from(".omon").join("skills")
+                    }
+                });
+                let skill_dir = target_dir.join(name);
+                std::fs::create_dir_all(&skill_dir).map_err(|e| {
+                    OmonError::ToolExecution(format!("failed to create skill directory: {e}"))
+                })?;
+                let skill_path = skill_dir.join("SKILL.md");
+                std::fs::write(&skill_path, content).map_err(|e| {
+                    OmonError::ToolExecution(format!("failed to write SKILL.md: {e}"))
+                })?;
+                Ok(json!({
+                    "name": name,
+                    "status": "saved",
+                    "path": skill_path.display().to_string()
+                }))
             }
             _ => Err(OmonError::ToolExecution(format!(
                 "unknown skills action: {action}"
