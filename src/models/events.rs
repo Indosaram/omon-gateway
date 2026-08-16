@@ -165,6 +165,9 @@ pub enum OutboundAction {
         command: String,
         reason: String,
     },
+    ExpireApproval {
+        request_id: Uuid,
+    },
 }
 
 #[cfg(test)]
@@ -225,6 +228,13 @@ mod tests {
             serde_json::to_value(&typing_action).expect("typing action should serialize");
         assert_eq!(typing_value["type"], "typing");
         assert_eq!(typing_value["active"], true);
+
+        let req_id = Uuid::new_v4();
+        let expire_action = OutboundAction::ExpireApproval { request_id: req_id };
+        let expire_value =
+            serde_json::to_value(&expire_action).expect("expire action should serialize");
+        assert_eq!(expire_value["type"], "expire_approval");
+        assert_eq!(expire_value["request_id"], req_id.to_string());
     }
 
     #[test]

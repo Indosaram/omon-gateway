@@ -144,6 +144,9 @@ impl ApprovalRequester for DiscordApprovalRequester {
             }
         } else {
             self.guard.cancel(request_id).await;
+            let _ = dispatcher
+                .dispatch(OutboundAction::ExpireApproval { request_id })
+                .await;
         }
         result
     }

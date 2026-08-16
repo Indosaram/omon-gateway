@@ -14,7 +14,9 @@ use serenity::all::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::approval::{approval_buttons, is_approval_custom_id, SmartApprovalGuard};
+use super::approval::{
+    approval_buttons, is_approval_custom_id, parse_custom_id, ApprovalDecision, SmartApprovalGuard,
+};
 use super::commands::{self, is_user_authorized, CommandError, PoiseData};
 use super::throttler::{
     chunk_markdown, DiscordMessageTransport, LiveEditThrottler, SerenityMessageTransport,
@@ -708,19 +710,41 @@ async fn handle_event(
                     return Ok(());
                 }
 
-                let response = if data
-                    .approvals
-                    .resolve_custom_id(&component.data.custom_id)
-                    .await
-                {
-                    CreateInteractionResponse::UpdateMessage(
-                        CreateInteractionResponseMessage::new().components(Vec::new()),
-                    )
+                let parsed = parse_custom_id(&component.data.custom_id);
+                let response = if let Some((_, decision)) = parsed {
+                    if data
+                        .approvals
+                        .resolve_custom_id(&component.data.custom_id)
+                        .await
+                    {
+                        let decision_label = match decision {
+                            ApprovalDecision::Once => "Approved (once)",
+                            ApprovalDecision::Session => "Approved (session)",
+                            ApprovalDecision::Always => "Approved (always)",
+                            ApprovalDecision::Deny => "Denied",
+                        };
+                        let user_name = &component.user.name;
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .components(Vec::new())
+                                .content(format!("{decision_label} by {user_name}")),
+                        )
+                    } else {
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .components(Vec::new())
+                                .content(
+                                    "⏱ Approval request no longer valid (expired or already resolved).",
+                                ),
+                        )
+                    }
                 } else {
                     CreateInteractionResponse::UpdateMessage(
                         CreateInteractionResponseMessage::new()
                             .components(Vec::new())
-                            .content("이 승인 요청은 더 이상 유효하지 않습니다 (게이트웨이 재시작 또는 만료됨). 명령을 다시 실행해 주세요."),
+                            .content(
+                                "이 승인 요청은 더 이상 유효하지 않습니다 (게이트웨이 재시작 또는 만료됨). 명령을 다시 실행해 주세요.",
+                            ),
                     )
                 };
                 component.create_response(ctx, response).await?;
@@ -992,6 +1016,7 @@ struct ActiveDiscordStream {
 }
 
 type StreamKey = (String, Uuid);
+type ApprovalMessageTarget = (SessionKey, ChannelId, MessageId);
 
 #[derive(Clone)]
 pub struct DiscordEgress {
@@ -1000,6 +1025,7 @@ pub struct DiscordEgress {
     streams: Arc<Mutex<HashMap<StreamKey, Arc<ActiveDiscordStream>>>>,
     typing: Arc<Mutex<HashMap<String, Typing>>>,
     file_uploader: Arc<dyn DiscordFileUploader>,
+    approval_messages: Arc<Mutex<HashMap<Uuid, ApprovalMessageTarget>>>,
 }
 
 impl DiscordEgress {
@@ -1015,6 +1041,7 @@ impl DiscordEgress {
             streams: Arc::new(Mutex::new(HashMap::new())),
             typing: Arc::new(Mutex::new(HashMap::new())),
             file_uploader: Arc::new(SerenityFileUploader),
+            approval_messages: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1034,7 +1061,40 @@ impl DiscordEgress {
             streams: Arc::new(Mutex::new(HashMap::new())),
             typing: Arc::new(Mutex::new(HashMap::new())),
             file_uploader: Arc::new(SerenityFileUploader),
+            approval_messages: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub async fn record_approval_message(
+        &self,
+        request_id: Uuid,
+        session: SessionKey,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) {
+        let mut map = self.approval_messages.lock().await;
+        map.insert(request_id, (session, channel_id, message_id));
+    }
+
+    pub async fn get_approval_message(
+        &self,
+        request_id: &Uuid,
+    ) -> Option<(SessionKey, ChannelId, MessageId)> {
+        let map = self.approval_messages.lock().await;
+        map.get(request_id).cloned()
+    }
+
+    pub async fn remove_approval_message(
+        &self,
+        request_id: &Uuid,
+    ) -> Option<(SessionKey, ChannelId, MessageId)> {
+        let mut map = self.approval_messages.lock().await;
+        map.remove(request_id)
+    }
+
+    pub async fn approval_message_count(&self) -> usize {
+        let map = self.approval_messages.lock().await;
+        map.len()
     }
 
     pub fn with_file_uploader(mut self, uploader: Arc<dyn DiscordFileUploader>) -> Self {
@@ -1278,7 +1338,7 @@ impl OutboundDispatcher for DiscordEgress {
                 let channel = Self::target(&session)?;
                 let content = build_approval_content(&command, &reason);
                 let embed = build_approval_embed(&command, &reason);
-                channel
+                let msg = channel
                     .send_message(
                         &http,
                         CreateMessage::new()
@@ -1288,6 +1348,26 @@ impl OutboundDispatcher for DiscordEgress {
                             .allowed_mentions(safe_allowed_mentions()),
                     )
                     .await?;
+                self.record_approval_message(request_id, session, channel, msg.id)
+                    .await;
+            }
+            OutboundAction::ExpireApproval { request_id } => {
+                if let Some((session, channel, message_id)) =
+                    self.remove_approval_message(&request_id).await
+                {
+                    if let Ok(http) = self.http_for(&session) {
+                        let _ = channel
+                            .edit_message(
+                                &http,
+                                message_id,
+                                EditMessage::new()
+                                    .components(Vec::new())
+                                    .content("⏱ Approval request expired")
+                                    .allowed_mentions(safe_allowed_mentions()),
+                            )
+                            .await;
+                    }
+                }
             }
         }
         Ok(())
@@ -1768,5 +1848,37 @@ mod tests {
         assert!(content.contains("⚠️ **Approval Required**"));
         assert!(content.contains("rm -rf /tmp/build"));
         assert!(content.contains("**Reason:** recursive delete"));
+    }
+
+    #[tokio::test]
+    async fn test_egress_approval_message_tracking_map() {
+        let http = Arc::new(serenity::Http::new("test-token"));
+        let egress = DiscordEgress::new(http);
+
+        let req_id = Uuid::new_v4();
+        let session = test_session("user-1");
+        let channel_id = ChannelId::new(12345);
+        let msg_id = MessageId::new(67890);
+
+        assert_eq!(egress.approval_message_count().await, 0);
+        assert!(egress.get_approval_message(&req_id).await.is_none());
+
+        egress
+            .record_approval_message(req_id, session.clone(), channel_id, msg_id)
+            .await;
+
+        assert_eq!(egress.approval_message_count().await, 1);
+        let recorded = egress.get_approval_message(&req_id).await.unwrap();
+        assert_eq!(recorded.0, session);
+        assert_eq!(recorded.1, channel_id);
+        assert_eq!(recorded.2, msg_id);
+
+        let removed = egress.remove_approval_message(&req_id).await.unwrap();
+        assert_eq!(removed.0, session);
+        assert_eq!(removed.1, channel_id);
+        assert_eq!(removed.2, msg_id);
+
+        assert_eq!(egress.approval_message_count().await, 0);
+        assert!(egress.get_approval_message(&req_id).await.is_none());
     }
 }
