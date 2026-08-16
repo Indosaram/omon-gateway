@@ -1183,13 +1183,25 @@ pub fn delivery_destination(payload: &Value) -> Result<Vec<crate::HermesOrigin>>
     delivery_destinations(payload)
 }
 
+pub const ONESHOT_GRACE_DURATION: Duration = Duration::from_secs(120);
+
 pub fn next_run(expression: &str, after: DateTime<Utc>) -> Result<DateTime<Utc>> {
     if let Some(timestamp) = expression.strip_prefix("once:") {
-        return DateTime::parse_from_rfc3339(timestamp)
+        let ts = DateTime::parse_from_rfc3339(timestamp)
             .map(|value| value.with_timezone(&Utc))
             .map_err(|error| {
                 OmonError::Config(format!("invalid one-shot timestamp `{timestamp}`: {error}"))
-            });
+            })?;
+        if ts >= after {
+            return Ok(ts);
+        }
+        let past = after - ts;
+        if past <= TimeDelta::from_std(ONESHOT_GRACE_DURATION).unwrap_or(TimeDelta::seconds(120)) {
+            return Ok(ts);
+        }
+        return Err(OmonError::Config(format!(
+            "one-shot timestamp `{timestamp}` is more than 120s in the past and cannot be scheduled"
+        )));
     }
     if let Some(interval) = parse_interval(expression)? {
         let delta = TimeDelta::from_std(interval)
@@ -1682,5 +1694,40 @@ mod tests {
         let targets = delivery_destination(&payload).unwrap();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].chat_id, "123");
+    }
+
+    #[test]
+    fn test_oneshot_grace_window() {
+        let now = Utc::now();
+
+        // Future one-shot: fires at future timestamp
+        let future_ts = now + chrono::TimeDelta::seconds(300);
+        let future_expr = format!("once:{}", future_ts.to_rfc3339());
+        let res = next_run(&future_expr, now).unwrap();
+        assert_eq!(res, future_ts);
+
+        // 60s past: within 120s grace window -> fires (Ok)
+        let past_60s = now - chrono::TimeDelta::seconds(60);
+        let past_60s_expr = format!("once:{}", past_60s.to_rfc3339());
+        let res = next_run(&past_60s_expr, now);
+        assert!(
+            res.is_ok(),
+            "60s past one-shot must fire within 120s grace window"
+        );
+
+        // Exactly 120s past: boundary -> fires (Ok)
+        let past_120s = now - chrono::TimeDelta::seconds(120);
+        let past_120s_expr = format!("once:{}", past_120s.to_rfc3339());
+        let res = next_run(&past_120s_expr, now);
+        assert!(res.is_ok(), "120s past one-shot boundary must fire");
+
+        // 200s past: older than 120s grace window -> rejected (Err)
+        let past_200s = now - chrono::TimeDelta::seconds(200);
+        let past_200s_expr = format!("once:{}", past_200s.to_rfc3339());
+        let res = next_run(&past_200s_expr, now);
+        assert!(
+            res.is_err(),
+            "200s past one-shot must be rejected outside grace window"
+        );
     }
 }

@@ -10,7 +10,7 @@ pub use scheduler::{
     next_run_after_failure, parse_context_from_ids, parse_wake_gate, resolve_predecessor_output,
     should_disable_after, truncate_context_output, CronJob, CronJobSpec, CronNotification,
     CronScheduler, CronTaskExecutor, PayloadTaskExecutor, ShellAndPayloadTaskExecutor,
-    MAX_CONTEXT_CHARS, MAX_RETRY_INTERVAL, MIN_RETRY_INTERVAL,
+    MAX_CONTEXT_CHARS, MAX_RETRY_INTERVAL, MIN_RETRY_INTERVAL, ONESHOT_GRACE_DURATION,
 };
 pub use store::{
     cron_runs_retention_days_from_environment, prune_terminal_cron_runs, HermesJob, HermesOrigin,
