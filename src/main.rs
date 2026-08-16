@@ -364,6 +364,7 @@ struct Config {
     workspace_root: PathBuf,
     free_response_channels: Vec<u64>,
     allowed_users: Vec<u64>,
+    auto_thread: bool,
     approval_policy: ApprovalPolicy,
     approval_timeout_secs: u64,
 }
@@ -441,6 +442,7 @@ impl Config {
             workspace_root,
             free_response_channels,
             allowed_users,
+            auto_thread: parse_bool_from(optional_env("DISCORD_AUTO_THREAD").as_deref(), false),
             approval_policy: ApprovalPolicy::parse(optional_env("APPROVAL_MODE").as_deref()),
             approval_timeout_secs: approval_timeout_secs_from(
                 optional_env("APPROVAL_TIMEOUT_SECS").as_deref(),
@@ -1632,6 +1634,7 @@ async fn run_gateway() -> Result<()> {
     poise_data.tool_registry = tools.clone();
     poise_data.free_response_channels = config.free_response_channels.clone();
     poise_data.allowed_users = config.allowed_users.clone();
+    poise_data.auto_thread = config.auto_thread;
     poise_data.attachment_downloader = Some(AttachmentDownloader::new(&config.workspace_root)?);
     poise_data.primary_bot_id = Some(default_bot_id.parse().map_err(|_| {
         OmonError::Config(format!(
@@ -1697,6 +1700,16 @@ fn approval_timeout_secs_from(raw: Option<&str>) -> u64 {
         .unwrap_or(900)
 }
 
+pub fn parse_bool_from(raw: Option<&str>, default: bool) -> bool {
+    match raw {
+        Some(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => default,
+    }
+}
+
 #[cfg(test)]
 mod runner_tests {
     use std::fs;
@@ -1719,6 +1732,22 @@ mod runner_tests {
         assert_eq!(approval_timeout_secs_from(Some("0")), 900);
         assert_eq!(approval_timeout_secs_from(Some("-10")), 900);
         assert_eq!(approval_timeout_secs_from(Some("invalid")), 900);
+    }
+
+    #[test]
+    fn parses_bool_from_env_variants() {
+        assert!(super::parse_bool_from(Some("true"), false));
+        assert!(super::parse_bool_from(Some("True"), false));
+        assert!(super::parse_bool_from(Some("1"), false));
+        assert!(super::parse_bool_from(Some("yes"), false));
+        assert!(super::parse_bool_from(Some("on"), false));
+        assert!(!super::parse_bool_from(Some("false"), true));
+        assert!(!super::parse_bool_from(Some("0"), true));
+        assert!(!super::parse_bool_from(Some("no"), true));
+        assert!(!super::parse_bool_from(Some("off"), true));
+        assert!(!super::parse_bool_from(Some(""), false));
+        assert!(super::parse_bool_from(None, true));
+        assert!(!super::parse_bool_from(None, false));
     }
 
     #[test]

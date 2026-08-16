@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use poise::serenity_prelude as serenity;
 use serenity::all::{
     ChannelId, ChannelType, CreateAllowedMentions, CreateAttachment, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateMessage, EditMessage, FullEvent, GatewayIntents,
-    HttpBuilder, Interaction, Message, MessageId, Typing,
+    CreateInteractionResponseMessage, CreateMessage, CreateThread, EditMessage, FullEvent,
+    GatewayIntents, HttpBuilder, Interaction, Message, MessageId, Typing,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -35,6 +35,21 @@ pub fn safe_allowed_mentions() -> CreateAllowedMentions {
 
 /// Maximum character length for hydrated referenced message context.
 pub const REFERENCED_CONTENT_CAP: usize = 500;
+
+/// Derives a clean thread name from a user message when auto-threading on mention.
+pub fn derive_auto_thread_name(content: &str, bot_user_id: serenity::UserId) -> String {
+    let stripped = strip_bot_mention(content, bot_user_id);
+    let collapsed: String = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        "Conversation".to_string()
+    } else if trimmed.chars().count() > 80 {
+        let capped: String = trimmed.chars().take(77).collect();
+        format!("{capped}...")
+    } else {
+        trimmed.to_string()
+    }
+}
 
 /// Composes reply context prefixing the user body with a quote block of the referenced message.
 pub fn compose_reply_context(
@@ -325,12 +340,20 @@ async fn handle_event(
                 .await
                 .map(|u| u.id)
                 .unwrap_or(ctx.cache.current_user().id);
+            let is_guild_text = channel_type == Some(ChannelType::Text);
+            let mentioned_bot_ids = new_message
+                .mentions
+                .iter()
+                .filter(|user| user.bot)
+                .map(|user| user.id)
+                .collect::<Vec<_>>();
+            let is_explicit_mention = mentioned_bot_ids.contains(&bot_user_id);
             let active_threads: Vec<u64> = data
                 .active_threads
                 .read()
                 .map(|set| set.iter().copied().collect())
                 .unwrap_or_default();
-            if let Some(event) = message_to_inbound_with_config(
+            if let Some(mut event) = message_to_inbound_with_config(
                 new_message,
                 bot_user_id,
                 channel_type,
@@ -341,6 +364,33 @@ async fn handle_event(
             ) {
                 if channel_type.is_some_and(is_thread) {
                     data.mark_thread_active(new_message.channel_id.get());
+                } else if data.auto_thread && is_guild_text && is_explicit_mention {
+                    let thread_name = derive_auto_thread_name(&new_message.content, bot_user_id);
+                    let builder = CreateThread::new(thread_name);
+                    match new_message
+                        .channel_id
+                        .create_thread_from_message(&ctx.http, new_message.id, builder)
+                        .await
+                    {
+                        Ok(thread_channel) => {
+                            let thread_id_num = thread_channel.id.get();
+                            data.mark_thread_active(thread_id_num);
+                            tracing::info!(
+                                thread_id = %thread_id_num,
+                                parent_channel = %new_message.channel_id,
+                                "Auto-created thread on channel mention"
+                            );
+                            event.session.thread_id = Some(thread_channel.id.to_string());
+                            event.session.channel_id = thread_channel.id.to_string();
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                channel = %new_message.channel_id,
+                                "Failed to auto-create thread from mention; falling back to in-channel reply"
+                            );
+                        }
+                    }
                 }
                 if event.content.trim().eq_ignore_ascii_case("/stop") {
                     global_debouncer().cancel(&event.session).await;

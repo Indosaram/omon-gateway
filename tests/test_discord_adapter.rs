@@ -10,12 +10,13 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use omon_gateway::discord::adapter::{message_to_inbound, message_to_inbound_with_config};
 use omon_gateway::discord::commands::is_user_allowed;
 use omon_gateway::{
-    approval_buttons, chunk_markdown, compose_reply_context, is_authorized_clicker,
-    parse_custom_id, render_user_prompt, safe_allowed_mentions, ApprovalDecision, ApprovalError,
-    AttachmentDownloader, ChatMessage, Database, DeliveryLedgerService, DiscordEgress,
-    DiscordFileUploader, DiscordMessageTransport, InboundEvent, LiveEditThrottler, LlmClient,
-    LlmConfig, LlmProvider, MessageAttachment, OutboundAction, OutboundDispatcher, Result,
-    SessionKey, SmartApprovalGuard, DISCORD_ATTACHMENT_MAX_BYTES,
+    approval_buttons, chunk_markdown, compose_reply_context, derive_auto_thread_name,
+    is_authorized_clicker, parse_custom_id, render_user_prompt, safe_allowed_mentions,
+    ApprovalDecision, ApprovalError, AttachmentDownloader, ChatMessage, Database,
+    DeliveryLedgerService, DiscordEgress, DiscordFileUploader, DiscordMessageTransport,
+    InboundEvent, LiveEditThrottler, LlmClient, LlmConfig, LlmProvider, MessageAttachment,
+    OutboundAction, OutboundDispatcher, Result, SessionKey, SmartApprovalGuard,
+    DISCORD_ATTACHMENT_MAX_BYTES,
 };
 use serenity::all::{ChannelId, ChannelType, Message, MessageId, UserId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -200,6 +201,24 @@ async fn final_live_edit_deletes_surplus_chunk_messages() {
     let calls = transport.calls.lock().await;
     assert!(calls.iter().any(|call| matches!(call, Call::Send(_))));
     assert!(calls.contains(&Call::Delete(MessageId::new(99))));
+}
+
+#[test]
+fn test_derive_auto_thread_name_formatting_and_capping() {
+    let bot_id = UserId::new(42);
+    assert_eq!(
+        derive_auto_thread_name("<@42> help me fix this bug", bot_id),
+        "help me fix this bug"
+    );
+    assert_eq!(
+        derive_auto_thread_name("<@!42>   lots   of   spaces   here  ", bot_id),
+        "lots of spaces here"
+    );
+    assert_eq!(derive_auto_thread_name("<@42>", bot_id), "Conversation");
+    let long_prompt = format!("<@42> {}", "a".repeat(100));
+    let derived = derive_auto_thread_name(&long_prompt, bot_id);
+    assert_eq!(derived.chars().count(), 80);
+    assert!(derived.ends_with("..."));
 }
 
 #[test]

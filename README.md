@@ -209,6 +209,7 @@ launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 | `DISCORD_BOT_TOKENS` | Optional | Comma-separated tokens for Multi-Bot sharding |
 | `DISCORD_ALLOWED_USERS` | Optional | Allowed Discord user IDs (empty allows all) |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | Optional | Channels where the bot responds without @mention |
+| `DISCORD_AUTO_THREAD` | `false` | When true, @mentions in guild text channels auto-create a public thread and route responses there |
 | `DEFAULT_MODEL` | `gpt-4o` | Default LLM model identifier |
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | OpenAI-compatible endpoint URL |
 | `OPENAI_API_KEY` | Optional | OpenAI API key |
