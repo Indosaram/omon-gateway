@@ -134,6 +134,12 @@ impl TerminalTool {
         session: Option<&SessionKey>,
         command: &str,
     ) -> Result<(), OmonError> {
+        if let Some(reason) = crate::security::detect_hardline_command(command) {
+            return Err(OmonError::Approval(format!(
+                "BLOCKED (hardline): {reason}. This command is on the unconditional blocklist and cannot be executed."
+            )));
+        }
+
         let gated = match self.approval_policy {
             ApprovalPolicy::Never => false,
             ApprovalPolicy::Always => true,
@@ -438,10 +444,10 @@ mod approval_tests {
     }
 
     #[tokio::test]
-    async fn never_bypasses_approval_for_dangerous_command() {
+    async fn hardline_commands_are_rejected_even_under_never_policy() {
         let approver = Arc::new(StubApprover {
             requests: AtomicUsize::new(0),
-            result: Ok(ApprovalDecision::Rejected),
+            result: Ok(ApprovalDecision::Approved),
         });
         let tool = TerminalTool::new(std::env::temp_dir()).with_approval(
             ApprovalPolicy::Never,
@@ -449,12 +455,15 @@ mod approval_tests {
             Duration::from_secs(1),
         );
 
-        let result = tool
-            .execute_with_context(echo_args("rm -rf is only text"), Some(&session()))
+        let error = tool
+            .execute_with_context(
+                json!({"program": "rm", "args": ["-rf", "/"]}),
+                Some(&session()),
+            )
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert!(result["success"].as_bool().unwrap());
+        assert!(matches!(error, OmonError::Approval(msg) if msg.contains("BLOCKED (hardline)")));
         assert_eq!(approver.requests.load(Ordering::SeqCst), 0);
     }
 

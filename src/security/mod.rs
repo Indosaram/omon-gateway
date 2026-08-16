@@ -1,7 +1,9 @@
 pub mod dangerous;
+pub mod hardline;
 pub mod normalize;
 
 pub use dangerous::{detect_dangerous_command, is_dangerous, DangerousFinding};
+pub use hardline::{check_sudo_stdin_guard, detect_hardline_command};
 pub use normalize::normalize_command_for_detection;
 
 #[cfg(test)]
@@ -131,5 +133,35 @@ mod tests {
         assert!(!is_dangerous("cat /etc/hosts"));
         assert!(!is_dangerous("git status"));
         assert!(!is_dangerous("git log -n 5"));
+    }
+
+    #[test]
+    fn test_hardline_commands_and_sudo_guard() {
+        assert!(detect_hardline_command("rm -rf /").is_some());
+        assert!(detect_hardline_command("rm -rf /etc").is_some());
+        assert!(detect_hardline_command("rm -rf /bin").is_some());
+        assert!(detect_hardline_command("rm -rf /usr/*").is_some());
+        assert!(detect_hardline_command("rm -rf ~").is_some());
+        assert!(detect_hardline_command("rm -rf \"$HOME\"").is_some());
+        assert!(detect_hardline_command("mkfs.ext4 /dev/sda").is_some());
+        assert!(detect_hardline_command("dd if=/dev/zero of=/dev/sda").is_some());
+        assert!(detect_hardline_command("cat payload > /dev/sda").is_some());
+        assert!(detect_hardline_command(":(){ :|:& };:").is_some());
+        assert!(detect_hardline_command("kill -1").is_some());
+        assert!(detect_hardline_command("kill -9 -1").is_some());
+        assert!(detect_hardline_command("shutdown -h now").is_some());
+        assert!(detect_hardline_command("reboot").is_some());
+        assert!(detect_hardline_command("halt").is_some());
+        assert!(detect_hardline_command("init 0").is_some());
+        assert!(detect_hardline_command("init 6").is_some());
+        assert!(detect_hardline_command("systemctl poweroff").is_some());
+
+        // sudo -S guard
+        assert!(detect_hardline_command("sudo -S whoami").is_some());
+        assert!(check_sudo_stdin_guard("sudo -S id").is_some());
+
+        // Recoverable dangerous commands are NOT hardline (they require approval, but not hardline blocked)
+        assert!(detect_hardline_command("git reset --hard HEAD").is_none());
+        assert!(detect_hardline_command("rm -rf /tmp/my_dir").is_none());
     }
 }
