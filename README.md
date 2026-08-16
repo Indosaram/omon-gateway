@@ -215,6 +215,7 @@ launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 | `DISCORD_FREE_RESPONSE_CHANNELS` | Optional | Channels where the bot responds without @mention |
 | `DISCORD_AUTO_THREAD` | `false` | When true, @mentions in guild text channels auto-create a public thread and route responses there |
 | `DISCORD_THREAD_SESSIONS_PER_USER` | `true` | When false, all users in a thread share the same conversation session |
+| `DISCORD_THREAD_REQUIRE_MENTION` | `false` | When true, requires an @-mention to respond even in active bot threads |
 | `DISCORD_CHANNEL_CONTEXT` | `false` | When true, @mentions in guild channels backfill recent channel history as conversation context |
 | `DISCORD_CHANNEL_CONTEXT_LIMIT` | `10` | Maximum preceding messages to backfill when channel context is enabled (clamped to <= 25) |
 | `DISCORD_PROCESSING_REACTIONS` | `true` | When true, adds 👀 reaction when processing starts, swapping to ✅ on success or ❌ on failure |

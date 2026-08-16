@@ -682,6 +682,56 @@ fn every_explicitly_mentioned_bot_owns_exactly_its_target() {
 }
 
 #[test]
+fn test_thread_require_mention_option() {
+    let bot_id = UserId::new(42);
+    let thread_msg_unmentioned =
+        message_fixture(Some(9), "random server chatter in thread", Vec::new());
+    let thread_msg_mentioned = message_fixture(Some(9), "<@42> please help here", vec![42]);
+
+    // When thread_require_mention is true, even an active thread drops unmentioned messages
+    assert!(message_to_inbound_with_config(
+        &thread_msg_unmentioned,
+        bot_id,
+        Some(ChannelType::PublicThread),
+        &InboundFilterConfig {
+            active_threads: &[7],
+            primary_bot_id: Some(42),
+            thread_require_mention: true,
+            ..Default::default()
+        },
+    )
+    .is_none());
+
+    // When thread_require_mention is true, explicitly mentioned messages are processed
+    assert!(message_to_inbound_with_config(
+        &thread_msg_mentioned,
+        bot_id,
+        Some(ChannelType::PublicThread),
+        &InboundFilterConfig {
+            active_threads: &[7],
+            primary_bot_id: Some(42),
+            thread_require_mention: true,
+            ..Default::default()
+        },
+    )
+    .is_some());
+
+    // When thread_require_mention is false, unmentioned messages in active threads are processed
+    assert!(message_to_inbound_with_config(
+        &thread_msg_unmentioned,
+        bot_id,
+        Some(ChannelType::PublicThread),
+        &InboundFilterConfig {
+            active_threads: &[7],
+            primary_bot_id: Some(42),
+            thread_require_mention: false,
+            ..Default::default()
+        },
+    )
+    .is_some());
+}
+
+#[test]
 fn scoped_thread_participation_gates_unmentioned_and_allows_mentioned() {
     let bot_id = UserId::new(42);
     let thread_msg_unmentioned =

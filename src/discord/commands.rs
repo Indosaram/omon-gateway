@@ -31,6 +31,7 @@ pub struct PoiseData {
     /// Thread IDs the bot is actively participating in (created or @mentioned).
     /// Kept in-memory: fast, zero-overhead, sufficient for active gateway runtime lifecycle.
     pub active_threads: Arc<RwLock<HashSet<u64>>>,
+    pub thread_require_mention: bool,
     pub auto_thread: bool,
     pub channel_context: bool,
     pub channel_context_limit: usize,
@@ -71,6 +72,7 @@ impl PoiseData {
             allowed_channels: Vec::new(),
             ignored_channels: Vec::new(),
             active_threads: Arc::new(RwLock::new(HashSet::new())),
+            thread_require_mention: false,
             auto_thread: false,
             channel_context: false,
             channel_context_limit: 10,

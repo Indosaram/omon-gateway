@@ -325,6 +325,7 @@ pub struct InboundFilterConfig<'a> {
     pub allowed_channels: &'a [u64],
     pub ignored_channels: &'a [u64],
     pub primary_bot_id: Option<u64>,
+    pub thread_require_mention: bool,
 }
 
 impl Default for InboundFilterConfig<'_> {
@@ -340,6 +341,7 @@ impl Default for InboundFilterConfig<'_> {
             allowed_channels: &[],
             ignored_channels: &[],
             primary_bot_id: None,
+            thread_require_mention: false,
         }
     }
 }
@@ -597,6 +599,7 @@ impl DiscordAdapter {
             allowed_channels: &self.data.allowed_channels,
             ignored_channels: &self.data.ignored_channels,
             primary_bot_id: self.data.primary_bot_id,
+            thread_require_mention: self.data.thread_require_mention,
         };
         let Some(event) =
             message_to_inbound_with_config(message, bot_user_id, channel_type, &config)
@@ -673,6 +676,7 @@ async fn handle_event(
                 allowed_channels: &data.allowed_channels,
                 ignored_channels: &data.ignored_channels,
                 primary_bot_id: data.primary_bot_id,
+                thread_require_mention: data.thread_require_mention,
             };
             if let Some(mut event) =
                 message_to_inbound_with_config(new_message, bot_user_id, channel_type, &config)
@@ -962,8 +966,9 @@ pub fn message_to_inbound_with_config(
             return None;
         }
     } else {
-        let is_active_thread =
-            is_thread && config.active_threads.contains(&message.channel_id.get());
+        let is_active_thread = is_thread
+            && !config.thread_require_mention
+            && config.active_threads.contains(&message.channel_id.get());
         let is_implicit_response_channel = is_dm || is_active_thread || is_free_channel;
         if !is_implicit_response_channel {
             return None;

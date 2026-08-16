@@ -371,6 +371,7 @@ struct Config {
     allowed_roles: Vec<u64>,
     allow_all_users: bool,
     thread_sessions_per_user: bool,
+    thread_require_mention: bool,
     allowed_channels: Vec<u64>,
     ignored_channels: Vec<u64>,
     auto_thread: bool,
@@ -418,6 +419,10 @@ impl Config {
         let thread_sessions_per_user = parse_bool_from(
             optional_env("DISCORD_THREAD_SESSIONS_PER_USER").as_deref(),
             true,
+        );
+        let thread_require_mention = parse_bool_from(
+            optional_env("DISCORD_THREAD_REQUIRE_MENTION").as_deref(),
+            false,
         );
         let allowed_channels = parse_u64_list(optional_env("DISCORD_ALLOWED_CHANNELS").as_deref());
         let ignored_channels = parse_u64_list(optional_env("DISCORD_IGNORED_CHANNELS").as_deref());
@@ -470,6 +475,7 @@ impl Config {
             allowed_roles,
             allow_all_users,
             thread_sessions_per_user,
+            thread_require_mention,
             allowed_channels,
             ignored_channels,
             auto_thread: parse_bool_from(optional_env("DISCORD_AUTO_THREAD").as_deref(), false),
@@ -2255,6 +2261,7 @@ async fn run_gateway() -> Result<()> {
     poise_data.allowed_roles = config.allowed_roles.clone();
     poise_data.allow_all_users = config.allow_all_users;
     poise_data.thread_sessions_per_user = config.thread_sessions_per_user;
+    poise_data.thread_require_mention = config.thread_require_mention;
     poise_data.allowed_channels = config.allowed_channels.clone();
     poise_data.ignored_channels = config.ignored_channels.clone();
     poise_data.auto_thread = config.auto_thread;
