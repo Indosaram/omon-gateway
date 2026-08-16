@@ -395,7 +395,7 @@ fn test_approval_buttons_and_parse_custom_id() {
     );
     assert_eq!(
         parse_custom_id(&format!("omon:approval:{request_id}:deny")),
-        Some((request_id, ApprovalDecision::Deny))
+        Some((request_id, ApprovalDecision::Deny { reason: None }))
     );
 }
 
@@ -467,7 +467,7 @@ async fn approval_guard_resolves_all_four_buttons_and_times_out() {
     );
     assert_eq!(
         deny_prompt.wait(Duration::from_secs(60)).await,
-        Ok(ApprovalDecision::Deny)
+        Ok(ApprovalDecision::Deny { reason: None })
     );
 
     // 5. Legacy aliases
@@ -492,7 +492,7 @@ async fn approval_guard_resolves_all_four_buttons_and_times_out() {
     );
     assert_eq!(
         legacy_rej.wait(Duration::from_secs(60)).await,
-        Ok(ApprovalDecision::Deny)
+        Ok(ApprovalDecision::Deny { reason: None })
     );
 
     // 6. Timeout

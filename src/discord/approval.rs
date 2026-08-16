@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{OutboundAction, OutboundDispatcher, SessionKey};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     #[serde(alias = "approved")]
@@ -19,12 +19,19 @@ pub enum ApprovalDecision {
     Session,
     Always,
     #[serde(alias = "rejected")]
-    Deny,
+    Deny {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 impl ApprovalDecision {
     pub fn is_approved(&self) -> bool {
         matches!(self, Self::Once | Self::Session | Self::Always)
+    }
+
+    pub fn deny(reason: Option<String>) -> Self {
+        Self::Deny { reason }
     }
 }
 
@@ -53,11 +60,17 @@ impl ApprovalPrompt {
     }
 }
 
+struct PendingApprovalEntry {
+    session: Option<SessionKey>,
+    sender: oneshot::Sender<ApprovalDecision>,
+    created_at: std::time::Instant,
+}
+
 /// Tracks pending approval requests, resolves Discord button interactions
 /// through a one-shot channel, and maintains per-session and global approval caches.
 #[derive(Clone, Default)]
 pub struct SmartApprovalGuard {
-    pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<ApprovalDecision>>>>,
+    pending: Arc<Mutex<HashMap<Uuid, PendingApprovalEntry>>>,
     session_cache: Arc<RwLock<HashMap<SessionKey, HashSet<String>>>>,
     always_cache: Arc<RwLock<HashSet<String>>>,
 }
@@ -116,7 +129,7 @@ impl ApprovalRequester for DiscordApprovalRequester {
             .await
             .clone()
             .ok_or(ApprovalError::Cancelled)?;
-        let prompt = self.guard.request().await;
+        let prompt = self.guard.request_with_session(Some(session.clone())).await;
         let request_id = prompt.request_id;
         if dispatcher
             .dispatch(OutboundAction::ApprovalRequest {
@@ -187,9 +200,20 @@ impl SmartApprovalGuard {
     }
 
     pub async fn request(&self) -> ApprovalPrompt {
+        self.request_with_session(None).await
+    }
+
+    pub async fn request_with_session(&self, session: Option<SessionKey>) -> ApprovalPrompt {
         let request_id = Uuid::new_v4();
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(request_id, sender);
+        self.pending.lock().await.insert(
+            request_id,
+            PendingApprovalEntry {
+                session,
+                sender,
+                created_at: std::time::Instant::now(),
+            },
+        );
         ApprovalPrompt {
             request_id,
             components: approval_buttons(request_id),
@@ -201,10 +225,48 @@ impl SmartApprovalGuard {
         let Some((request_id, decision)) = parse_custom_id(custom_id) else {
             return false;
         };
-        let Some(sender) = self.pending.lock().await.remove(&request_id) else {
+        let Some(entry) = self.pending.lock().await.remove(&request_id) else {
             return false;
         };
-        sender.send(decision).is_ok()
+        entry.sender.send(decision).is_ok()
+    }
+
+    pub async fn resolve_session_deny(&self, session: &SessionKey, reason: Option<String>) -> bool {
+        let mut lock = self.pending.lock().await;
+        let target = lock
+            .iter()
+            .filter(|(_, entry)| {
+                if let Some(s) = &entry.session {
+                    s == session
+                        || (s.platform == session.platform
+                            && s.channel_id == session.channel_id
+                            && s.thread_id == session.thread_id)
+                } else {
+                    false
+                }
+            })
+            .max_by_key(|(_, entry)| entry.created_at)
+            .map(|(id, _)| *id);
+
+        let target_id = target.or_else(|| {
+            lock.iter()
+                .filter(|(_, entry)| {
+                    if let Some(s) = &entry.session {
+                        s.channel_id == session.channel_id
+                    } else {
+                        false
+                    }
+                })
+                .max_by_key(|(_, entry)| entry.created_at)
+                .map(|(id, _)| *id)
+        });
+
+        if let Some(request_id) = target_id {
+            if let Some(entry) = lock.remove(&request_id) {
+                return entry.sender.send(ApprovalDecision::Deny { reason }).is_ok();
+            }
+        }
+        false
     }
 
     pub async fn cancel(&self, request_id: Uuid) {
@@ -247,7 +309,7 @@ pub fn parse_custom_id(custom_id: &str) -> Option<(Uuid, ApprovalDecision)> {
         "once" | "approve" => ApprovalDecision::Once,
         "session" => ApprovalDecision::Session,
         "always" => ApprovalDecision::Always,
-        "deny" | "reject" => ApprovalDecision::Deny,
+        "deny" | "reject" => ApprovalDecision::Deny { reason: None },
         _ => return None,
     };
     if parts.next().is_some() {
@@ -301,7 +363,7 @@ mod tests {
         );
         assert_eq!(
             parse_custom_id(&format!("omon:approval:{id}:deny")),
-            Some((id, ApprovalDecision::Deny))
+            Some((id, ApprovalDecision::Deny { reason: None }))
         );
         assert_eq!(
             parse_custom_id(&format!("omon:approval:{id}:approve")),
@@ -309,7 +371,7 @@ mod tests {
         );
         assert_eq!(
             parse_custom_id(&format!("omon:approval:{id}:reject")),
-            Some((id, ApprovalDecision::Deny))
+            Some((id, ApprovalDecision::Deny { reason: None }))
         );
     }
 
@@ -383,5 +445,22 @@ mod tests {
 
         assert!(guard.is_approved(&session_a, pattern).await);
         assert!(guard.is_approved(&session_b, pattern).await);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_session_deny_with_reason() {
+        let guard = SmartApprovalGuard::new();
+        let session = SessionKey::new("discord", None::<String>, "chan1", None::<String>, "user1");
+
+        let prompt = guard.request_with_session(Some(session.clone())).await;
+
+        let reason = Some("unsafe directory operation".to_string());
+        assert!(guard.resolve_session_deny(&session, reason.clone()).await);
+
+        let decision = prompt.wait(Duration::from_millis(50)).await.unwrap();
+        assert_eq!(decision, ApprovalDecision::Deny { reason });
+
+        // Subsequent resolve fails
+        assert!(!guard.resolve_session_deny(&session, None).await);
     }
 }

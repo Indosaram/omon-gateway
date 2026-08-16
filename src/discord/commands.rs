@@ -124,6 +124,7 @@ pub fn all() -> Vec<poise::Command<PoiseData, CommandError>> {
         compress(),
         title(),
         thread(),
+        deny(),
     ]
 }
 
@@ -759,6 +760,37 @@ pub async fn thread(
     Ok(())
 }
 
+#[poise::command(slash_command)]
+/// Deny a pending dangerous command approval with an optional reason.
+pub async fn deny(
+    ctx: PoiseContext<'_>,
+    #[description = "Optional reason explaining why the command was denied"] reason: Option<String>,
+) -> Result<(), CommandError> {
+    let key = session_key(ctx).await?;
+    let resolved = ctx
+        .data()
+        .approvals
+        .resolve_session_deny(&key, reason.clone())
+        .await;
+    if resolved {
+        let msg = match reason {
+            Some(r) if !r.trim().is_empty() => {
+                format!("❌ Denied pending command approval: `{}`", r.trim())
+            }
+            _ => "❌ Denied pending command approval.".to_string(),
+        };
+        ctx.say(msg).await?;
+    } else {
+        ctx.send(
+            poise::CreateReply::default()
+                .content("No pending approval found to deny.")
+                .ephemeral(true),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub fn format_steer_prompt(text: &str) -> String {
     format!("[Steering] {}", text.trim())
 }
@@ -867,11 +899,11 @@ mod tests {
     #[test]
     fn test_all_commands_count() {
         let commands = all();
-        assert_eq!(commands.len(), 13);
+        assert_eq!(commands.len(), 14);
         let names: HashSet<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         for expected in &[
             "model", "reset", "stop", "status", "tools", "skill", "cron", "steer", "undo", "retry",
-            "compress", "title", "thread",
+            "compress", "title", "thread", "deny",
         ] {
             assert!(names.contains(expected), "missing command {expected}");
         }

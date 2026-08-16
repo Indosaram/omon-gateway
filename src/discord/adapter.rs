@@ -721,7 +721,7 @@ async fn handle_event(
                             ApprovalDecision::Once => "Approved (once)",
                             ApprovalDecision::Session => "Approved (session)",
                             ApprovalDecision::Always => "Approved (always)",
-                            ApprovalDecision::Deny => "Denied",
+                            ApprovalDecision::Deny { .. } => "Denied",
                         };
                         let user_name = &component.user.name;
                         CreateInteractionResponse::UpdateMessage(
