@@ -370,7 +370,7 @@ impl HermesStoreSynchronizer {
                     .unwrap_or_else(Utc::now);
                 let now = Utc::now();
                 sqlx::query(
-                    "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)\n                     VALUES (?, ?, ?, ?, ?, ?, ?)\n                     ON CONFLICT(id) DO UPDATE SET\n                     expression=excluded.expression,\n                     payload_json=excluded.payload_json,\n                     enabled=CASE\n                         WHEN cron_jobs.expression LIKE 'once:%' AND cron_jobs.next_run_at IS NULL\n                         THEN cron_jobs.enabled\n                         ELSE excluded.enabled\n                     END,\n                     next_run_at=CASE\n                         WHEN cron_jobs.expression LIKE 'once:%' AND cron_jobs.next_run_at IS NULL\n                         THEN NULL\n                         WHEN cron_jobs.expression <> excluded.expression\n                           OR cron_jobs.payload_json <> excluded.payload_json\n                           OR cron_jobs.enabled <> excluded.enabled\n                         THEN excluded.next_run_at\n                         ELSE cron_jobs.next_run_at\n                     END,\n                     updated_at=excluded.updated_at"
+                    "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)\n                     VALUES (?, ?, ?, ?, ?, ?, ?)\n                     ON CONFLICT(id) DO UPDATE SET\n                     expression=excluded.expression,\n                     payload_json=CASE\n                         WHEN json_extract(cron_jobs.payload_json, '$.repeat.completed') IS NOT NULL\n                              AND CAST(json_extract(cron_jobs.payload_json, '$.repeat.completed') AS INTEGER) > CAST(COALESCE(json_extract(excluded.payload_json, '$.repeat.completed'), 0) AS INTEGER)\n                         THEN json_set(excluded.payload_json, '$.repeat.completed', CAST(json_extract(cron_jobs.payload_json, '$.repeat.completed') AS INTEGER))\n                         ELSE excluded.payload_json\n                     END,\n                     enabled=CASE\n                         WHEN cron_jobs.expression LIKE 'once:%' AND cron_jobs.next_run_at IS NULL\n                         THEN cron_jobs.enabled\n                         WHEN json_extract(cron_jobs.payload_json, '$.repeat.times') IS NOT NULL\n                              AND CAST(json_extract(cron_jobs.payload_json, '$.repeat.times') AS INTEGER) > 0\n                              AND CAST(json_extract(cron_jobs.payload_json, '$.repeat.completed') AS INTEGER) >= CAST(json_extract(cron_jobs.payload_json, '$.repeat.times') AS INTEGER)\n                              AND cron_jobs.next_run_at IS NULL\n                         THEN cron_jobs.enabled\n                         ELSE excluded.enabled\n                     END,\n                     next_run_at=CASE\n                         WHEN cron_jobs.expression LIKE 'once:%' AND cron_jobs.next_run_at IS NULL\n                         THEN NULL\n                         WHEN json_extract(cron_jobs.payload_json, '$.repeat.times') IS NOT NULL\n                              AND CAST(json_extract(cron_jobs.payload_json, '$.repeat.times') AS INTEGER) > 0\n                              AND CAST(json_extract(cron_jobs.payload_json, '$.repeat.completed') AS INTEGER) >= CAST(json_extract(cron_jobs.payload_json, '$.repeat.times') AS INTEGER)\n                              AND cron_jobs.next_run_at IS NULL\n                         THEN NULL\n                         WHEN cron_jobs.expression <> excluded.expression\n                           OR json_remove(cron_jobs.payload_json, '$.repeat.completed') <> json_remove(excluded.payload_json, '$.repeat.completed')\n                           OR cron_jobs.enabled <> excluded.enabled\n                         THEN excluded.next_run_at\n                         ELSE cron_jobs.next_run_at\n                     END,\n                     updated_at=excluded.updated_at"
                 )
                 .bind(&id).bind(expression).bind(payload_json).bind(job.enabled)
                 .bind(next_run_at).bind(created).bind(now).execute(&self.pool).await?;
@@ -587,6 +587,58 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(actual, advanced);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronization_does_not_rearm_completed_repeat_times() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let root =
+            std::env::temp_dir().join(format!("omon-hermes-repeat-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(root.join("cron")).await.unwrap();
+        tokio::fs::write(
+            root.join("cron/jobs.json"),
+            serde_json::to_vec(&json!({"jobs": [{
+                "id": "repeat_job", "prompt": "run", "enabled": true,
+                "schedule": {"kind": "interval", "minutes": 5},
+                "repeat": {"times": 2, "completed": 0},
+                "deliver": "local"
+            }]}))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let sync = HermesStoreSynchronizer::new(
+            database.pool().clone(),
+            vec![HermesStore::new("default", &root)],
+        );
+        sync.sync().await.unwrap();
+
+        // Simulate scheduler completing 2 runs and disabling job
+        sqlx::query(
+            "UPDATE cron_jobs SET enabled = 0, next_run_at = NULL, payload_json = json_set(payload_json, '$.repeat.completed', 2) WHERE id = 'hermes:default:repeat_job'",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        // Sync again from jobs.json (which still has completed: 0)
+        sync.sync().await.unwrap();
+
+        let state: (bool, Option<DateTime<Utc>>, String) = sqlx::query_as(
+            "SELECT enabled, next_run_at, payload_json FROM cron_jobs WHERE id = 'hermes:default:repeat_job'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            !state.0,
+            "Job must remain disabled after repeat.times limit was reached"
+        );
+        assert_eq!(state.1, None, "Disabled job must not have next_run_at");
+        let payload: Value = serde_json::from_str(&state.2).unwrap();
+        assert_eq!(payload["repeat"]["completed"], 2);
+
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

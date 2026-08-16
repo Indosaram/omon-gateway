@@ -2,7 +2,8 @@ mod scheduler;
 mod store;
 
 pub use scheduler::{
-    failure_backoff_duration, is_cron_silence_response, next_run, next_run_after_failure, CronJob,
+    extract_repeat_info, failure_backoff_duration, increment_repeat_completed,
+    is_cron_silence_response, next_run, next_run_after_failure, should_disable_after, CronJob,
     CronJobSpec, CronNotification, CronScheduler, CronTaskExecutor, PayloadTaskExecutor,
     ShellAndPayloadTaskExecutor, MAX_RETRY_INTERVAL, MIN_RETRY_INTERVAL,
 };

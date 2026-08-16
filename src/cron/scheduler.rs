@@ -62,6 +62,54 @@ pub fn is_cron_silence_response(text: &str) -> bool {
     false
 }
 
+pub fn should_disable_after(completed: u64, times: Option<u64>) -> bool {
+    match times {
+        Some(limit) if limit > 0 => completed >= limit,
+        _ => false,
+    }
+}
+
+pub fn extract_repeat_info(payload: &Value) -> (Option<u64>, u64) {
+    if let Some(repeat) = payload.get("repeat") {
+        let times = repeat.get("times").and_then(Value::as_u64);
+        let completed = repeat.get("completed").and_then(Value::as_u64).unwrap_or(0);
+        return (times, completed);
+    }
+    let times = payload.get("times").and_then(Value::as_u64);
+    let completed = payload
+        .get("completed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    (times, completed)
+}
+
+pub fn increment_repeat_completed(payload: &mut Value) -> (Option<u64>, u64) {
+    if let Some(repeat) = payload.get_mut("repeat") {
+        if let Some(obj) = repeat.as_object_mut() {
+            let times = obj.get("times").and_then(Value::as_u64);
+            let completed = obj.get("completed").and_then(Value::as_u64).unwrap_or(0) + 1;
+            obj.insert("completed".to_string(), Value::from(completed));
+            return (times, completed);
+        }
+    }
+    let times = payload.get("times").and_then(Value::as_u64);
+    let completed = payload
+        .get("completed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        + 1;
+    if let Some(obj) = payload.as_object_mut() {
+        if times.is_some() {
+            obj.insert("completed".to_string(), Value::from(completed));
+        } else {
+            let mut repeat_obj = serde_json::Map::new();
+            repeat_obj.insert("completed".to_string(), Value::from(completed));
+            obj.insert("repeat".to_string(), Value::Object(repeat_obj));
+        }
+    }
+    (times, completed)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CronJobSpec {
     pub expression: String,
@@ -628,13 +676,21 @@ impl CronScheduler {
             )));
         }
 
+        let mut payload: Value =
+            serde_json::from_str(&claim.job.payload_json).unwrap_or_else(|_| serde_json::json!({}));
+        let (times, completed_count) = increment_repeat_completed(&mut payload);
+        let updated_payload_json =
+            serde_json::to_string(&payload).unwrap_or_else(|_| claim.job.payload_json.clone());
+        let limit_reached = should_disable_after(completed_count, times);
+
         if claim.advance_schedule {
-            if claim.job.expression.starts_with("once:") {
+            if claim.job.expression.starts_with("once:") || limit_reached {
                 sqlx::query(
                     "UPDATE cron_jobs
-                     SET enabled = 0, next_run_at = NULL, updated_at = ?
+                     SET enabled = 0, next_run_at = NULL, payload_json = ?, updated_at = ?
                      WHERE id = ? AND expression = ? AND payload_json = ?",
                 )
+                .bind(&updated_payload_json)
                 .bind(now)
                 .bind(&claim.job.id)
                 .bind(&claim.job.expression)
@@ -645,10 +701,11 @@ impl CronScheduler {
                 let next = next_run(&claim.job.expression, now)?;
                 sqlx::query(
                     "UPDATE cron_jobs
-                     SET next_run_at = ?, updated_at = ?
+                     SET next_run_at = ?, payload_json = ?, updated_at = ?
                      WHERE id = ? AND enabled = 1 AND expression = ? AND payload_json = ?",
                 )
                 .bind(next)
+                .bind(&updated_payload_json)
                 .bind(now)
                 .bind(&claim.job.id)
                 .bind(&claim.job.expression)
@@ -656,6 +713,19 @@ impl CronScheduler {
                 .execute(&mut *transaction)
                 .await?;
             }
+        } else {
+            sqlx::query(
+                "UPDATE cron_jobs
+                 SET payload_json = ?, updated_at = ?
+                 WHERE id = ? AND expression = ? AND payload_json = ?",
+            )
+            .bind(&updated_payload_json)
+            .bind(now)
+            .bind(&claim.job.id)
+            .bind(&claim.job.expression)
+            .bind(&claim.job.payload_json)
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.wake.notify_one();
@@ -1125,5 +1195,96 @@ mod tests {
         active_scheduler.execute_job(&job).await.unwrap();
         let note = active_notifications.try_recv().unwrap();
         assert_eq!(note.content, "Report content");
+    }
+
+    #[test]
+    fn test_should_disable_after() {
+        assert!(!should_disable_after(0, Some(2)));
+        assert!(!should_disable_after(1, Some(2)));
+        assert!(should_disable_after(2, Some(2)));
+        assert!(should_disable_after(3, Some(2)));
+        assert!(!should_disable_after(5, None));
+        assert!(!should_disable_after(5, Some(0)));
+    }
+
+    #[test]
+    fn test_increment_repeat_completed() {
+        let mut payload = serde_json::json!({
+            "repeat": {
+                "times": 3,
+                "completed": 1
+            }
+        });
+        let (times, completed) = increment_repeat_completed(&mut payload);
+        assert_eq!(times, Some(3));
+        assert_eq!(completed, 2);
+        assert_eq!(payload["repeat"]["completed"], 2);
+
+        let mut payload_flat = serde_json::json!({
+            "times": 2
+        });
+        let (times, completed) = increment_repeat_completed(&mut payload_flat);
+        assert_eq!(times, Some(2));
+        assert_eq!(completed, 1);
+        assert_eq!(payload_flat["completed"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_repeat_times_disables_job_after_limit_reached() {
+        let database = crate::Database::connect("sqlite::memory:").await.unwrap();
+        let scheduler = CronScheduler::new(
+            database.pool().clone(),
+            Arc::new(SilentExecutor(Some("Run ok".into()))),
+        );
+
+        let job = scheduler
+            .register(CronJobSpec::new(
+                "interval:1m",
+                serde_json::json!({
+                    "channel_id": "123",
+                    "repeat": {
+                        "times": 2,
+                        "completed": 0
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        // 1. Run 1: claim, complete_success
+        let claim1 = scheduler
+            .claim_job(&job.id, false, true)
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler.complete_success(&claim1).await.unwrap();
+
+        let job_after_1 = scheduler.get(&job.id).await.unwrap().unwrap();
+        assert!(job_after_1.enabled);
+        assert!(job_after_1.next_run_at.is_some());
+        let (times1, comp1) = extract_repeat_info(&job_after_1.payload().unwrap());
+        assert_eq!(times1, Some(2));
+        assert_eq!(comp1, 1);
+
+        // 2. Run 2 (reaches limit of 2): claim, complete_success
+        let claim2 = scheduler
+            .claim_job(&job.id, false, true)
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler.complete_success(&claim2).await.unwrap();
+
+        let job_after_2 = scheduler.get(&job.id).await.unwrap().unwrap();
+        assert!(
+            !job_after_2.enabled,
+            "Job must be disabled after hitting repeat.times limit"
+        );
+        assert!(
+            job_after_2.next_run_at.is_none(),
+            "Disabled job must clear next_run_at"
+        );
+        let (times2, comp2) = extract_repeat_info(&job_after_2.payload().unwrap());
+        assert_eq!(times2, Some(2));
+        assert_eq!(comp2, 2);
     }
 }
