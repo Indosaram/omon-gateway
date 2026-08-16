@@ -206,6 +206,70 @@ pub fn derive_auto_thread_name(content: &str, bot_user_id: serenity::UserId) -> 
     }
 }
 
+/// Formats a compact runtime metadata footer line: `model · context% · cwd`.
+/// Missing or empty fields are skipped silently.
+pub fn format_runtime_footer(
+    model: Option<&str>,
+    context_percent: Option<u8>,
+    cwd: Option<&Path>,
+) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(m) = model {
+        let trimmed = m.trim();
+        if !trimmed.is_empty() {
+            let short_model = trimmed.rsplit('/').next().unwrap_or(trimmed);
+            parts.push(short_model.to_string());
+        }
+    }
+
+    if let Some(pct) = context_percent {
+        let clamped = pct.min(100);
+        parts.push(format!("{clamped}%"));
+    }
+
+    if let Some(path) = cwd {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let path_str = if let Some(home_path) = home {
+            if let Ok(rel) = path.strip_prefix(&home_path) {
+                format!("~/{}", rel.display())
+            } else {
+                path.display().to_string()
+            }
+        } else {
+            path.display().to_string()
+        };
+        let trimmed = path_str.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Appends a runtime metadata footer to message content if footer is non-empty.
+pub fn append_runtime_footer(
+    content: &str,
+    model: Option<&str>,
+    context_percent: Option<u8>,
+    cwd: Option<&Path>,
+) -> String {
+    let footer = format_runtime_footer(model, context_percent, cwd);
+    if footer.is_empty() {
+        return content.to_string();
+    }
+    if content.trim().is_empty() {
+        footer
+    } else {
+        format!("{content}\n\n_{footer}_")
+    }
+}
+
 static MENTION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<@!?[0-9]+>|<#[0-9]+>|<@&[0-9]+>").expect("valid mention regex"));
 
@@ -1928,6 +1992,28 @@ mod tests {
 
     fn test_session(name: &str) -> SessionKey {
         SessionKey::new("discord", Some("guild"), "channel", None::<String>, name)
+    }
+
+    #[test]
+    fn test_format_runtime_footer_and_append() {
+        let cwd = Path::new("/tmp/test_workspace");
+        let footer = format_runtime_footer(Some("openai/gpt-4o"), Some(45), Some(cwd));
+        assert_eq!(footer, "gpt-4o · 45% · /tmp/test_workspace");
+
+        let app = append_runtime_footer("Answer text", Some("gpt-4o"), Some(45), Some(cwd));
+        assert_eq!(app, "Answer text\n\n_gpt-4o · 45% · /tmp/test_workspace_");
+
+        // Skips missing fields
+        let partial = format_runtime_footer(Some("claude-3-5-sonnet"), None, None);
+        assert_eq!(partial, "claude-3-5-sonnet");
+
+        // Clamps percentage
+        let clamped = format_runtime_footer(None, Some(150), None);
+        assert_eq!(clamped, "100%");
+
+        // Empty footer on no fields
+        assert_eq!(format_runtime_footer(None, None, None), "");
+        assert_eq!(append_runtime_footer("Plain", None, None, None), "Plain");
     }
 
     #[test]

@@ -382,6 +382,7 @@ struct Config {
     approval_mentions: bool,
     approvals_deny: Vec<String>,
     profile_routes: Vec<ProfileRoute>,
+    runtime_footer: bool,
 }
 
 impl Config {
@@ -505,6 +506,10 @@ impl Config {
             profile_routes: parse_profile_routes(
                 &optional_env("DISCORD_PROFILE_ROUTES").unwrap_or_default(),
             ),
+            runtime_footer: parse_bool_from(
+                optional_env("DISCORD_RUNTIME_FOOTER").as_deref(),
+                false,
+            ),
         })
     }
 
@@ -567,6 +572,7 @@ struct LiveAgentRunner {
     workspace_root: PathBuf,
     streams: ParkingMutex<HashMap<String, StreamEmissionState>>,
     processing_reactions: bool,
+    runtime_footer: bool,
 }
 
 impl LiveAgentRunner {
@@ -866,13 +872,35 @@ impl LiveAgentRunner {
                         return Ok(response);
                     }
 
+                    let final_text = if self.runtime_footer {
+                        let active_model = session
+                            .state
+                            .active_model
+                            .as_deref()
+                            .or(Some(llm.config().model.as_str()));
+                        let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
+                        let approx_tokens = total_chars / 4;
+                        let context_limit = 128_000usize;
+                        let pct = ((approx_tokens as f64 / context_limit as f64) * 100.0)
+                            .round()
+                            .min(100.0) as u8;
+                        omon_gateway::append_runtime_footer(
+                            &stripped_text,
+                            active_model,
+                            Some(pct),
+                            Some(&self.workspace_root),
+                        )
+                    } else {
+                        stripped_text
+                    };
+
                     if stream_output {
-                        self.emit_final(session, stripped_text).await?;
-                    } else if !stripped_text.trim().is_empty() {
+                        self.emit_final(session, final_text).await?;
+                    } else if !final_text.trim().is_empty() {
                         self.dispatcher
                             .dispatch(OutboundAction::SendMessage {
                                 session: session.key.clone(),
-                                content: stripped_text,
+                                content: final_text,
                                 reply_to: None,
                             })
                             .await?;
@@ -2134,6 +2162,7 @@ async fn run_gateway() -> Result<()> {
         workspace_root: config.workspace_root.clone(),
         streams: ParkingMutex::new(HashMap::new()),
         processing_reactions: config.processing_reactions,
+        runtime_footer: config.runtime_footer,
     });
     let profile_router = ProfileRouter::new(config.profile_routes.clone());
     let multiplexer = SessionMultiplexer::with_profile_router(
@@ -2536,6 +2565,7 @@ mod runner_tests {
             workspace_root: temp_dir.path().to_path_buf(),
             streams: parking_lot::Mutex::new(std::collections::HashMap::new()),
             processing_reactions: true,
+            runtime_footer: false,
         };
         (runner, temp_dir)
     }

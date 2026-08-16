@@ -219,6 +219,7 @@ launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 | `DISCORD_CHANNEL_CONTEXT_LIMIT` | `10` | Maximum preceding messages to backfill when channel context is enabled (clamped to <= 25) |
 | `DISCORD_PROCESSING_REACTIONS` | `true` | When true, adds 👀 reaction when processing starts, swapping to ✅ on success or ❌ on failure |
 | `DISCORD_CHUNK_PAGINATION` | `true` | When true, adds (i/N) pagination indicator headers to messages split across multiple chunks |
+| `DISCORD_RUNTIME_FOOTER` | `false` | When true, appends a compact runtime metadata footer (`model · context% · cwd`) to the final assistant message |
 | `DISCORD_PROFILE_ROUTES` | Optional | JSON array of hierarchical profile routing rules mapping `(guild, channel, thread)` to custom models, prompts, and toolsets |
 | `DEFAULT_MODEL` | `gpt-4o` | Default LLM model identifier |
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | OpenAI-compatible endpoint URL |
