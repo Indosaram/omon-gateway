@@ -333,132 +333,149 @@ impl LiveAgentRunner {
                 .dispatcher
                 .dispatch(OutboundAction::Typing {
                     session: session.key.clone(),
+                    active: true,
                 })
                 .await;
         }
-        info!(session = %session.key, user = %event.session.user_id, content = %event.content, "Starting agent execution for message");
-        let mut messages = self.messages(session, &event).await?;
-        let mut user_content = render_user_prompt(&event);
-        let lower = user_content.to_lowercase();
-        let is_ulw = lower.contains("ulw")
-            || lower.contains("ultrawork")
-            || lower.contains("울트라워크")
-            || lower.contains("/ulw");
 
-        if is_ulw {
-            let ulw_directive = "\n\n<ultrawork-mode>\n\
-                **MANDATORY**: First user-visible line this turn MUST be exactly:\n\
-                `ULTRAWORK MODE ENABLED!`\n\n\
-                [CODE RED] Maximum precision. Outcome-first. Evidence-driven.\n\
-                - Decompose work into systematic, evidence-bound steps.\n\
-                - Actively use available tools (terminal, file, web_search, browser, mcp, skills) to inspect, execute, and verify.\n\
-                - Never claim completion without executing and verifying real artifacts.\n\
-                </ultrawork-mode>";
-            user_content = format!("{}{}", user_content, ulw_directive);
-        }
+        let outcome: Result<String> = async {
+            info!(session = %session.key, user = %event.session.user_id, content = %event.content, "Starting agent execution for message");
+            let mut messages = self.messages(session, &event).await?;
+            let mut user_content = render_user_prompt(&event);
+            let lower = user_content.to_lowercase();
+            let is_ulw = lower.contains("ulw")
+                || lower.contains("ultrawork")
+                || lower.contains("울트라워크")
+                || lower.contains("/ulw");
 
-        let attachments = event.attachments.clone();
-        if let Some(message) = messages
-            .iter_mut()
-            .rev()
-            .find(|message| message.role == "user" && message.content == user_content)
-        {
-            message.attachments = attachments;
-        } else {
-            messages.push(ChatMessage::new("user", &user_content).with_attachments(attachments));
-        }
-        ensure_agent_session(&self.pool, session).await?;
-        let tools = execution_tools.unwrap_or(&self.tools);
-        let definitions = Self::tool_definitions(tools, enabled_tools);
-        let llm = match session.state.active_model.as_deref() {
-            Some(model) if model != self.llm.config().model => {
-                let mut config = self.llm.config().clone();
-                config.model = model.to_owned();
-                LlmClient::new(config)?
+            if is_ulw {
+                let ulw_directive = "\n\n<ultrawork-mode>\n\
+                    **MANDATORY**: First user-visible line this turn MUST be exactly:\n\
+                    `ULTRAWORK MODE ENABLED!`\n\n\
+                    [CODE RED] Maximum precision. Outcome-first. Evidence-driven.\n\
+                    - Decompose work into systematic, evidence-bound steps.\n\
+                    - Actively use available tools (terminal, file, web_search, browser, mcp, skills) to inspect, execute, and verify.\n\
+                    - Never claim completion without executing and verifying real artifacts.\n\
+                    </ultrawork-mode>";
+                user_content = format!("{}{}", user_content, ulw_directive);
             }
-            _ => self.llm.clone(),
-        };
 
-        loop {
-            let (mut stream, tool_calls) =
-                llm.stream_with_tool_calls(&messages, &definitions).await?;
-            let mut response = String::new();
-            let mut pending = String::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                if chunk.content.is_empty() {
-                    continue;
-                }
-                response.push_str(&chunk.content);
-                pending.push_str(&chunk.content);
-                if stream_output && pending.chars().count() >= STREAM_BATCH_CHARS {
-                    self.emit(session, std::mem::take(&mut pending), false)
-                        .await?;
-                }
+            let attachments = event.attachments.clone();
+            if let Some(message) = messages
+                .iter_mut()
+                .rev()
+                .find(|message| message.role == "user" && message.content == user_content)
+            {
+                message.attachments = attachments;
+            } else {
+                messages.push(ChatMessage::new("user", &user_content).with_attachments(attachments));
             }
-            let calls = tool_calls
-                .await
-                .map_err(|_| OmonError::Llm("LLM tool-call stream closed unexpectedly".into()))??;
-            if calls.is_empty() {
-                if stream_output {
-                    if !pending.is_empty() {
-                        self.emit(session, pending, true).await?;
-                    } else if response.is_empty() {
-                        self.emit(
-                            session,
-                            "The model returned an empty response.".into(),
-                            true,
-                        )
-                        .await?;
-                    } else {
-                        self.emit(session, String::new(), true).await?;
+            ensure_agent_session(&self.pool, session).await?;
+            let tools = execution_tools.unwrap_or(&self.tools);
+            let definitions = Self::tool_definitions(tools, enabled_tools);
+            let llm = match session.state.active_model.as_deref() {
+                Some(model) if model != self.llm.config().model => {
+                    let mut config = self.llm.config().clone();
+                    config.model = model.to_owned();
+                    LlmClient::new(config)?
+                }
+                _ => self.llm.clone(),
+            };
+
+            loop {
+                let (mut stream, tool_calls) =
+                    llm.stream_with_tool_calls(&messages, &definitions).await?;
+                let mut response = String::new();
+                let mut pending = String::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    if chunk.content.is_empty() {
+                        continue;
+                    }
+                    response.push_str(&chunk.content);
+                    pending.push_str(&chunk.content);
+                    if stream_output && pending.chars().count() >= STREAM_BATCH_CHARS {
+                        self.emit(session, std::mem::take(&mut pending), false)
+                            .await?;
                     }
                 }
-                self.persist_message(session, "assistant", &response, json!({}))
-                    .await?;
-                return Ok(response);
-            }
-            if !response.is_empty() {
-                messages.push(ChatMessage::new("assistant", response));
-            }
-            let mut assistant = ChatMessage::new("assistant", "");
-            assistant.tool_calls = calls.clone();
-            messages.push(assistant);
-            self.persist_message(session, "assistant", "", json!({"tool_calls": calls}))
-                .await?;
-            for call in calls {
-                if stream_output {
-                    let status_msg = format!("\n\n⚙️ Running tool `{}`...", call.name);
-                    let _ = self.emit(session, status_msg, false).await;
+                let calls = tool_calls
+                    .await
+                    .map_err(|_| OmonError::Llm("LLM tool-call stream closed unexpectedly".into()))??;
+                if calls.is_empty() {
+                    if stream_output {
+                        if !pending.is_empty() {
+                            self.emit(session, pending, true).await?;
+                        } else if response.is_empty() {
+                            self.emit(
+                                session,
+                                "The model returned an empty response.".into(),
+                                true,
+                            )
+                            .await?;
+                        } else {
+                            self.emit(session, String::new(), true).await?;
+                        }
+                    }
+                    self.persist_message(session, "assistant", &response, json!({}))
+                        .await?;
+                    return Ok(response);
                 }
+                if !response.is_empty() {
+                    messages.push(ChatMessage::new("assistant", response));
+                }
+                let mut assistant = ChatMessage::new("assistant", "");
+                assistant.tool_calls = calls.clone();
+                messages.push(assistant);
+                self.persist_message(session, "assistant", "", json!({"tool_calls": calls}))
+                    .await?;
+                for call in calls {
+                    if stream_output {
+                        let status_msg = format!("\n\n⚙️ Running tool `{}`...", call.name);
+                        let _ = self.emit(session, status_msg, false).await;
+                    }
 
-                let tool_session = stream_output.then_some(&session.key);
-                let result = tools
-                    .execute_with_context(&call.name, call.arguments.clone(), tool_session)
-                    .await;
-                let content = match result {
-                    Ok(value) => value.to_string(),
-                    Err(error) => json!({"error": error.to_string()}).to_string(),
-                };
-                let mut message = ChatMessage::new(
-                    if llm.config().provider == LlmProvider::Anthropic {
-                        "user"
-                    } else {
-                        "tool"
-                    },
-                    content.clone(),
-                );
-                message.tool_call_id = Some(call.id.clone());
-                messages.push(message);
-                self.persist_message(
-                    session,
-                    "tool",
-                    &content,
-                    json!({"tool_call_id": call.id, "tool": call.name}),
-                )
-                .await?;
+                    let tool_session = stream_output.then_some(&session.key);
+                    let result = tools
+                        .execute_with_context(&call.name, call.arguments.clone(), tool_session)
+                        .await;
+                    let content = match result {
+                        Ok(value) => value.to_string(),
+                        Err(error) => json!({"error": error.to_string()}).to_string(),
+                    };
+                    let mut message = ChatMessage::new(
+                        if llm.config().provider == LlmProvider::Anthropic {
+                            "user"
+                        } else {
+                            "tool"
+                        },
+                        content.clone(),
+                    );
+                    message.tool_call_id = Some(call.id.clone());
+                    messages.push(message);
+                    self.persist_message(
+                        session,
+                        "tool",
+                        &content,
+                        json!({"tool_call_id": call.id, "tool": call.name}),
+                    )
+                    .await?;
+                }
             }
         }
+        .await;
+
+        if stream_output {
+            let _ = self
+                .dispatcher
+                .dispatch(OutboundAction::Typing {
+                    session: session.key.clone(),
+                    active: false,
+                })
+                .await;
+        }
+
+        outcome
     }
 
     async fn emit(
@@ -1118,6 +1135,7 @@ mod runner_tests {
     use std::fs;
 
     use clap::Parser;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{canonical_authorized_directory, hermes_skill_dirs, tool_enabled, Cli, Command};
 
@@ -1372,6 +1390,149 @@ mod runner_tests {
         assert!(
             has_tool_status,
             "Streaming run must emit tool-call status chunks"
+        );
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_dispatches_typing_start_and_stop_for_streaming_turns_and_omits_for_non_streaming(
+    ) {
+        // 1. Streaming (interactive) turn: dispatches Typing { active: true } first,
+        // intermediate stream / tool chunks, and Typing { active: false } last.
+        let (base_url, server_handle) = spawn_two_turn_tool_llm_server().await;
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-1",
+            None::<String>,
+            "user-1",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-1", "Run a tool");
+
+        let response = runner
+            .execute(&mut session, event, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(response, "Final result content");
+
+        let actions = dispatcher.actions.lock().await.clone();
+        assert!(
+            actions.len() >= 2,
+            "Expected at least start and stop typing actions, got {actions:?}"
+        );
+
+        assert_eq!(
+            actions.first(),
+            Some(&omon_gateway::OutboundAction::Typing {
+                session: session_key.clone(),
+                active: true,
+            }),
+            "First action dispatched in interactive turn must be Typing {{ active: true }}"
+        );
+
+        assert_eq!(
+            actions.last(),
+            Some(&omon_gateway::OutboundAction::Typing {
+                session: session_key.clone(),
+                active: false,
+            }),
+            "Last action dispatched in interactive turn must be Typing {{ active: false }}"
+        );
+
+        let intermediate_actions = &actions[1..actions.len() - 1];
+        assert!(
+            !intermediate_actions.is_empty(),
+            "Expected intermediate stream/tool actions between typing start and stop"
+        );
+        assert!(
+            intermediate_actions
+                .iter()
+                .all(|a| !matches!(a, omon_gateway::OutboundAction::Typing { .. })),
+            "Intermediate actions must not be typing actions"
+        );
+
+        server_handle.await.unwrap();
+
+        // 2. Non-streaming turn: dispatches neither start nor stop typing.
+        let (base_url_non_stream, server_handle_non_stream) =
+            spawn_two_turn_tool_llm_server().await;
+        let dispatcher_non_stream = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner_non_stream, _dir_non_stream) =
+            build_test_runner(base_url_non_stream, dispatcher_non_stream.clone()).await;
+
+        let mut session_non_stream = omon_gateway::SessionContext::new(session_key.clone());
+        let event_non_stream =
+            omon_gateway::InboundEvent::message(session_key.clone(), "msg-2", "Run a tool");
+
+        let response_non_stream = runner_non_stream
+            .execute(&mut session_non_stream, event_non_stream, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(response_non_stream, "Final result content");
+
+        let non_stream_actions = dispatcher_non_stream.actions.lock().await.clone();
+        assert!(
+            non_stream_actions.is_empty(),
+            "Non-streaming turn must not dispatch typing or stream actions, got: {non_stream_actions:?}"
+        );
+        server_handle_non_stream.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_dispatches_typing_stop_on_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = "{\"error\": \"Internal server error\"}";
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner, _dir) =
+            build_test_runner(format!("http://{address}/v1"), dispatcher.clone()).await;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-1",
+            None::<String>,
+            "user-1",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-err", "Hello");
+
+        let result = runner.execute(&mut session, event, None, None, true).await;
+        assert!(result.is_err(), "Expected error from 500 response");
+
+        let actions = dispatcher.actions.lock().await.clone();
+        assert_eq!(
+            actions,
+            vec![
+                omon_gateway::OutboundAction::Typing {
+                    session: session_key.clone(),
+                    active: true,
+                },
+                omon_gateway::OutboundAction::Typing {
+                    session: session_key,
+                    active: false,
+                },
+            ],
+            "Both typing start and stop must be dispatched even when execution fails"
         );
 
         server_handle.await.unwrap();

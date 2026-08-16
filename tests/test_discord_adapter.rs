@@ -549,6 +549,28 @@ async fn discord_egress_dispatches_upload_file_to_target_channel() {
     let _ = std::fs::remove_dir_all(workspace);
 }
 
+#[tokio::test]
+async fn discord_egress_handles_typing_start_and_stop() {
+    let egress = DiscordEgress::new(Arc::new(serenity::http::Http::new("test-token")));
+    let session = SessionKey::new("discord", Some("9"), "7", None::<String>, "10");
+
+    egress
+        .dispatch(OutboundAction::Typing {
+            session: session.clone(),
+            active: true,
+        })
+        .await
+        .unwrap();
+
+    egress
+        .dispatch(OutboundAction::Typing {
+            session,
+            active: false,
+        })
+        .await
+        .unwrap();
+}
+
 #[test]
 fn slash_authorization_defaults_open_and_enforces_allowlist() {
     assert!(is_user_allowed(&[], 10));

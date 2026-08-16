@@ -129,6 +129,7 @@ pub enum OutboundAction {
     },
     Typing {
         session: SessionKey,
+        active: bool,
     },
     ApprovalRequest {
         session: SessionKey,
@@ -181,6 +182,15 @@ mod tests {
         assert_eq!(value["type"], "send_message");
         assert_eq!(value["content"], "response");
         assert_eq!(value["reply_to"], "message-1");
+
+        let typing_action = OutboundAction::Typing {
+            session: session(),
+            active: true,
+        };
+        let typing_value =
+            serde_json::to_value(&typing_action).expect("typing action should serialize");
+        assert_eq!(typing_value["type"], "typing");
+        assert_eq!(typing_value["active"], true);
     }
 
     #[test]

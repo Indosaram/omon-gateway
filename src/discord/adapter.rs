@@ -7,7 +7,7 @@ use poise::serenity_prelude as serenity;
 use serenity::all::{
     ChannelId, ChannelType, CreateAttachment, CreateInteractionResponse,
     CreateInteractionResponseMessage, CreateMessage, EditMessage, FullEvent, GatewayIntents,
-    Interaction, Message, MessageId,
+    Interaction, Message, MessageId, Typing,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -378,6 +378,7 @@ pub struct DiscordEgress {
     clients: Arc<HashMap<String, Arc<serenity::Http>>>,
     default_bot_id: String,
     streams: Arc<Mutex<HashMap<StreamKey, Arc<ActiveDiscordStream>>>>,
+    typing: Arc<Mutex<HashMap<String, Typing>>>,
     file_uploader: Arc<dyn DiscordFileUploader>,
 }
 
@@ -392,6 +393,7 @@ impl DiscordEgress {
             clients: Arc::new(clients),
             default_bot_id,
             streams: Arc::new(Mutex::new(HashMap::new())),
+            typing: Arc::new(Mutex::new(HashMap::new())),
             file_uploader: Arc::new(SerenityFileUploader),
         }
     }
@@ -410,6 +412,7 @@ impl DiscordEgress {
             clients: Arc::new(clients),
             default_bot_id,
             streams: Arc::new(Mutex::new(HashMap::new())),
+            typing: Arc::new(Mutex::new(HashMap::new())),
             file_uploader: Arc::new(SerenityFileUploader),
         })
     }
@@ -546,9 +549,18 @@ impl OutboundDispatcher for DiscordEgress {
             OutboundAction::Stream { session, chunk } => {
                 self.stream(session, chunk).await?;
             }
-            OutboundAction::Typing { session } => {
-                let http = self.http_for(&session)?;
-                http.broadcast_typing(Self::target(&session)?).await?;
+            OutboundAction::Typing { session, active } => {
+                if active {
+                    let http = self.http_for(&session)?;
+                    let channel = Self::target(&session)?;
+                    let guard = http.start_typing(channel);
+                    self.typing
+                        .lock()
+                        .await
+                        .insert(session.storage_key(), guard);
+                } else {
+                    self.typing.lock().await.remove(&session.storage_key());
+                }
             }
             OutboundAction::ApprovalRequest {
                 session,
