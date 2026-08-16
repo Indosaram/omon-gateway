@@ -996,12 +996,12 @@ impl CronScheduler {
 
     async fn execute_job(&self, job: &CronJob) -> Result<()> {
         let payload = job.payload()?;
-        let destination = delivery_destination(&payload)?;
+        let destinations = delivery_destination(&payload)?;
         let execution = self.executor.execute(job).await;
 
         match execution {
             Ok(result_content) => {
-                if let Some(destination) = destination {
+                if !destinations.is_empty() {
                     let content = result_content
                         .or_else(|| {
                             payload
@@ -1017,7 +1017,9 @@ impl CronScheduler {
                         });
                     if let Some(content) = content {
                         if !content.trim().is_empty() && !is_cron_silence_response(&content) {
-                            self.deliver(job, destination, content).await?;
+                            for destination in &destinations {
+                                self.deliver(job, destination, &content).await?;
+                            }
                         } else {
                             tracing::info!(
                                 job_id = %job.id,
@@ -1029,10 +1031,13 @@ impl CronScheduler {
                 Ok(())
             }
             Err(error) => {
-                if let Some(destination) = destination {
+                if !destinations.is_empty() {
                     let content = format!("Cron job {} failed: {error}", job.id);
-                    if let Err(delivery_error) = self.deliver(job, destination, content).await {
-                        tracing::error!(%delivery_error, job_id = %job.id, "failed to deliver cron failure notification");
+                    for destination in &destinations {
+                        if let Err(delivery_error) = self.deliver(job, destination, &content).await
+                        {
+                            tracing::error!(%delivery_error, job_id = %job.id, "failed to deliver cron failure notification");
+                        }
                     }
                 }
                 Err(error)
@@ -1043,8 +1048,8 @@ impl CronScheduler {
     async fn deliver(
         &self,
         job: &CronJob,
-        destination: crate::HermesOrigin,
-        content: String,
+        destination: &crate::HermesOrigin,
+        content: &str,
     ) -> Result<()> {
         let channel_id = destination.chat_id.parse::<u64>().map_err(|_| {
             OmonError::Config(format!(
@@ -1055,7 +1060,7 @@ impl CronScheduler {
         let notification = CronNotification {
             job_id: job.id.clone(),
             channel_id,
-            content: content.clone(),
+            content: content.to_string(),
             triggered_at: Utc::now(),
         };
         let _ = self.notifications.send(notification);
@@ -1065,11 +1070,11 @@ impl CronScheduler {
                     session: SessionKey::new(
                         "discord",
                         None::<String>,
-                        destination.chat_id,
-                        destination.thread_id,
-                        destination.user_id.unwrap_or_else(|| "cron".into()),
+                        destination.chat_id.clone(),
+                        destination.thread_id.clone(),
+                        destination.user_id.clone().unwrap_or_else(|| "cron".into()),
                     ),
-                    content,
+                    content: content.to_string(),
                     reply_to: None,
                 })
                 .await?;
@@ -1078,32 +1083,104 @@ impl CronScheduler {
     }
 }
 
-fn delivery_destination(payload: &Value) -> Result<Option<crate::HermesOrigin>> {
+pub fn delivery_destinations(payload: &Value) -> Result<Vec<crate::HermesOrigin>> {
     if payload.get("schedule").is_some() {
         let job: HermesJob = serde_json::from_value(payload.clone())
             .map_err(|error| OmonError::Config(format!("invalid Hermes cron payload: {error}")))?;
-        return job.discord_destination();
+        return job.discord_destinations();
     }
-    Ok(payload
-        .get("channel_id")
-        .and_then(|value| {
-            value
-                .as_u64()
-                .map(|value| value.to_string())
-                .or_else(|| value.as_str().map(str::to_owned))
-        })
-        .or_else(|| {
-            payload
-                .get("deliver")
-                .and_then(Value::as_str)
-                .and_then(|value| value.strip_prefix("discord:"))
-                .map(str::to_owned)
-        })
-        .map(|chat_id| crate::HermesOrigin {
-            platform: "discord".into(),
-            chat_id,
-            ..crate::HermesOrigin::default()
-        }))
+
+    let mut destinations = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    if let Some(chat_id) = payload.get("channel_id").and_then(|value| {
+        value
+            .as_u64()
+            .map(|value| value.to_string())
+            .or_else(|| value.as_str().map(str::to_owned))
+    }) {
+        let chat_id = chat_id.trim().to_string();
+        if !chat_id.is_empty() {
+            let key = ("discord".to_string(), chat_id.clone(), None);
+            seen.insert(key);
+            destinations.push(crate::HermesOrigin {
+                platform: "discord".into(),
+                chat_id,
+                ..crate::HermesOrigin::default()
+            });
+        }
+    }
+
+    let deliver_str = if let Some(s) = payload.get("deliver").and_then(Value::as_str) {
+        Some(s.to_string())
+    } else if let Some(arr) = payload.get("deliver").and_then(Value::as_array) {
+        let parts: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+        Some(parts.join(","))
+    } else {
+        None
+    };
+
+    if let Some(deliver) = deliver_str {
+        for part in deliver.split(',') {
+            let part = part.trim();
+            if part.is_empty() || part == "local" {
+                continue;
+            }
+            if part == "origin" || part == "all" || part == "discord" {
+                if let Some(origin_val) = payload.get("origin") {
+                    if let Ok(origin) =
+                        serde_json::from_value::<crate::HermesOrigin>(origin_val.clone())
+                    {
+                        if origin.platform.eq_ignore_ascii_case("discord")
+                            && !origin.chat_id.is_empty()
+                        {
+                            let key = (
+                                origin.platform.to_lowercase(),
+                                origin.chat_id.clone(),
+                                origin.thread_id.clone(),
+                            );
+                            if seen.insert(key) {
+                                destinations.push(origin);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(channel) = part.strip_prefix("discord:") {
+                let chat_id = channel.trim_start_matches('#').trim().to_string();
+                if !chat_id.is_empty() {
+                    let key = ("discord".to_string(), chat_id.clone(), None);
+                    if seen.insert(key) {
+                        destinations.push(crate::HermesOrigin {
+                            platform: "discord".into(),
+                            chat_id,
+                            ..crate::HermesOrigin::default()
+                        });
+                    }
+                }
+            } else if part.contains(':') {
+                // Unknown platform prefix (e.g. telegram:123) - skip gracefully
+                continue;
+            } else {
+                let chat_id = part.trim_start_matches('#').trim().to_string();
+                if !chat_id.is_empty() {
+                    let key = ("discord".to_string(), chat_id.clone(), None);
+                    if seen.insert(key) {
+                        destinations.push(crate::HermesOrigin {
+                            platform: "discord".into(),
+                            chat_id,
+                            ..crate::HermesOrigin::default()
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(destinations)
+}
+
+pub fn delivery_destination(payload: &Value) -> Result<Vec<crate::HermesOrigin>> {
+    delivery_destinations(payload)
 }
 
 pub fn next_run(expression: &str, after: DateTime<Utc>) -> Result<DateTime<Utc>> {
@@ -1547,5 +1624,63 @@ mod tests {
         assert!(!parse_wake_gate(
             "Running daily health check...\nFound no pending alerts.\nwakeAgent: false"
         ));
+    }
+
+    #[test]
+    fn test_delivery_fan_out_parsing() {
+        // 1. Comma-separated discord channels
+        let payload = serde_json::json!({
+            "deliver": "discord:123,discord:456"
+        });
+        let targets = delivery_destination(&payload).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].chat_id, "123");
+        assert_eq!(targets[1].chat_id, "456");
+
+        // 2. Comma-separated with unknown platforms (e.g. telegram)
+        let payload = serde_json::json!({
+            "deliver": "discord:123,telegram:456,discord:789"
+        });
+        let targets = delivery_destination(&payload).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].chat_id, "123");
+        assert_eq!(targets[1].chat_id, "789");
+
+        // 3. origin and all with discord origin
+        let payload = serde_json::json!({
+            "id": "job1",
+            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+            "deliver": "origin,all",
+            "origin": {"platform": "discord", "chat_id": "999", "thread_id": "888"}
+        });
+        let targets = delivery_destination(&payload).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].chat_id, "999");
+        assert_eq!(targets[0].thread_id.as_deref(), Some("888"));
+
+        // 4. all with non-discord origin -> gracefully skipped
+        let payload = serde_json::json!({
+            "id": "job2",
+            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+            "deliver": "all",
+            "origin": {"platform": "telegram", "chat_id": "999"}
+        });
+        let targets = delivery_destination(&payload).unwrap();
+        assert!(targets.is_empty());
+
+        // 5. local delivery -> empty
+        let payload = serde_json::json!({
+            "deliver": "local"
+        });
+        let targets = delivery_destination(&payload).unwrap();
+        assert!(targets.is_empty());
+
+        // 6. Deduplication of explicit channel and origin
+        let payload = serde_json::json!({
+            "deliver": "discord:123,discord:123,123"
+        });
+        let targets = delivery_destination(&payload).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].chat_id, "123");
     }
 }

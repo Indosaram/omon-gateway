@@ -179,47 +179,70 @@ impl HermesJob {
         })
     }
 
-    pub fn discord_destination(&self) -> Result<Option<HermesOrigin>> {
+    pub fn discord_destinations(&self) -> Result<Vec<HermesOrigin>> {
         let deliver = self.deliver.as_deref().unwrap_or("origin").trim();
         if deliver == "local" || deliver.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        if deliver.contains(',') || deliver == "all" || deliver == "discord" {
-            return Err(OmonError::Config(format!(
-                "Hermes job {} uses delivery mode `{deliver}` which requires a channel directory/fan-out dispatcher",
-                self.id
-            )));
-        }
-        let target = if deliver == "origin" {
-            self.origin.clone()
-        } else if let Some(channel) = deliver.strip_prefix("discord:") {
-            Some(HermesOrigin {
-                platform: "discord".into(),
-                chat_id: channel.trim_start_matches('#').to_owned(),
-                ..HermesOrigin::default()
-            })
-        } else {
-            return Err(OmonError::Config(format!(
-                "Hermes job {} uses unsupported delivery target `{deliver}`",
-                self.id
-            )));
-        };
-        match target {
-            Some(origin)
-                if origin.platform.eq_ignore_ascii_case("discord")
-                    && !origin.chat_id.is_empty() =>
-            {
-                Ok(Some(origin))
+
+        let mut destinations = Vec::new();
+        let mut seen = HashSet::new();
+
+        for part in deliver.split(',') {
+            let part = part.trim();
+            if part.is_empty() || part == "local" {
+                continue;
             }
-            Some(origin) => Err(OmonError::Config(format!(
-                "Hermes job {} cannot be delivered by the Discord gateway to {}:{}",
-                self.id, origin.platform, origin.chat_id
-            ))),
-            None => Err(OmonError::Config(format!(
-                "Hermes job {} has deliver=origin but no origin",
-                self.id
-            ))),
+            if part == "origin" || part == "all" || part == "discord" {
+                if let Some(origin) = &self.origin {
+                    if origin.platform.eq_ignore_ascii_case("discord") && !origin.chat_id.is_empty()
+                    {
+                        let key = (
+                            origin.platform.to_lowercase(),
+                            origin.chat_id.clone(),
+                            origin.thread_id.clone(),
+                        );
+                        if seen.insert(key) {
+                            destinations.push(origin.clone());
+                        }
+                    }
+                }
+            } else if let Some(channel) = part.strip_prefix("discord:") {
+                let chat_id = channel.trim_start_matches('#').trim().to_string();
+                if !chat_id.is_empty() {
+                    let key = ("discord".to_string(), chat_id.clone(), None);
+                    if seen.insert(key) {
+                        destinations.push(HermesOrigin {
+                            platform: "discord".into(),
+                            chat_id,
+                            ..HermesOrigin::default()
+                        });
+                    }
+                }
+            } else if part.contains(':') {
+                // Skip unknown platform targets gracefully
+                continue;
+            } else {
+                let chat_id = part.trim_start_matches('#').trim().to_string();
+                if !chat_id.is_empty() {
+                    let key = ("discord".to_string(), chat_id.clone(), None);
+                    if seen.insert(key) {
+                        destinations.push(HermesOrigin {
+                            platform: "discord".into(),
+                            chat_id,
+                            ..HermesOrigin::default()
+                        });
+                    }
+                }
+            }
         }
+
+        Ok(destinations)
+    }
+
+    pub fn discord_destination(&self) -> Result<Option<HermesOrigin>> {
+        let targets = self.discord_destinations()?;
+        Ok(targets.into_iter().next())
     }
 }
 
