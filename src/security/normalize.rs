@@ -179,7 +179,7 @@ pub fn iter_shell_command_starts(command: &str) -> Vec<usize> {
                 i += 1;
                 continue;
             }
-            if command[i..].starts_with("$(") {
+            if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
                 starts.push(i + 2);
                 i += 2;
                 continue;
@@ -196,7 +196,7 @@ pub fn iter_shell_command_starts(command: &str) -> Vec<usize> {
             i += 2;
             continue;
         }
-        if command[i..].starts_with("$(") {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             starts.push(i + 2);
             i += 2;
             continue;
@@ -298,7 +298,7 @@ fn scan_dollar_paren_end(command: &str, start: usize) -> Option<usize> {
             i += 2;
             continue;
         }
-        if command[i..].starts_with("$(") {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             depth += 1;
             i += 2;
             continue;
@@ -362,7 +362,7 @@ pub fn read_shell_word(command: &str, pos: usize) -> (usize, usize, String) {
             i += 2;
             continue;
         }
-        if command[i..].starts_with("$(") {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             if let Some(end) = scan_dollar_paren_end(command, i) {
                 i = end;
             } else {
@@ -370,8 +370,8 @@ pub fn read_shell_word(command: &str, pos: usize) -> (usize, usize, String) {
             }
             continue;
         }
-        if command[i..].starts_with("${") {
-            if let Some(end) = command[i + 2..].find('}') {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end) = bytes[i + 2..].iter().position(|&b| b == b'}') {
                 i += 2 + end + 1;
             } else {
                 i += 2;
@@ -391,7 +391,11 @@ pub fn read_shell_word(command: &str, pos: usize) -> (usize, usize, String) {
         }
         i += 1;
     }
-    (start, i, command[start..i].to_string())
+    (
+        start,
+        i,
+        String::from_utf8_lossy(&bytes[start..i]).into_owned(),
+    )
 }
 
 fn replace_simple_command_substitutions(word: &str) -> String {

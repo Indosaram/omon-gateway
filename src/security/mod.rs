@@ -1,10 +1,12 @@
 pub mod dangerous;
 pub mod hardline;
 pub mod normalize;
+pub mod scan;
 
 pub use dangerous::{derive_pattern_key, detect_dangerous_command, is_dangerous, DangerousFinding};
 pub use hardline::{check_sudo_stdin_guard, detect_hardline_command};
 pub use normalize::normalize_command_for_detection;
+pub use scan::scan_cron_prompt;
 
 #[cfg(test)]
 mod tests {
