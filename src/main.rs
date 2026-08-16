@@ -2168,15 +2168,33 @@ async fn run_gateway() -> Result<()> {
         approval_requester.clone(),
         std::time::Duration::from_secs(config.approval_timeout_secs + 5),
     );
-    tools.register(
-        TerminalTool::new(&config.workspace_root)
-            .with_approval(
-                config.approval_policy,
-                approval_requester.clone(),
-                std::time::Duration::from_secs(config.approval_timeout_secs + 5),
-            )
-            .with_deny_globs(config.approvals_deny.clone()),
-    );
+    let mut terminal_tool = TerminalTool::new(&config.workspace_root)
+        .with_approval(
+            config.approval_policy,
+            approval_requester.clone(),
+            std::time::Duration::from_secs(config.approval_timeout_secs + 5),
+        )
+        .with_deny_globs(config.approvals_deny.clone());
+
+    if let Some(scanner_url) = optional_env("TIRITH_SCANNER_URL") {
+        let fail_open = parse_bool_from(optional_env("TIRITH_FAIL_OPEN").as_deref(), true);
+        let timeout_secs = optional_env("TIRITH_TIMEOUT_SECS")
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(omon_gateway::DEFAULT_TIRITH_TIMEOUT_SECS);
+        info!(
+            url = %scanner_url,
+            fail_open,
+            timeout_secs,
+            "configuring external security scanner (Tirith)"
+        );
+        let tirith_scanner = omon_gateway::TirithScanner::new(
+            scanner_url,
+            fail_open,
+            std::time::Duration::from_secs(timeout_secs),
+        );
+        terminal_tool = terminal_tool.with_external_scanner(tirith_scanner);
+    }
+    tools.register(terminal_tool);
     tools.register(FileTool::new(&config.workspace_root));
     tools.register(McpTool::default());
     tools.register(CronTool::new(pool.clone()));

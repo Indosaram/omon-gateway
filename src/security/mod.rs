@@ -3,6 +3,7 @@ pub mod hardline;
 pub mod neutralize;
 pub mod normalize;
 pub mod scan;
+pub mod tirith;
 
 pub use dangerous::{derive_pattern_key, detect_dangerous_command, is_dangerous, DangerousFinding};
 pub use hardline::{
@@ -11,6 +12,7 @@ pub use hardline::{
 pub use neutralize::{is_invisible_or_control, neutralize_untrusted_inline_text};
 pub use normalize::normalize_command_for_detection;
 pub use scan::scan_cron_prompt;
+pub use tirith::{ScannerVerdict, TirithScanner, DEFAULT_TIRITH_TIMEOUT_SECS};
 
 #[cfg(test)]
 mod tests {

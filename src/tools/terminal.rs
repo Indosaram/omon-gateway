@@ -37,6 +37,7 @@ pub struct TerminalTool {
     approval_requester: Option<Arc<dyn ApprovalRequester>>,
     approval_timeout: Duration,
     deny_globs: Vec<String>,
+    external_scanner: Option<crate::security::TirithScanner>,
 }
 
 impl std::fmt::Debug for TerminalTool {
@@ -63,7 +64,13 @@ impl TerminalTool {
             approval_requester: None,
             approval_timeout: Duration::from_secs(120),
             deny_globs: Vec::new(),
+            external_scanner: None,
         }
+    }
+
+    pub fn with_external_scanner(mut self, scanner: crate::security::TirithScanner) -> Self {
+        self.external_scanner = Some(scanner);
+        self
     }
 
     pub fn with_deny_globs(mut self, deny_globs: Vec<String>) -> Self {
@@ -142,6 +149,17 @@ impl TerminalTool {
         session: Option<&SessionKey>,
         command: &str,
     ) -> Result<(), OmonError> {
+        if let Some(scanner) = &self.external_scanner {
+            match scanner.scan_command(command).await {
+                crate::security::ScannerVerdict::Allow => {}
+                crate::security::ScannerVerdict::Deny { reason } => {
+                    return Err(OmonError::Approval(format!(
+                        "BLOCKED (external security scanner): {reason}"
+                    )));
+                }
+            }
+        }
+
         if let Some(reason) = crate::security::detect_hardline_command(command) {
             return Err(OmonError::Approval(format!(
                 "BLOCKED (hardline): {reason}. This command is on the unconditional blocklist and cannot be executed."
