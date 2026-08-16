@@ -281,6 +281,7 @@ impl LiveAgentRunner {
                 .into_iter()
                 .map(|(role, content)| ChatMessage::new(role, content)),
         );
+        let messages = repair_message_sequence(messages);
         Ok(messages)
     }
 
@@ -374,6 +375,7 @@ impl LiveAgentRunner {
             } else {
                 messages.push(ChatMessage::new("user", &user_content).with_attachments(attachments));
             }
+            let mut messages = repair_message_sequence(messages);
             ensure_agent_session(&self.pool, session).await?;
             let tools = execution_tools.unwrap_or(&self.tools);
             let definitions = Self::tool_definitions(tools, enabled_tools);
@@ -554,6 +556,88 @@ impl AgentRunner for LiveAgentRunner {
         }
         Ok(())
     }
+}
+
+/// Sanitizes and repairs message role sequence for LLM providers:
+/// 1. Extracts all system messages and keeps them leading (merging consecutive ones).
+/// 2. Merges consecutive same-role non-system messages with "\n\n" rather than dropping them.
+/// 3. Handles sequences starting with assistant gracefully by prepending a user turn.
+/// 4. Ensures the resulting non-system sequence strictly alternates and ends on user.
+pub fn repair_message_sequence(msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    if msgs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut system_msgs = Vec::new();
+    let mut non_system_raw = Vec::new();
+
+    for msg in msgs {
+        if msg.role == "system" {
+            system_msgs.push(msg);
+        } else {
+            non_system_raw.push(msg);
+        }
+    }
+
+    // Merge consecutive system messages into leading system messages
+    let mut leading_system: Vec<ChatMessage> = Vec::new();
+    for msg in system_msgs {
+        if let Some(prev) = leading_system.last_mut() {
+            if !prev.content.is_empty() && !msg.content.is_empty() {
+                prev.content.push_str("\n\n");
+                prev.content.push_str(&msg.content);
+            } else if prev.content.is_empty() {
+                prev.content = msg.content;
+            }
+            prev.attachments.extend(msg.attachments);
+        } else {
+            leading_system.push(msg);
+        }
+    }
+
+    if non_system_raw.is_empty() {
+        return leading_system;
+    }
+
+    // Merge consecutive same-role messages
+    let mut merged_non_system: Vec<ChatMessage> = Vec::new();
+    for msg in non_system_raw {
+        if let Some(prev) = merged_non_system.last_mut() {
+            if prev.role == msg.role {
+                if !prev.content.is_empty() && !msg.content.is_empty() {
+                    prev.content.push_str("\n\n");
+                    prev.content.push_str(&msg.content);
+                } else if prev.content.is_empty() {
+                    prev.content = msg.content;
+                }
+                prev.attachments.extend(msg.attachments);
+                prev.tool_calls.extend(msg.tool_calls);
+                if prev.tool_call_id.is_none() {
+                    prev.tool_call_id = msg.tool_call_id;
+                }
+                continue;
+            }
+        }
+        merged_non_system.push(msg);
+    }
+
+    // If starting with assistant or tool, prepend a graceful user message
+    if let Some(first) = merged_non_system.first() {
+        if first.role == "assistant" || first.role == "tool" {
+            merged_non_system.insert(0, ChatMessage::new("user", "Continue"));
+        }
+    }
+
+    // Ensure ending on user message
+    if let Some(last) = merged_non_system.last() {
+        if last.role == "assistant" || last.role == "tool" {
+            merged_non_system.push(ChatMessage::new("user", "Continue"));
+        }
+    }
+
+    let mut result = leading_system;
+    result.extend(merged_non_system);
+    result
 }
 
 fn tool_enabled(name: &str, enabled: Option<&[String]>) -> bool {
@@ -1561,5 +1645,96 @@ mod runner_tests {
         );
 
         server_handle.await.unwrap();
+    }
+
+    #[test]
+    fn repair_message_sequence_merges_consecutive_user_messages() {
+        let msgs = vec![
+            omon_gateway::ChatMessage::new("system", "sys prompt"),
+            omon_gateway::ChatMessage::new("user", "first message"),
+            omon_gateway::ChatMessage::new("user", "second message"),
+        ];
+        let repaired = super::repair_message_sequence(msgs);
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[0].role, "system");
+        assert_eq!(repaired[0].content, "sys prompt");
+        assert_eq!(repaired[1].role, "user");
+        assert_eq!(repaired[1].content, "first message\n\nsecond message");
+    }
+
+    #[test]
+    fn repair_message_sequence_merges_consecutive_assistant_messages() {
+        let msgs = vec![
+            omon_gateway::ChatMessage::new("system", "sys prompt"),
+            omon_gateway::ChatMessage::new("user", "question"),
+            omon_gateway::ChatMessage::new("assistant", "partial answer"),
+            omon_gateway::ChatMessage::new("assistant", "full answer"),
+            omon_gateway::ChatMessage::new("user", "follow up"),
+        ];
+        let repaired = super::repair_message_sequence(msgs);
+        assert_eq!(repaired.len(), 4);
+        assert_eq!(repaired[0].role, "system");
+        assert_eq!(repaired[1].role, "user");
+        assert_eq!(repaired[1].content, "question");
+        assert_eq!(repaired[2].role, "assistant");
+        assert_eq!(repaired[2].content, "partial answer\n\nfull answer");
+        assert_eq!(repaired[3].role, "user");
+        assert_eq!(repaired[3].content, "follow up");
+    }
+
+    #[test]
+    fn repair_message_sequence_keeps_system_messages_leading() {
+        let msgs = vec![
+            omon_gateway::ChatMessage::new("user", "user 1"),
+            omon_gateway::ChatMessage::new("system", "system 1"),
+            omon_gateway::ChatMessage::new("assistant", "assistant 1"),
+            omon_gateway::ChatMessage::new("system", "system 2"),
+            omon_gateway::ChatMessage::new("user", "user 2"),
+        ];
+        let repaired = super::repair_message_sequence(msgs);
+        assert_eq!(repaired[0].role, "system");
+        assert_eq!(repaired[0].content, "system 1\n\nsystem 2");
+        assert_eq!(repaired[1].role, "user");
+        assert_eq!(repaired[1].content, "user 1");
+        assert_eq!(repaired[2].role, "assistant");
+        assert_eq!(repaired[2].content, "assistant 1");
+        assert_eq!(repaired[3].role, "user");
+        assert_eq!(repaired[3].content, "user 2");
+    }
+
+    #[test]
+    fn repair_message_sequence_strictly_alternates_and_ends_on_user() {
+        let msgs = vec![
+            omon_gateway::ChatMessage::new("system", "sys prompt"),
+            omon_gateway::ChatMessage::new("user", "user 1"),
+            omon_gateway::ChatMessage::new("assistant", "assistant 1"),
+        ];
+        let repaired = super::repair_message_sequence(msgs);
+        assert_eq!(repaired.len(), 4);
+        assert_eq!(repaired[0].role, "system");
+        assert_eq!(repaired[1].role, "user");
+        assert_eq!(repaired[1].content, "user 1");
+        assert_eq!(repaired[2].role, "assistant");
+        assert_eq!(repaired[2].content, "assistant 1");
+        assert_eq!(repaired[3].role, "user");
+        assert_eq!(repaired[3].content, "Continue");
+    }
+
+    #[test]
+    fn repair_message_sequence_handles_leading_assistant_gracefully() {
+        let msgs = vec![
+            omon_gateway::ChatMessage::new("system", "sys prompt"),
+            omon_gateway::ChatMessage::new("assistant", "unprompted greeting"),
+            omon_gateway::ChatMessage::new("user", "my answer"),
+        ];
+        let repaired = super::repair_message_sequence(msgs);
+        assert_eq!(repaired.len(), 4);
+        assert_eq!(repaired[0].role, "system");
+        assert_eq!(repaired[1].role, "user");
+        assert_eq!(repaired[1].content, "Continue");
+        assert_eq!(repaired[2].role, "assistant");
+        assert_eq!(repaired[2].content, "unprompted greeting");
+        assert_eq!(repaired[3].role, "user");
+        assert_eq!(repaired[3].content, "my answer");
     }
 }
