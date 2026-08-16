@@ -144,24 +144,15 @@ async fn handles_events_sequentially_within_one_session() {
 }
 
 #[tokio::test]
-async fn a_new_message_interrupts_the_active_turn_and_runs_promptly() {
-    struct InterruptRunner {
+async fn events_arriving_during_running_turn_are_queued_and_processed_in_order() {
+    struct QueuedRunner {
         started: mpsc::UnboundedSender<String>,
         first_release: Mutex<Option<oneshot::Receiver<()>>>,
-        first_dropped: Arc<AtomicBool>,
         completed: mpsc::UnboundedSender<String>,
     }
 
-    struct DropSignal(Arc<AtomicBool>);
-
-    impl Drop for DropSignal {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
     #[async_trait]
-    impl AgentRunner for InterruptRunner {
+    impl AgentRunner for QueuedRunner {
         async fn run(
             &self,
             session: &mut SessionContext,
@@ -169,48 +160,58 @@ async fn a_new_message_interrupts_the_active_turn_and_runs_promptly() {
         ) -> Result<(), OmonError> {
             self.started.send(event.content.clone()).unwrap();
             if event.content == "first" {
-                let _drop_signal = DropSignal(self.first_dropped.clone());
                 let release = self.first_release.lock().await.take().unwrap();
                 let _ = release.await;
-                session.state.metadata.insert("stale".into(), true.into());
-            } else {
-                session.state.metadata.insert("fresh".into(), true.into());
-                self.completed.send(event.content).unwrap();
+                session.state.metadata.insert("turn_1".into(), true.into());
+            } else if event.content == "second" {
+                session.state.metadata.insert("turn_2".into(), true.into());
+            } else if event.content == "third" {
+                session.state.metadata.insert("turn_3".into(), true.into());
             }
+            self.completed.send(event.content).unwrap();
             Ok(())
         }
     }
 
     let database = Database::connect("sqlite::memory:").await.unwrap();
-    let key = session("interrupt-user");
+    let key = session("queue-user");
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
-    let (_release_tx, release_rx) = oneshot::channel();
-    let first_dropped = Arc::new(AtomicBool::new(false));
+    let (release_tx, release_rx) = oneshot::channel();
     let multiplexer = SessionMultiplexer::new(
         database.pool().clone(),
-        Arc::new(InterruptRunner {
+        Arc::new(QueuedRunner {
             started: started_tx,
             first_release: Mutex::new(Some(release_rx)),
-            first_dropped: first_dropped.clone(),
             completed: completed_tx,
         }),
         MultiplexerConfig::default(),
     );
 
     multiplexer
-        .route(InboundEvent::message(key.clone(), "interrupt-1", "first"))
+        .route(InboundEvent::message(key.clone(), "queue-1", "first"))
         .await
         .unwrap();
     assert_eq!(started_rx.recv().await.as_deref(), Some("first"));
 
+    // Route second and third events while the first turn is still in flight
     multiplexer
-        .route(InboundEvent::message(key.clone(), "interrupt-2", "second"))
+        .route(InboundEvent::message(key.clone(), "queue-2", "second"))
         .await
         .unwrap();
+    multiplexer
+        .route(InboundEvent::message(key.clone(), "queue-3", "third"))
+        .await
+        .unwrap();
+
+    // Release turn 1
+    release_tx.send(()).unwrap();
+
+    assert_eq!(completed_rx.recv().await.as_deref(), Some("first"));
     assert_eq!(started_rx.recv().await.as_deref(), Some("second"));
     assert_eq!(completed_rx.recv().await.as_deref(), Some("second"));
-    assert!(first_dropped.load(Ordering::SeqCst));
+    assert_eq!(started_rx.recv().await.as_deref(), Some("third"));
+    assert_eq!(completed_rx.recv().await.as_deref(), Some("third"));
 
     let messages: Vec<String> =
         sqlx::query_scalar("SELECT content FROM messages WHERE session_key = ? ORDER BY sequence")
@@ -218,7 +219,7 @@ async fn a_new_message_interrupts_the_active_turn_and_runs_promptly() {
             .fetch_all(database.pool())
             .await
             .unwrap();
-    assert_eq!(messages, vec!["first", "second"]);
+    assert_eq!(messages, vec!["first", "second", "third"]);
 }
 
 #[tokio::test]
@@ -281,6 +282,71 @@ async fn stop_immediately_cancels_the_active_turn() {
     assert!(dropped.load(Ordering::SeqCst));
     assert!(!completed.load(Ordering::SeqCst));
     assert!(!multiplexer.stop(&key).await.unwrap());
+}
+
+#[tokio::test]
+async fn stop_cancels_active_turn_and_clears_queued_events() {
+    struct QueuedStoppableRunner {
+        started: mpsc::UnboundedSender<String>,
+        first_release: Mutex<Option<oneshot::Receiver<()>>>,
+        completed: mpsc::UnboundedSender<String>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for QueuedStoppableRunner {
+        async fn run(
+            &self,
+            _session: &mut SessionContext,
+            event: InboundEvent,
+        ) -> Result<(), OmonError> {
+            self.started.send(event.content.clone()).unwrap();
+            if event.content == "turn-1" {
+                let release = self.first_release.lock().await.take().unwrap();
+                let _ = release.await;
+            }
+            self.completed.send(event.content).unwrap();
+            Ok(())
+        }
+    }
+
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let key = session("stop-queue-user");
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    let multiplexer = SessionMultiplexer::new(
+        database.pool().clone(),
+        Arc::new(QueuedStoppableRunner {
+            started: started_tx,
+            first_release: Mutex::new(Some(release_rx)),
+            completed: completed_tx,
+        }),
+        MultiplexerConfig::default(),
+    );
+
+    multiplexer
+        .route(InboundEvent::message(key.clone(), "turn-1", "turn-1"))
+        .await
+        .unwrap();
+    assert_eq!(started_rx.recv().await.as_deref(), Some("turn-1"));
+
+    // Queue turn 2 and turn 3 behind turn 1
+    multiplexer
+        .route(InboundEvent::message(key.clone(), "turn-2", "turn-2"))
+        .await
+        .unwrap();
+    multiplexer
+        .route(InboundEvent::message(key.clone(), "turn-3", "turn-3"))
+        .await
+        .unwrap();
+
+    // Stop session: cancels active turn 1 and drains queued turns
+    assert!(multiplexer.stop(&key).await.unwrap());
+
+    // Neither turn-1, turn-2, nor turn-3 should have completed successfully
+    assert!(completed_rx.try_recv().is_err());
+    // Turn 2 and 3 should not have started
+    assert!(started_rx.try_recv().is_err());
 }
 
 #[tokio::test]

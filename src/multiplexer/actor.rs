@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,11 @@ use crate::{
     render_user_prompt, DeliveryLedgerService, InboundEvent, OmonError, OutboundAction, Result,
     SessionContext, SessionKey,
 };
+
+/// Sensible maximum number of pending events queued per session actor.
+/// If the queue overflows, oldest events are preserved and new incoming events
+/// are rejected to avoid unbounded memory growth.
+const MAX_PENDING_EVENTS: usize = 64;
 
 #[async_trait]
 pub trait AgentRunner: Send + Sync + 'static {
@@ -51,7 +57,6 @@ pub(crate) enum ActorCommand {
 
 enum TurnOutcome {
     Completed(Result<()>),
-    Superseded(Box<InboundEvent>),
     Stopped(oneshot::Sender<Result<bool>>),
     Shutdown,
 }
@@ -87,14 +92,15 @@ impl SessionActor {
     }
 
     pub(crate) async fn run(mut self) {
-        let mut pending_event = None;
+        let mut pending_events: VecDeque<Box<InboundEvent>> = VecDeque::new();
         loop {
-            let command = match pending_event.take() {
-                Some(event) => ActorCommand::Event(event),
-                None => match self.receiver.recv().await {
+            let command = if let Some(event) = pending_events.pop_front() {
+                ActorCommand::Event(event)
+            } else {
+                match self.receiver.recv().await {
                     Some(command) => command,
                     None => break,
-                },
+                }
             };
 
             match command {
@@ -123,11 +129,30 @@ impl SessionActor {
                             command = self.receiver.recv() => {
                                 match command {
                                     Some(ActorCommand::Event(next)) => {
-                                        cancellation.cancel();
-                                        break TurnOutcome::Superseded(next);
+                                        if pending_events.len() < MAX_PENDING_EVENTS {
+                                            pending_events.push_back(next);
+                                        } else {
+                                            tracing::warn!(
+                                                session = %self.context.key,
+                                                "pending turn queue full (max {}); dropping new event",
+                                                MAX_PENDING_EVENTS
+                                            );
+                                            self.complete_delivery(
+                                                next.delivery_id.as_deref(),
+                                                &Err(OmonError::Multiplexer("pending turn queue full".into())),
+                                            )
+                                            .await;
+                                        }
                                     }
                                     Some(ActorCommand::Stop { reply }) => {
                                         cancellation.cancel();
+                                        while let Some(pending) = pending_events.pop_front() {
+                                            self.complete_delivery(
+                                                pending.delivery_id.as_deref(),
+                                                &Err(OmonError::Multiplexer("stopped by user".into())),
+                                            )
+                                            .await;
+                                        }
                                         break TurnOutcome::Stopped(reply);
                                     }
                                     Some(ActorCommand::EvictIfIdle { reply, .. }) => {
@@ -135,6 +160,13 @@ impl SessionActor {
                                     }
                                     None => {
                                         cancellation.cancel();
+                                        while let Some(pending) = pending_events.pop_front() {
+                                            self.complete_delivery(
+                                                pending.delivery_id.as_deref(),
+                                                &Err(OmonError::Multiplexer("session actor shutting down".into())),
+                                            )
+                                            .await;
+                                        }
                                         break TurnOutcome::Shutdown;
                                     }
                                 }
@@ -164,16 +196,6 @@ impl SessionActor {
                                 }
                             }
                         }
-                        TurnOutcome::Superseded(next) => {
-                            self.interrupt_turn(
-                                event_id,
-                                delivery_id.as_deref(),
-                                "superseded by a newer message",
-                            )
-                            .await;
-                            self.notify_interrupted(&reply_to);
-                            pending_event = Some(next);
-                        }
                         TurnOutcome::Stopped(reply) => {
                             self.interrupt_turn(
                                 event_id,
@@ -196,14 +218,22 @@ impl SessionActor {
                 }
                 ActorCommand::Stop { reply } => {
                     self.last_active_at = tokio::time::Instant::now();
+                    while let Some(pending) = pending_events.pop_front() {
+                        self.complete_delivery(
+                            pending.delivery_id.as_deref(),
+                            &Err(OmonError::Multiplexer("stopped by user".into())),
+                        )
+                        .await;
+                    }
                     let _ = reply.send(Ok(false));
                 }
                 ActorCommand::EvictIfIdle {
                     idle_timeout,
                     reply,
                 } => {
-                    let idle =
-                        self.last_active_at.elapsed() > idle_timeout && self.receiver.is_empty();
+                    let idle = self.last_active_at.elapsed() > idle_timeout
+                        && self.receiver.is_empty()
+                        && pending_events.is_empty();
                     if idle {
                         let result = self.flush_if_dirty().await.map(|_| true);
                         let should_stop = result.is_ok();
@@ -255,21 +285,6 @@ impl SessionActor {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    fn notify_interrupted(&self, reply_to: &str) {
-        if let Some(dispatcher) = self.dispatcher.clone() {
-            let action = OutboundAction::SendMessage {
-                session: self.context.key.clone(),
-                content: "Previous turn interrupted; following your latest message.".into(),
-                reply_to: Some(reply_to.to_owned()),
-            };
-            tokio::spawn(async move {
-                if let Err(error) = dispatcher.dispatch(action).await {
-                    tracing::warn!(%error, "failed to send turn interruption notice");
-                }
-            });
-        }
     }
 
     async fn complete_delivery(&self, delivery_id: Option<&str>, result: &Result<()>) {
@@ -367,4 +382,145 @@ async fn ensure_session(pool: &SqlitePool, context: &SessionContext) -> Result<(
 
 fn serialization_error(error: serde_json::Error) -> OmonError {
     OmonError::Multiplexer(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Database;
+    use tokio::sync::Barrier;
+
+    fn test_session(user: &str) -> SessionKey {
+        SessionKey::new("discord", Some("guild"), "channel", None::<String>, user)
+    }
+
+    struct TurnRecordingRunner {
+        started: mpsc::UnboundedSender<String>,
+        barrier: Arc<Barrier>,
+        completed: mpsc::UnboundedSender<String>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for TurnRecordingRunner {
+        async fn run(&self, _session: &mut SessionContext, event: InboundEvent) -> Result<()> {
+            let _ = self.started.send(event.content.clone());
+            if event.content == "blocking" {
+                self.barrier.wait().await;
+            }
+            let _ = self.completed.send(event.content);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_queues_turns_in_order_without_cancellation() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let key = test_session("actor-queue-test");
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let runner = Arc::new(TurnRecordingRunner {
+            started: started_tx,
+            barrier: barrier.clone(),
+            completed: completed_tx,
+        });
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let actor = SessionActor::load(key.clone(), cmd_rx, runner, None, db.pool().clone())
+            .await
+            .unwrap();
+        let handle = tokio::spawn(actor.run());
+
+        // Send first blocking turn
+        cmd_tx
+            .send(ActorCommand::Event(Box::new(InboundEvent::message(
+                key.clone(),
+                "msg-1",
+                "blocking",
+            ))))
+            .await
+            .unwrap();
+
+        assert_eq!(started_rx.recv().await.as_deref(), Some("blocking"));
+
+        // Send two more events while first is blocking
+        cmd_tx
+            .send(ActorCommand::Event(Box::new(InboundEvent::message(
+                key.clone(),
+                "msg-2",
+                "follow-up-1",
+            ))))
+            .await
+            .unwrap();
+        cmd_tx
+            .send(ActorCommand::Event(Box::new(InboundEvent::message(
+                key.clone(),
+                "msg-3",
+                "follow-up-2",
+            ))))
+            .await
+            .unwrap();
+
+        // Release the first turn
+        barrier.wait().await;
+
+        assert_eq!(completed_rx.recv().await.as_deref(), Some("blocking"));
+        assert_eq!(started_rx.recv().await.as_deref(), Some("follow-up-1"));
+        assert_eq!(completed_rx.recv().await.as_deref(), Some("follow-up-1"));
+        assert_eq!(started_rx.recv().await.as_deref(), Some("follow-up-2"));
+        assert_eq!(completed_rx.recv().await.as_deref(), Some("follow-up-2"));
+
+        drop(cmd_tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_stop_cancels_active_turn_immediately() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let key = test_session("actor-stop-test");
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let runner = Arc::new(TurnRecordingRunner {
+            started: started_tx,
+            barrier: barrier.clone(),
+            completed: completed_tx,
+        });
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let actor = SessionActor::load(key.clone(), cmd_rx, runner, None, db.pool().clone())
+            .await
+            .unwrap();
+        let handle = tokio::spawn(actor.run());
+
+        // Send blocking turn
+        cmd_tx
+            .send(ActorCommand::Event(Box::new(InboundEvent::message(
+                key.clone(),
+                "msg-1",
+                "blocking",
+            ))))
+            .await
+            .unwrap();
+
+        assert_eq!(started_rx.recv().await.as_deref(), Some("blocking"));
+
+        // Send Stop command
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(ActorCommand::Stop { reply: reply_tx })
+            .await
+            .unwrap();
+
+        let stop_result = reply_rx.await.unwrap();
+        assert!(stop_result.unwrap());
+
+        // Turn did not complete successfully
+        assert!(completed_rx.try_recv().is_err());
+
+        drop(cmd_tx);
+        handle.await.unwrap();
+    }
 }
