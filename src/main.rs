@@ -28,6 +28,312 @@ use uuid::Uuid;
 
 const STREAM_BATCH_CHARS: usize = 1_500;
 
+const THINK_OPEN_TAGS: &[&str] = &[
+    "<think>",
+    "<thinking>",
+    "<reasoning>",
+    "<thought>",
+    "<reasoning_scratchpad>",
+];
+
+const THINK_CLOSE_TAGS: &[&str] = &[
+    "</think>",
+    "</thinking>",
+    "</reasoning>",
+    "</thought>",
+    "</reasoning_scratchpad>",
+];
+
+#[derive(Clone, Debug)]
+pub struct ThinkStripper {
+    in_block: bool,
+    buffer: String,
+    last_emitted_ended_newline: bool,
+}
+
+impl Default for ThinkStripper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ThinkStripper {
+    pub fn new() -> Self {
+        Self {
+            in_block: false,
+            buffer: String::new(),
+            last_emitted_ended_newline: true,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.in_block = false;
+        self.buffer.clear();
+        self.last_emitted_ended_newline = true;
+    }
+
+    pub fn push(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+        self.buffer.push_str(chunk);
+        let mut buf = std::mem::take(&mut self.buffer);
+        let mut out = String::new();
+
+        while !buf.is_empty() {
+            if self.in_block {
+                let (close_idx, close_len) = Self::find_first_tag(&buf, THINK_CLOSE_TAGS);
+                if close_idx == -1 {
+                    let held = Self::max_partial_suffix(&buf, THINK_CLOSE_TAGS);
+                    if held > 0 {
+                        self.buffer = buf[buf.len() - held..].to_string();
+                    }
+                    return out;
+                }
+                let close_idx = close_idx as usize;
+                buf = buf[close_idx + close_len..].to_string();
+                self.in_block = false;
+            } else {
+                let pair = Self::find_earliest_closed_pair(&buf);
+                let (open_idx, open_len) =
+                    Self::find_open_at_boundary(&buf, &out, self.last_emitted_ended_newline);
+
+                if let Some((start_idx, end_idx)) = pair {
+                    if open_idx == -1 || start_idx <= open_idx as usize {
+                        let preceding = &buf[..start_idx];
+                        if !preceding.is_empty() {
+                            let cleaned = Self::strip_orphan_close_tags(preceding);
+                            if !cleaned.is_empty() {
+                                self.last_emitted_ended_newline = cleaned.ends_with('\n');
+                                out.push_str(&cleaned);
+                            }
+                        }
+                        buf = buf[end_idx..].to_string();
+                        continue;
+                    }
+                }
+
+                if open_idx != -1 {
+                    let open_idx = open_idx as usize;
+                    let preceding = &buf[..open_idx];
+                    if !preceding.is_empty() {
+                        let cleaned = Self::strip_orphan_close_tags(preceding);
+                        if !cleaned.is_empty() {
+                            self.last_emitted_ended_newline = cleaned.ends_with('\n');
+                            out.push_str(&cleaned);
+                        }
+                    }
+                    self.in_block = true;
+                    buf = buf[open_idx + open_len..].to_string();
+                    continue;
+                }
+
+                let held_open = Self::max_partial_suffix(&buf, THINK_OPEN_TAGS);
+                let held_close = Self::max_partial_suffix(&buf, THINK_CLOSE_TAGS);
+                let held = held_open.max(held_close);
+
+                if held > 0 {
+                    let emittable = &buf[..buf.len() - held];
+                    self.buffer = buf[buf.len() - held..].to_string();
+                    if !emittable.is_empty() {
+                        let cleaned = Self::strip_orphan_close_tags(emittable);
+                        if !cleaned.is_empty() {
+                            self.last_emitted_ended_newline = cleaned.ends_with('\n');
+                            out.push_str(&cleaned);
+                        }
+                    }
+                } else {
+                    let cleaned = Self::strip_orphan_close_tags(&buf);
+                    if !cleaned.is_empty() {
+                        self.last_emitted_ended_newline = cleaned.ends_with('\n');
+                        out.push_str(&cleaned);
+                    }
+                    self.buffer.clear();
+                }
+                return out;
+            }
+        }
+
+        out
+    }
+
+    pub fn finish(&mut self) -> String {
+        if self.in_block {
+            self.buffer.clear();
+            self.in_block = false;
+            self.last_emitted_ended_newline = true;
+            String::new()
+        } else {
+            let tail = std::mem::take(&mut self.buffer);
+            self.last_emitted_ended_newline = true;
+            if tail.is_empty() {
+                String::new()
+            } else {
+                Self::strip_orphan_close_tags(&tail)
+            }
+        }
+    }
+
+    fn find_first_tag(buf: &str, tags: &[&str]) -> (isize, usize) {
+        let buf_lower = buf.to_lowercase();
+        let mut best_idx: isize = -1;
+        let mut best_len = 0;
+        for &tag in tags {
+            if let Some(idx) = buf_lower.find(tag) {
+                let idx = idx as isize;
+                if best_idx == -1 || idx < best_idx {
+                    best_idx = idx;
+                    best_len = tag.len();
+                }
+            }
+        }
+        (best_idx, best_len)
+    }
+
+    fn find_earliest_closed_pair(buf: &str) -> Option<(usize, usize)> {
+        let buf_lower = buf.to_lowercase();
+        let mut best: Option<(usize, usize)> = None;
+        for (&open_tag, &close_tag) in THINK_OPEN_TAGS.iter().zip(THINK_CLOSE_TAGS.iter()) {
+            if let Some(open_idx) = buf_lower.find(open_tag) {
+                if let Some(close_rel) = buf_lower[open_idx + open_tag.len()..].find(close_tag) {
+                    let close_idx = open_idx + open_tag.len() + close_rel;
+                    let end_idx = close_idx + close_tag.len();
+                    if best.is_none() || open_idx < best.unwrap().0 {
+                        best = Some((open_idx, end_idx));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    fn find_open_at_boundary(
+        buf: &str,
+        already_emitted: &str,
+        last_emitted_ended_newline: bool,
+    ) -> (isize, usize) {
+        let buf_lower = buf.to_lowercase();
+        let mut best_idx: isize = -1;
+        let mut best_len = 0;
+        for &tag in THINK_OPEN_TAGS {
+            let mut search_start = 0;
+            while search_start < buf_lower.len() {
+                if let Some(rel) = buf_lower[search_start..].find(tag) {
+                    let idx = search_start + rel;
+                    if Self::is_block_boundary(
+                        buf,
+                        idx,
+                        already_emitted,
+                        last_emitted_ended_newline,
+                    ) {
+                        let idx = idx as isize;
+                        if best_idx == -1 || idx < best_idx {
+                            best_idx = idx;
+                            best_len = tag.len();
+                        }
+                        break;
+                    }
+                    search_start = idx + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        (best_idx, best_len)
+    }
+
+    fn is_block_boundary(
+        buf: &str,
+        idx: usize,
+        already_emitted: &str,
+        last_emitted_ended_newline: bool,
+    ) -> bool {
+        if idx == 0 {
+            if !already_emitted.is_empty() {
+                already_emitted.ends_with('\n')
+            } else {
+                last_emitted_ended_newline
+            }
+        } else {
+            let preceding = &buf[..idx];
+            if let Some(last_nl) = preceding.rfind('\n') {
+                preceding[last_nl + 1..].trim().is_empty()
+            } else {
+                let prior_newline = if !already_emitted.is_empty() {
+                    already_emitted.ends_with('\n')
+                } else {
+                    last_emitted_ended_newline
+                };
+                prior_newline && preceding.trim().is_empty()
+            }
+        }
+    }
+
+    fn max_partial_suffix(buf: &str, tags: &[&str]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        let buf_lower = buf.to_lowercase();
+        let max_tag_len = tags.iter().map(|t| t.len()).max().unwrap_or(0);
+        let max_check = buf_lower.len().min(max_tag_len.saturating_sub(1));
+        for i in (1..=max_check).rev() {
+            let start_idx = buf_lower.len() - i;
+            if !buf_lower.is_char_boundary(start_idx) {
+                continue;
+            }
+            let suffix = &buf_lower[start_idx..];
+            for &tag in tags {
+                if tag.len() > i && tag.starts_with(suffix) {
+                    return i;
+                }
+            }
+        }
+        0
+    }
+
+    pub fn strip_orphan_close_tags(text: &str) -> String {
+        let text_lower = text.to_lowercase();
+        if !text_lower.contains("</") {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut byte_pos = 0;
+        let bytes = text.as_bytes();
+        let text_len = text.len();
+
+        while byte_pos < text_len {
+            let mut matched = false;
+            if byte_pos + 1 < text_len && bytes[byte_pos] == b'<' && bytes[byte_pos + 1] == b'/' {
+                for &tag in THINK_CLOSE_TAGS {
+                    let tag_len = tag.len();
+                    if byte_pos + tag_len <= text_len
+                        && text_lower[byte_pos..byte_pos + tag_len] == *tag
+                    {
+                        let mut j = byte_pos + tag_len;
+                        while j < text_len
+                            && (bytes[j] == b' '
+                                || bytes[j] == b'\t'
+                                || bytes[j] == b'\n'
+                                || bytes[j] == b'\r')
+                        {
+                            j += 1;
+                        }
+                        byte_pos = j;
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if !matched {
+                let next_char = text[byte_pos..].chars().next().unwrap();
+                out.push(next_char);
+                byte_pos += next_char.len_utf8();
+            }
+        }
+        out
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "omon-gateway")]
 struct Cli {
@@ -393,17 +699,27 @@ impl LiveAgentRunner {
                     llm.stream_with_tool_calls(&messages, &definitions).await?;
                 let mut response = String::new();
                 let mut pending = String::new();
+                let mut stripper = ThinkStripper::new();
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk?;
                     if chunk.content.is_empty() {
                         continue;
                     }
-                    response.push_str(&chunk.content);
-                    pending.push_str(&chunk.content);
+                    let clean = stripper.push(&chunk.content);
+                    if clean.is_empty() {
+                        continue;
+                    }
+                    response.push_str(&clean);
+                    pending.push_str(&clean);
                     if stream_output && pending.chars().count() >= STREAM_BATCH_CHARS {
                         self.emit(session, std::mem::take(&mut pending), false)
                             .await?;
                     }
+                }
+                let tail = stripper.finish();
+                if !tail.is_empty() {
+                    response.push_str(&tail);
+                    pending.push_str(&tail);
                 }
                 let calls = tool_calls
                     .await
@@ -1980,5 +2296,173 @@ mod runner_tests {
             .unwrap()
             .unwrap();
         assert_eq!(obl2.state, "delivered");
+    }
+
+    fn drive_stripper(chunks: &[&str]) -> String {
+        let mut stripper = super::ThinkStripper::new();
+        let mut out = String::new();
+        for chunk in chunks {
+            out.push_str(&stripper.push(chunk));
+        }
+        out.push_str(&stripper.finish());
+        out
+    }
+
+    #[test]
+    fn test_think_stripper_closed_pairs() {
+        assert_eq!(
+            drive_stripper(&["<think>reasoning</think>Hello world"]),
+            "Hello world"
+        );
+        assert_eq!(
+            drive_stripper(&["Hello <think>internal thoughts</think> world"]),
+            "Hello  world"
+        );
+    }
+
+    #[test]
+    fn test_think_stripper_all_tag_variants_and_case() {
+        for tag in [
+            "think",
+            "thinking",
+            "reasoning",
+            "thought",
+            "reasoning_scratchpad",
+        ] {
+            let chunk = format!("<{tag}>secret scratchpad</{tag}>Visible answer");
+            assert_eq!(drive_stripper(&[&chunk]), "Visible answer");
+        }
+        assert_eq!(drive_stripper(&["<THINK>mixed case</Think>Hello"]), "Hello");
+        assert_eq!(
+            drive_stripper(&["<Reasoning>planning</REASONING>Done"]),
+            "Done"
+        );
+    }
+
+    #[test]
+    fn test_think_stripper_unterminated_open_drops_to_end() {
+        assert_eq!(drive_stripper(&["<think>reasoning without close"]), "");
+        assert_eq!(drive_stripper(&["Hello\n<think>reasoning text"]), "Hello\n");
+        assert_eq!(
+            drive_stripper(&["Hello\n  <thought>reasoning text"]),
+            "Hello\n  "
+        );
+    }
+
+    #[test]
+    fn test_think_stripper_prose_mentioning_tag_preserved() {
+        let text = "Use the <think> tag for reasoning models";
+        assert_eq!(drive_stripper(&[text]), text);
+    }
+
+    #[test]
+    fn test_think_stripper_orphan_close_tags() {
+        assert_eq!(drive_stripper(&["Hello</think>world"]), "Helloworld");
+        assert_eq!(drive_stripper(&["Hello</think> world"]), "Helloworld");
+        assert_eq!(drive_stripper(&["A</think>B</thinking>C"]), "ABC");
+    }
+
+    #[test]
+    fn test_think_stripper_split_tags_across_chunks() {
+        assert_eq!(
+            drive_stripper(&["<", "think>reasoning</think>done"]),
+            "done"
+        );
+        assert_eq!(
+            drive_stripper(&["<", "thi", "nk>internal thoughts</think>Answer"]),
+            "Answer"
+        );
+        assert_eq!(
+            drive_stripper(&["<think>reasoning<", "/think>after"]),
+            "after"
+        );
+        assert_eq!(
+            drive_stripper(&["<think>reasoning<", "/", "think>after"]),
+            "after"
+        );
+    }
+
+    #[test]
+    fn test_think_stripper_non_tag_flushed() {
+        assert_eq!(drive_stripper(&["Is 3 < 5?"]), "Is 3 < 5?");
+        assert_eq!(drive_stripper(&["Is 3 <"]), "Is 3 <");
+    }
+
+    #[tokio::test]
+    async fn test_execute_strips_think_blocks_from_streamed_responses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let chunk1 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>Internal deep thought\"}}]}\n\n";
+                let chunk2 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" and hidden steps</think>Hello user!\"}}]}\n\n";
+                let chunk_done = "data: [DONE]\n\n";
+                let body = format!("{chunk1}{chunk2}{chunk_done}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner, _dir) =
+            build_test_runner(format!("http://{address}/v1"), dispatcher.clone()).await;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-think",
+            None::<String>,
+            "user-1",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-think", "Hello!");
+
+        let response = runner
+            .execute(&mut session, event, None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(response, "Hello user!");
+
+        let actions = dispatcher.actions.lock().await.clone();
+        for action in &actions {
+            if let omon_gateway::OutboundAction::Stream { chunk, .. } = action {
+                assert!(
+                    !chunk.content.contains("Internal deep thought"),
+                    "Dispatched stream chunk contained reasoning text: {:?}",
+                    chunk.content
+                );
+                assert!(
+                    !chunk.content.contains("<think>"),
+                    "Dispatched stream chunk contained <think> tag: {:?}",
+                    chunk.content
+                );
+            }
+        }
+
+        // Check persisted messages
+        let history: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, content FROM messages WHERE session_key = ? ORDER BY sequence ASC",
+        )
+        .bind(session_key.storage_key())
+        .fetch_all(&runner.pool)
+        .await
+        .unwrap();
+
+        let assistant_msg = history.iter().find(|(role, _)| role == "assistant");
+        assert!(assistant_msg.is_some());
+        let content = &assistant_msg.unwrap().1;
+        assert_eq!(content, "Hello user!");
+
+        server_handle.await.unwrap();
     }
 }
