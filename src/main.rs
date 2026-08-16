@@ -1291,6 +1291,55 @@ pub async fn recover_pending_delivery_obligations(
     Ok(count)
 }
 
+/// Startup recovery: finds sessions marked resume_pending from a previous run/crash/restart,
+/// reconstructs their last unfinished user turn, and re-dispatches them through the multiplexer.
+pub async fn recover_resume_pending_sessions(
+    pool: &SqlitePool,
+    multiplexer: &SessionMultiplexer,
+) -> Result<usize> {
+    let pending_keys = omon_gateway::storage::fetch_resume_pending_session_keys(pool).await?;
+    let mut resumed_count = 0;
+    for session_key in pending_keys {
+        let cleared =
+            omon_gateway::storage::clear_session_resume_pending(pool, &session_key.storage_key())
+                .await?;
+        if !cleared {
+            continue;
+        }
+
+        if let Some(unfinished) =
+            omon_gateway::storage::find_last_unfinished_user_turn(pool, &session_key.storage_key())
+                .await?
+        {
+            let attachments: Vec<omon_gateway::MessageAttachment> =
+                serde_json::from_str(&unfinished.metadata_json).unwrap_or_default();
+            let event = InboundEvent {
+                id: Uuid::new_v4(),
+                session: session_key.clone(),
+                platform_message_id: String::new(),
+                delivery_id: None,
+                content: unfinished.content,
+                attachments,
+                received_at: chrono::Utc::now(),
+            };
+            info!(
+                session = %session_key,
+                "re-dispatching unfinished user turn on restart recovery"
+            );
+            if let Err(error) = multiplexer.route(event).await {
+                tracing::error!(
+                    session = %session_key,
+                    %error,
+                    "failed to route resumed session event"
+                );
+            } else {
+                resumed_count += 1;
+            }
+        }
+    }
+    Ok(resumed_count)
+}
+
 fn tool_enabled(name: &str, enabled: Option<&[String]>) -> bool {
     let Some(enabled) = enabled else { return true };
     enabled.iter().any(|toolset| {
@@ -1911,6 +1960,12 @@ async fn run_gateway() -> Result<()> {
         "recovered pending outbound delivery obligations on boot"
     );
 
+    let recovered_sessions = recover_resume_pending_sessions(&pool, &multiplexer).await?;
+    info!(
+        recovered_sessions,
+        "recovered resume_pending sessions on boot"
+    );
+
     let scheduler = CronScheduler::with_dispatcher(
         pool.clone(),
         Arc::new(AgentCronExecutor {
@@ -1921,7 +1976,7 @@ async fn run_gateway() -> Result<()> {
     .with_hermes_sync(cron_sync);
     scheduler.start().await;
 
-    let mut poise_data = PoiseData::new(multiplexer, pool.clone());
+    let mut poise_data = PoiseData::new(multiplexer.clone(), pool.clone());
     poise_data.profile_router = profile_router;
     poise_data.llm = Some(llm.clone());
     poise_data.tools = tool_names;
@@ -1976,6 +2031,7 @@ async fn run_gateway() -> Result<()> {
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|error| OmonError::Config(format!("failed to listen for Ctrl+C: {error}")))?;
             info!("shutdown signal received");
+            let _ = multiplexer.mark_in_flight_resume_pending().await;
             for sm in shard_managers {
                 sm.shutdown_all().await;
             }
@@ -3023,6 +3079,83 @@ mod runner_tests {
             .unwrap()
             .unwrap();
         assert_eq!(obl2.state, "delivered");
+    }
+
+    #[tokio::test]
+    async fn test_recover_resume_pending_sessions_redispatches_unfinished_turn() {
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            Some("guild-1"),
+            "chan-rec-turn",
+            None::<String>,
+            "user-rec-turn",
+        );
+        super::ensure_agent_session(
+            &pool,
+            &omon_gateway::SessionContext::new(session_key.clone()),
+        )
+        .await
+        .unwrap();
+
+        // Persist an unfinished user turn
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, metadata_json)
+             VALUES ('msg-unfin', ?, 'user', 'resume this prompt', '[]')",
+        )
+        .bind(session_key.storage_key())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Mark resume_pending
+        omon_gateway::storage::mark_session_resume_pending(&pool, &session_key.storage_key())
+            .await
+            .unwrap();
+
+        let pending = omon_gateway::storage::fetch_resume_pending_session_keys(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+
+        struct MockRunner;
+        #[async_trait::async_trait]
+        impl omon_gateway::AgentRunner for MockRunner {
+            async fn run(
+                &self,
+                _session: &mut omon_gateway::SessionContext,
+                event: omon_gateway::InboundEvent,
+            ) -> omon_gateway::Result<()> {
+                assert_eq!(event.content, "resume this prompt");
+                Ok(())
+            }
+        }
+
+        let multiplexer = omon_gateway::SessionMultiplexer::new(
+            pool.clone(),
+            std::sync::Arc::new(MockRunner),
+            omon_gateway::MultiplexerConfig::default(),
+        );
+
+        let recovered = super::recover_resume_pending_sessions(&pool, &multiplexer)
+            .await
+            .unwrap();
+        assert_eq!(recovered, 1);
+
+        // Resume pending flag must now be cleared
+        let pending_after = omon_gateway::storage::fetch_resume_pending_session_keys(&pool)
+            .await
+            .unwrap();
+        assert!(pending_after.is_empty());
+
+        // A second recovery sweep should find 0 sessions and not resume twice
+        let recovered_second = super::recover_resume_pending_sessions(&pool, &multiplexer)
+            .await
+            .unwrap();
+        assert_eq!(recovered_second, 0);
     }
 
     fn drive_stripper(chunks: &[&str]) -> String {

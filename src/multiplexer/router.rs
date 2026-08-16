@@ -281,6 +281,17 @@ impl SessionMultiplexer {
         }
     }
 
+    /// Marks all currently tracked in-flight sessions as `resume_pending` in SQLite.
+    pub async fn mark_in_flight_resume_pending(&self) -> Result<usize> {
+        let mut count = 0;
+        for entry in self.sessions.iter() {
+            let key = entry.key();
+            crate::storage::mark_session_resume_pending(&self.pool, &key.storage_key()).await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Returns an activity heartbeat callback suitable for injecting into approval requesters.
     pub fn activity_heartbeat(&self) -> Arc<dyn Fn(&SessionKey) + Send + Sync> {
         let multiplexer = self.clone();

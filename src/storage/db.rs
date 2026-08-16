@@ -57,6 +57,114 @@ impl Database {
     }
 }
 
+/// Marks a session as having an in-flight or queued turn pending restart recovery.
+pub async fn mark_session_resume_pending(pool: &SqlitePool, session_key: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE sessions SET resume_pending = 1, updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) WHERE session_key = ?",
+    )
+    .bind(session_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Clears the resume_pending marker for a session. Returns `true` if the flag was set.
+pub async fn clear_session_resume_pending(pool: &SqlitePool, session_key: &str) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE sessions SET resume_pending = 0, updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) WHERE session_key = ? AND resume_pending = 1",
+    )
+    .bind(session_key)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Counts the number of sessions currently marked resume_pending.
+pub async fn count_resume_pending_sessions(pool: &SqlitePool) -> Result<i64> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE resume_pending = 1")
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
+#[derive(sqlx::FromRow)]
+struct ResumePendingSessionRow {
+    #[allow(dead_code)]
+    session_key: String,
+    platform: String,
+    guild_id: Option<String>,
+    channel_id: String,
+    thread_id: Option<String>,
+    user_id: String,
+}
+
+/// Queries all session keys that currently have resume_pending = 1.
+pub async fn fetch_resume_pending_session_keys(
+    pool: &SqlitePool,
+) -> Result<Vec<crate::SessionKey>> {
+    let rows: Vec<ResumePendingSessionRow> = sqlx::query_as(
+        "SELECT session_key, platform, guild_id, channel_id, thread_id, user_id FROM sessions WHERE resume_pending = 1 ORDER BY updated_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            crate::SessionKey::new(
+                row.platform,
+                row.guild_id,
+                row.channel_id,
+                row.thread_id,
+                row.user_id,
+            )
+        })
+        .collect())
+}
+
+#[derive(Clone, Debug)]
+pub struct UnfinishedTurn {
+    pub message_id: String,
+    pub content: String,
+    pub metadata_json: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Finds the last unfinished user turn for a session if the most recent transcript row is a user message.
+pub async fn find_last_unfinished_user_turn(
+    pool: &SqlitePool,
+    session_key: &str,
+) -> Result<Option<UnfinishedTurn>> {
+    let row: Option<(
+        String,
+        String,
+        String,
+        String,
+        chrono::DateTime<chrono::Utc>,
+    )> = sqlx::query_as(
+        "SELECT id, role, content, metadata_json, created_at
+         FROM messages
+         WHERE session_key = ?
+         ORDER BY sequence DESC
+         LIMIT 1",
+    )
+    .bind(session_key)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some((id, role, content, metadata_json, created_at)) = row {
+        if role == "user" {
+            return Ok(Some(UnfinishedTurn {
+                message_id: id,
+                content,
+                metadata_json,
+                created_at,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -271,5 +379,129 @@ mod tests {
         assert_eq!(recent.len(), 100);
         assert_eq!(recent.first().map(|row| row.0.as_str()), Some("5"));
         assert_eq!(recent.last().map(|row| row.0.as_str()), Some("104"));
+    }
+
+    #[tokio::test]
+    async fn migration_creates_resume_pending_column_and_index() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+
+        let row = sqlx::query("SELECT resume_pending FROM sessions LIMIT 0")
+            .fetch_optional(database.pool())
+            .await;
+        assert!(row.is_ok(), "resume_pending column should exist");
+
+        let rows = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'sessions'",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("indexes should be queryable");
+
+        let indexes: HashSet<String> = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+
+        assert!(indexes.contains("idx_sessions_resume_pending"));
+    }
+
+    #[tokio::test]
+    async fn test_resume_pending_flag_lifecycle_and_queries() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+        let pool = database.pool();
+
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json)
+             VALUES ('sess-1', 'discord', 'c1', 'u1', '{}'),
+                    ('sess-2', 'discord', 'c2', 'u2', '{}')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // Initially none are resume_pending
+        let pending = super::fetch_resume_pending_session_keys(pool)
+            .await
+            .unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(super::count_resume_pending_sessions(pool).await.unwrap(), 0);
+
+        // Mark sess-1 as resume_pending
+        super::mark_session_resume_pending(pool, "sess-1")
+            .await
+            .unwrap();
+        let pending = super::fetch_resume_pending_session_keys(pool)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].channel_id, "c1");
+        assert_eq!(super::count_resume_pending_sessions(pool).await.unwrap(), 1);
+
+        // Clear sess-1
+        let cleared = super::clear_session_resume_pending(pool, "sess-1")
+            .await
+            .unwrap();
+        assert!(cleared);
+        let cleared_again = super::clear_session_resume_pending(pool, "sess-1")
+            .await
+            .unwrap();
+        assert!(!cleared_again); // already cleared
+        assert_eq!(super::count_resume_pending_sessions(pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_last_unfinished_user_turn() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+        let pool = database.pool();
+
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json)
+             VALUES ('sess-turn', 'discord', 'c1', 'u1', '{}')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // No messages -> None
+        let turn = super::find_last_unfinished_user_turn(pool, "sess-turn")
+            .await
+            .unwrap();
+        assert!(turn.is_none());
+
+        // User message -> Some
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, metadata_json)
+             VALUES ('msg-u1', 'sess-turn', 'user', 'hello agent', '[]')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let turn = super::find_last_unfinished_user_turn(pool, "sess-turn")
+            .await
+            .unwrap()
+            .expect("should find turn");
+        assert_eq!(turn.content, "hello agent");
+        assert_eq!(turn.message_id, "msg-u1");
+
+        // Assistant message completes it -> None
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, metadata_json)
+             VALUES ('msg-a1', 'sess-turn', 'assistant', 'hello user', '{}')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let turn = super::find_last_unfinished_user_turn(pool, "sess-turn")
+            .await
+            .unwrap();
+        assert!(turn.is_none());
     }
 }

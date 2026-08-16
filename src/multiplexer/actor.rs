@@ -185,6 +185,11 @@ impl SessionActor {
                         TurnOutcome::Completed(result) => {
                             if result.is_ok() {
                                 self.context = turn_context;
+                                let _ = crate::storage::clear_session_resume_pending(
+                                    &self.pool,
+                                    &self.context.key.storage_key(),
+                                )
+                                .await;
                             }
                             self.complete_delivery(delivery_id.as_deref(), &result)
                                 .await;
@@ -217,6 +222,14 @@ impl SessionActor {
                                 "session actor shutting down",
                             )
                             .await;
+                            if let Err(error) = crate::storage::mark_session_resume_pending(
+                                &self.pool,
+                                &self.context.key.storage_key(),
+                            )
+                            .await
+                            {
+                                tracing::error!(session = %self.context.key, %error, "failed to mark resume_pending on shutdown");
+                            }
                         }
                     }
                     self.context.updated_at = Utc::now();
@@ -259,6 +272,16 @@ impl SessionActor {
         // Dropping the multiplexer closes all strong senders. Flush dirty state
         // on that graceful channel shutdown so actor memory can be reclaimed
         // without silently discarding the last in-memory session mutation.
+        if !pending_events.is_empty() {
+            if let Err(error) = crate::storage::mark_session_resume_pending(
+                &self.pool,
+                &self.context.key.storage_key(),
+            )
+            .await
+            {
+                tracing::error!(session = %self.context.key, %error, "failed to mark resume_pending for remaining pending events");
+            }
+        }
         if let Err(error) = self.flush_if_dirty().await {
             tracing::error!(session = %self.context.key, %error, "failed to flush session actor during shutdown");
         }
