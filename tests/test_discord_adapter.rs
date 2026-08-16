@@ -10,7 +10,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use omon_gateway::discord::adapter::{
     message_to_inbound, message_to_inbound_with_config, InboundFilterConfig,
 };
-use omon_gateway::discord::commands::is_user_allowed;
+use omon_gateway::discord::commands::{is_user_allowed, is_user_authorized};
 use omon_gateway::{
     approval_buttons, chunk_markdown, compose_reply_context, derive_auto_thread_name,
     is_authorized_clicker, parse_custom_id, render_user_prompt, safe_allowed_mentions,
@@ -700,6 +700,24 @@ fn channel_allow_and_ignore_lists() {
         },
     )
     .is_some());
+}
+
+#[test]
+fn user_authorization_allow_all_and_roles() {
+    // 1. Default open when both allowed_users and allowed_roles are empty
+    assert!(is_user_authorized(10, &[], &[], &[], false));
+
+    // 2. Allow-all bypasses non-empty user and role allowlists
+    assert!(is_user_authorized(10, &[], &[20, 30], &[100], true));
+
+    // 3. User allowlist allows matching user ID
+    assert!(is_user_authorized(20, &[], &[20, 30], &[], false));
+    assert!(!is_user_authorized(99, &[], &[20, 30], &[], false));
+
+    // 4. Role membership allows user possessing an allowed role
+    assert!(is_user_authorized(99, &[100, 200], &[], &[100], false));
+    assert!(is_user_authorized(99, &[200, 300], &[20], &[300], false));
+    assert!(!is_user_authorized(99, &[500], &[20], &[300], false));
 }
 
 #[tokio::test]

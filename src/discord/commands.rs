@@ -22,6 +22,8 @@ pub struct PoiseData {
     pub approvals: SmartApprovalGuard,
     pub free_response_channels: Vec<u64>,
     pub allowed_users: Vec<u64>,
+    pub allowed_roles: Vec<u64>,
+    pub allow_all_users: bool,
     pub allowed_channels: Vec<u64>,
     pub ignored_channels: Vec<u64>,
     /// Thread IDs the bot is actively participating in (created or @mentioned).
@@ -52,6 +54,8 @@ impl PoiseData {
             approvals: SmartApprovalGuard::new(),
             free_response_channels: Vec::new(),
             allowed_users: Vec::new(),
+            allowed_roles: Vec::new(),
+            allow_all_users: false,
             allowed_channels: Vec::new(),
             ignored_channels: Vec::new(),
             active_threads: Arc::new(RwLock::new(HashSet::new())),
@@ -96,11 +100,45 @@ pub fn all() -> Vec<poise::Command<PoiseData, CommandError>> {
 }
 
 pub fn is_user_allowed(allowed_users: &[u64], user_id: u64) -> bool {
-    allowed_users.is_empty() || allowed_users.contains(&user_id)
+    is_user_authorized(user_id, &[], allowed_users, &[], false)
+}
+
+/// Evaluates user authorization based on user ID allowlist, role membership, and allow-all bypass.
+pub fn is_user_authorized(
+    user_id: u64,
+    user_roles: &[u64],
+    allowed_users: &[u64],
+    allowed_roles: &[u64],
+    allow_all_users: bool,
+) -> bool {
+    if allow_all_users {
+        return true;
+    }
+    if allowed_users.is_empty() && allowed_roles.is_empty() {
+        return true;
+    }
+    if !allowed_users.is_empty() && allowed_users.contains(&user_id) {
+        return true;
+    }
+    if !allowed_roles.is_empty() && user_roles.iter().any(|r| allowed_roles.contains(r)) {
+        return true;
+    }
+    false
 }
 
 pub async fn command_check(ctx: PoiseContext<'_>) -> Result<bool, CommandError> {
-    if is_user_allowed(&ctx.data().allowed_users, ctx.author().id.get()) {
+    let data = ctx.data();
+    let user_roles: Vec<u64> = match ctx.author_member().await {
+        Some(member) => member.roles.iter().map(|r| r.get()).collect(),
+        None => Vec::new(),
+    };
+    if is_user_authorized(
+        ctx.author().id.get(),
+        &user_roles,
+        &data.allowed_users,
+        &data.allowed_roles,
+        data.allow_all_users,
+    ) {
         return Ok(true);
     }
 

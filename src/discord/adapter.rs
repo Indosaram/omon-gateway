@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::approval::{approval_buttons, is_approval_custom_id, SmartApprovalGuard};
-use super::commands::{self, CommandError, PoiseData};
+use super::commands::{self, is_user_authorized, CommandError, PoiseData};
 use super::throttler::{
     chunk_markdown, DiscordMessageTransport, LiveEditThrottler, SerenityMessageTransport,
     DISCORD_MESSAGE_LIMIT,
@@ -56,6 +56,9 @@ pub fn derive_auto_thread_name(content: &str, bot_user_id: serenity::UserId) -> 
 pub struct InboundFilterConfig<'a> {
     pub free_response_channels: &'a [u64],
     pub allowed_users: &'a [u64],
+    pub allowed_roles: &'a [u64],
+    pub user_roles: &'a [u64],
+    pub allow_all_users: bool,
     pub active_threads: &'a [u64],
     pub allowed_channels: &'a [u64],
     pub ignored_channels: &'a [u64],
@@ -307,6 +310,9 @@ impl DiscordAdapter {
         let config = InboundFilterConfig {
             free_response_channels: &self.data.free_response_channels,
             allowed_users: &self.data.allowed_users,
+            allowed_roles: &self.data.allowed_roles,
+            user_roles: &[],
+            allow_all_users: self.data.allow_all_users,
             active_threads: &active_threads,
             allowed_channels: &self.data.allowed_channels,
             ignored_channels: &self.data.ignored_channels,
@@ -366,9 +372,22 @@ async fn handle_event(
                 .read()
                 .map(|set| set.iter().copied().collect())
                 .unwrap_or_default();
+            let user_roles: Vec<u64> = if let Some(member) = &new_message.member {
+                member.roles.iter().map(|r| r.get()).collect()
+            } else if let Some(guild_id) = new_message.guild_id {
+                match ctx.http.get_member(guild_id, new_message.author.id).await {
+                    Ok(member) => member.roles.iter().map(|r| r.get()).collect(),
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
             let config = InboundFilterConfig {
                 free_response_channels: &data.free_response_channels,
                 allowed_users: &data.allowed_users,
+                allowed_roles: &data.allowed_roles,
+                user_roles: &user_roles,
+                allow_all_users: data.allow_all_users,
                 active_threads: &active_threads,
                 allowed_channels: &data.allowed_channels,
                 ignored_channels: &data.ignored_channels,
@@ -423,7 +442,18 @@ async fn handle_event(
             interaction: Interaction::Component(component),
         } => {
             if is_approval_custom_id(&component.data.custom_id) {
-                if !is_authorized_clicker(component.user.id.get(), &data.allowed_users) {
+                let component_roles: Vec<u64> = component
+                    .member
+                    .as_ref()
+                    .map(|m| m.roles.iter().map(|r| r.get()).collect())
+                    .unwrap_or_default();
+                if !is_user_authorized(
+                    component.user.id.get(),
+                    &component_roles,
+                    &data.allowed_users,
+                    &data.allowed_roles,
+                    data.allow_all_users,
+                ) {
                     let refusal = CreateInteractionResponse::Message(
                         CreateInteractionResponseMessage::new()
                             .ephemeral(true)
@@ -541,8 +571,13 @@ pub fn message_to_inbound_with_config(
         return None;
     }
 
-    if !config.allowed_users.is_empty() && !config.allowed_users.contains(&message.author.id.get())
-    {
+    if !is_user_authorized(
+        message.author.id.get(),
+        config.user_roles,
+        config.allowed_users,
+        config.allowed_roles,
+        config.allow_all_users,
+    ) {
         return None;
     }
 
