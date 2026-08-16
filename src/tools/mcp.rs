@@ -38,6 +38,7 @@ pub struct McpClientTool {
     next_id: Arc<AtomicU64>,
     http: reqwest::Client,
     stdio_lock: Arc<Mutex<()>>,
+    pub requires_approval: bool,
 }
 
 impl McpClientTool {
@@ -58,7 +59,13 @@ impl McpClientTool {
             next_id: Arc::new(AtomicU64::new(1)),
             http: reqwest::Client::new(),
             stdio_lock: Arc::new(Mutex::new(())),
+            requires_approval: false,
         }
+    }
+
+    pub fn with_approval(mut self, enabled: bool) -> Self {
+        self.requires_approval = enabled;
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -225,6 +232,23 @@ impl Tool for McpTool {
         })
     }
 
+    fn requires_approval(&self, args: &Value) -> Option<String> {
+        let tool_name = args
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let client = self.clients.iter().find(|client| client.name == tool_name);
+        if let Some(client) = client {
+            if client.requires_approval {
+                return Some(format!(
+                    "MCP external tool execution: '{}'",
+                    client.remote_tool
+                ));
+            }
+        }
+        None
+    }
+
     async fn execute(&self, args: Value) -> Result<Value, OmonError> {
         let name = args
             .get("tool")
@@ -253,6 +277,17 @@ impl Tool for McpClientTool {
 
     fn input_schema(&self) -> Value {
         self.input_schema.clone()
+    }
+
+    fn requires_approval(&self, _args: &Value) -> Option<String> {
+        if self.requires_approval {
+            Some(format!(
+                "MCP external tool execution: '{}'",
+                self.remote_tool
+            ))
+        } else {
+            None
+        }
     }
 
     async fn execute(&self, args: Value) -> Result<Value, OmonError> {

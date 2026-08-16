@@ -2164,7 +2164,10 @@ async fn run_gateway() -> Result<()> {
         approval_guard.clone(),
         std::time::Duration::from_secs(config.approval_timeout_secs),
     ));
-    let mut tools = ToolRegistry::new();
+    let mut tools = ToolRegistry::new().with_approval_requester(
+        approval_requester.clone(),
+        std::time::Duration::from_secs(config.approval_timeout_secs + 5),
+    );
     tools.register(
         TerminalTool::new(&config.workspace_root)
             .with_approval(

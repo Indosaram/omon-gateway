@@ -13,6 +13,7 @@ pub struct FileTool {
     root: PathBuf,
     max_read_bytes: usize,
     max_search_results: usize,
+    require_write_approval: bool,
 }
 
 impl FileTool {
@@ -21,7 +22,13 @@ impl FileTool {
             root: root.into(),
             max_read_bytes: 100 * 1024 * 1024,
             max_search_results: 1000,
+            require_write_approval: false,
         }
+    }
+
+    pub fn with_write_approval(mut self, enabled: bool) -> Self {
+        self.require_write_approval = enabled;
+        self
     }
 
     fn canonical_root(&self) -> Result<PathBuf, OmonError> {
@@ -219,6 +226,18 @@ impl Tool for FileTool {
             },
             "required": ["operation"]
         })
+    }
+
+    fn requires_approval(&self, args: &Value) -> Option<String> {
+        if self.require_write_approval {
+            if let Some(op) = args.get("operation").and_then(Value::as_str) {
+                if op.eq_ignore_ascii_case("write") {
+                    let path = args.get("path").and_then(Value::as_str).unwrap_or("file");
+                    return Some(format!("destructive file write to '{path}'"));
+                }
+            }
+        }
+        None
     }
 
     async fn execute(&self, args: Value) -> Result<Value, OmonError> {
