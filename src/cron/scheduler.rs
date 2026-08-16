@@ -20,6 +20,48 @@ use crate::{
 const LEASE_DURATION: TimeDelta = TimeDelta::minutes(30);
 const LEASE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+const CRON_SILENCE_TOKENS: &[&str] = &["[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"];
+
+fn is_silence_token_line(line: &str) -> bool {
+    let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let upper = normalized.to_uppercase();
+    CRON_SILENCE_TOKENS.iter().any(|&token| token == upper)
+}
+
+pub fn is_cron_silence_response(text: &str) -> bool {
+    let stripped = text.trim();
+    if stripped.is_empty() {
+        return true;
+    }
+
+    if is_silence_token_line(stripped) {
+        return true;
+    }
+
+    let lines: Vec<&str> = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|ln| !ln.is_empty())
+        .collect();
+    if let Some(&first) = lines.first() {
+        if is_silence_token_line(first) {
+            return true;
+        }
+    }
+    if let Some(&last) = lines.last() {
+        if is_silence_token_line(last) {
+            return true;
+        }
+    }
+
+    let upper = stripped.to_uppercase();
+    if upper.starts_with("[SILENT]") {
+        return true;
+    }
+
+    false
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CronJobSpec {
     pub expression: String,
@@ -748,9 +790,17 @@ impl CronScheduler {
                                 .get("content")
                                 .and_then(Value::as_str)
                                 .map(str::to_owned)
-                        })
-                        .unwrap_or_else(|| format!("Cron job {} completed", job.id));
-                    self.deliver(job, destination, content).await?;
+                        });
+                    if let Some(content) = content {
+                        if !content.trim().is_empty() && !is_cron_silence_response(&content) {
+                            self.deliver(job, destination, content).await?;
+                        } else {
+                            tracing::info!(
+                                job_id = %job.id,
+                                "cron job returned empty or silence response, suppressing delivery"
+                            );
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -995,5 +1045,85 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next5, now + TimeDelta::seconds(160));
+    }
+
+    #[test]
+    fn test_is_cron_silence_response_matches_sentinels_and_variants() {
+        assert!(is_cron_silence_response(""));
+        assert!(is_cron_silence_response("   \n  \t "));
+        assert!(is_cron_silence_response("[SILENT]"));
+        assert!(is_cron_silence_response("[silent]"));
+        assert!(is_cron_silence_response("SILENT"));
+        assert!(is_cron_silence_response("silent"));
+        assert!(is_cron_silence_response("NO_REPLY"));
+        assert!(is_cron_silence_response("no_reply"));
+        assert!(is_cron_silence_response("NO REPLY"));
+        assert!(is_cron_silence_response("no reply"));
+        assert!(is_cron_silence_response("[SILENT] No updates to report"));
+        assert!(is_cron_silence_response("[silent] no new issues found"));
+        assert!(is_cron_silence_response("Everything checked\n\n[SILENT]"));
+        assert!(is_cron_silence_response(
+            "[SILENT]\nChecked 5 repos, all green"
+        ));
+        assert!(is_cron_silence_response("NO_REPLY\nProcessed batch"));
+    }
+
+    #[test]
+    fn test_is_cron_silence_response_preserves_mid_sentence_content() {
+        assert!(!is_cron_silence_response(
+            "I considered staying [SILENT] but here is the summary of issues."
+        ));
+        assert!(!is_cron_silence_response("Silent retry succeeded"));
+        assert!(!is_cron_silence_response("Found 3 new vulnerabilities"));
+    }
+
+    struct SilentExecutor(Option<String>);
+
+    #[async_trait]
+    impl CronTaskExecutor for SilentExecutor {
+        async fn execute(&self, _job: &CronJob) -> Result<Option<String>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_job_suppresses_delivery_for_silent_and_empty_output() {
+        let database = crate::Database::connect("sqlite::memory:").await.unwrap();
+
+        // 1. Executor returning None suppresses delivery
+        let scheduler = CronScheduler::new(database.pool().clone(), Arc::new(SilentExecutor(None)));
+        let mut notifications = scheduler.subscribe();
+        let job = scheduler
+            .register_job(
+                "interval:1m",
+                serde_json::json!({
+                    "channel_id": 123456,
+                }),
+            )
+            .await
+            .unwrap();
+
+        scheduler.execute_job(&job).await.unwrap();
+        // Notification channel should have no message
+        assert!(notifications.try_recv().is_err());
+
+        // 2. Executor returning [SILENT] suppresses delivery
+        let silent_scheduler = CronScheduler::new(
+            database.pool().clone(),
+            Arc::new(SilentExecutor(Some("[SILENT]".into()))),
+        );
+        let mut silent_notifications = silent_scheduler.subscribe();
+        silent_scheduler.execute_job(&job).await.unwrap();
+        assert!(silent_notifications.try_recv().is_err());
+
+        // 3. Executor returning non-empty report delivers
+        let active_scheduler = CronScheduler::new(
+            database.pool().clone(),
+            Arc::new(SilentExecutor(Some("Report content".into()))),
+        );
+        let mut active_notifications = active_scheduler.subscribe();
+        active_scheduler.execute_job(&job).await.unwrap();
+        let note = active_notifications.try_recv().unwrap();
+        assert_eq!(note.content, "Report content");
     }
 }

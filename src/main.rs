@@ -1151,9 +1151,14 @@ impl CronTaskExecutor for AgentCronExecutor {
                 hermes.id
             )));
         }
-        let mut prompt = load_cron_skills(&hermes)?;
-        if !prompt.is_empty() && !hermes.prompt.trim().is_empty() {
-            prompt.push_str("\n\n[Task]\n");
+        let cron_hint = "[IMPORTANT: You are running as a scheduled cron job. DELIVERY: Your final response will be automatically delivered to the user — do NOT use send_message or try to deliver the output yourself. Just produce your report/output as your final response and the system handles the rest. SILENT: If there is genuinely nothing new to report, respond with exactly \"[SILENT]\" (nothing else) to suppress delivery. Never combine [SILENT] with content — either report your findings normally, or say [SILENT] and nothing more.]\n\n";
+        let mut prompt = cron_hint.to_string();
+        let skills = load_cron_skills(&hermes)?;
+        if !skills.is_empty() {
+            prompt.push_str(&skills);
+            if !hermes.prompt.trim().is_empty() {
+                prompt.push_str("\n\n[Task]\n");
+            }
         }
         prompt.push_str(&hermes.prompt);
         if let Some(output) = script_output.filter(|output| !output.trim().is_empty()) {
@@ -1193,7 +1198,8 @@ impl CronTaskExecutor for AgentCronExecutor {
         let event = InboundEvent::message(session_key, format!("cron:{}", job.id), prompt);
         let execution_tools =
             build_cron_tools(&hermes, &self.runner.tools, &self.runner.workspace_root)?;
-        self.runner
+        let response = self
+            .runner
             .execute(
                 &mut session,
                 event,
@@ -1201,8 +1207,12 @@ impl CronTaskExecutor for AgentCronExecutor {
                 execution_tools.as_ref(),
                 false,
             )
-            .await
-            .map(Some)
+            .await?;
+        if response.trim().is_empty() || omon_gateway::is_cron_silence_response(&response) {
+            Ok(None)
+        } else {
+            Ok(Some(response))
+        }
     }
 }
 
@@ -1283,10 +1293,14 @@ async fn execute_native_cron(
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         });
-    runner
+    let response = runner
         .execute(&mut session, event, enabled.as_deref(), None, false)
-        .await
-        .map(Some)
+        .await?;
+    if response.trim().is_empty() || omon_gateway::is_cron_silence_response(&response) {
+        Ok(None)
+    } else {
+        Ok(Some(response))
+    }
 }
 
 fn load_cron_skills(job: &HermesJob) -> Result<String> {
