@@ -128,6 +128,17 @@ pub struct UnfinishedTurn {
     pub content: String,
     pub metadata_json: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub platform_message_id: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LastMessageRow {
+    id: String,
+    role: String,
+    content: String,
+    metadata_json: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    platform_message_id: Option<String>,
 }
 
 /// Finds the last unfinished user turn for a session if the most recent transcript row is a user message.
@@ -135,14 +146,8 @@ pub async fn find_last_unfinished_user_turn(
     pool: &SqlitePool,
     session_key: &str,
 ) -> Result<Option<UnfinishedTurn>> {
-    let row: Option<(
-        String,
-        String,
-        String,
-        String,
-        chrono::DateTime<chrono::Utc>,
-    )> = sqlx::query_as(
-        "SELECT id, role, content, metadata_json, created_at
+    let row: Option<LastMessageRow> = sqlx::query_as(
+        "SELECT id, role, content, metadata_json, created_at, platform_message_id
          FROM messages
          WHERE session_key = ?
          ORDER BY sequence DESC
@@ -152,17 +157,34 @@ pub async fn find_last_unfinished_user_turn(
     .fetch_optional(pool)
     .await?;
 
-    if let Some((id, role, content, metadata_json, created_at)) = row {
-        if role == "user" {
+    if let Some(row) = row {
+        if row.role == "user" {
             return Ok(Some(UnfinishedTurn {
-                message_id: id,
-                content,
-                metadata_json,
-                created_at,
+                message_id: row.id,
+                content: row.content,
+                metadata_json: row.metadata_json,
+                created_at: row.created_at,
+                platform_message_id: row.platform_message_id,
             }));
         }
     }
     Ok(None)
+}
+
+/// Checks if a message with the given `platform_message_id` already exists in the transcript for `session_key`.
+pub async fn has_platform_message_id(
+    pool: &SqlitePool,
+    session_key: &str,
+    platform_message_id: &str,
+) -> Result<bool> {
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM messages WHERE session_key = ? AND platform_message_id = ? LIMIT 1",
+    )
+    .bind(session_key)
+    .bind(platform_message_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(exists.is_some())
 }
 
 #[cfg(test)]
@@ -503,5 +525,84 @@ mod tests {
             .await
             .unwrap();
         assert!(turn.is_none());
+    }
+
+    #[tokio::test]
+    async fn migration_creates_messages_platform_id_column_and_index() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+
+        let row = sqlx::query("SELECT platform_message_id FROM messages LIMIT 0")
+            .fetch_optional(database.pool())
+            .await;
+        assert!(row.is_ok(), "platform_message_id column should exist");
+
+        let rows = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages'",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("indexes should be queryable");
+
+        let indexes: HashSet<String> = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+
+        assert!(indexes.contains("idx_messages_session_platform_id"));
+    }
+
+    #[tokio::test]
+    async fn test_has_platform_message_id_dedup_query() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+        let pool = database.pool();
+
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json)
+             VALUES ('sess-dedup', 'discord', 'c1', 'u1', '{}')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // Empty transcript -> false
+        assert!(
+            !super::has_platform_message_id(pool, "sess-dedup", "plat-msg-123")
+                .await
+                .unwrap()
+        );
+
+        // Insert message with platform_message_id
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, platform_message_id)
+             VALUES ('m-dedup-1', 'sess-dedup', 'user', 'hello', 'plat-msg-123')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // Existing platform_message_id on same session -> true
+        assert!(
+            super::has_platform_message_id(pool, "sess-dedup", "plat-msg-123")
+                .await
+                .unwrap()
+        );
+
+        // Different platform_message_id -> false
+        assert!(
+            !super::has_platform_message_id(pool, "sess-dedup", "plat-msg-456")
+                .await
+                .unwrap()
+        );
+
+        // Same platform_message_id on different session -> false
+        assert!(
+            !super::has_platform_message_id(pool, "sess-other", "plat-msg-123")
+                .await
+                .unwrap()
+        );
     }
 }

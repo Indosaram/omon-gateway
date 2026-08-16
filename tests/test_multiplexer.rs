@@ -614,3 +614,55 @@ async fn delivery_ledger_deduplicates_concurrent_claims_and_records_latency() {
     assert!(entry.completed_at.is_some());
     assert!(entry.processing_latency_ms.unwrap() >= 0);
 }
+
+#[tokio::test]
+async fn transcript_level_inbound_dedup_skips_duplicate_platform_message_id() {
+    struct CountingRunner {
+        runs: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentRunner for CountingRunner {
+        async fn run(
+            &self,
+            _session: &mut SessionContext,
+            _event: InboundEvent,
+        ) -> Result<(), OmonError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let runner = Arc::new(CountingRunner {
+        runs: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let multiplexer = SessionMultiplexer::new(
+        database.pool().clone(),
+        runner.clone(),
+        MultiplexerConfig::default(),
+    );
+
+    let key = session("dedup-user");
+    let event1 = InboundEvent::message(key.clone(), "plat-msg-unique-1", "first prompt");
+    multiplexer.route(event1).await.unwrap();
+
+    // Give actor a moment to finish
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(runner.runs.load(Ordering::SeqCst), 1);
+
+    // Send another event with the exact same platform_message_id (simulating a replayed webhook/gateway event after ledger eviction)
+    let event2 = InboundEvent::message(key.clone(), "plat-msg-unique-1", "duplicate prompt");
+    multiplexer.route(event2).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Runner must NOT have run a second time:
+    assert_eq!(runner.runs.load(Ordering::SeqCst), 1);
+
+    // Send a new event with a different platform_message_id
+    let event3 = InboundEvent::message(key.clone(), "plat-msg-unique-2", "second prompt");
+    multiplexer.route(event3).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(runner.runs.load(Ordering::SeqCst), 2);
+}

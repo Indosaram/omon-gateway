@@ -110,6 +110,37 @@ impl SessionActor {
                     self.last_active_at = tokio::time::Instant::now();
                     self.context.updated_at = Utc::now();
                     self.dirty = true;
+
+                    if !event.platform_message_id.is_empty() {
+                        match crate::storage::has_platform_message_id(
+                            &self.pool,
+                            &self.context.key.storage_key(),
+                            &event.platform_message_id,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                tracing::info!(
+                                    session = %self.context.key,
+                                    platform_message_id = %event.platform_message_id,
+                                    "skipping replayed inbound turn: platform_message_id already exists in transcript"
+                                );
+                                self.complete_delivery(event.delivery_id.as_deref(), &Ok(()))
+                                    .await;
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    session = %self.context.key,
+                                    platform_message_id = %event.platform_message_id,
+                                    %error,
+                                    "failed to check transcript dedup index"
+                                );
+                            }
+                        }
+                    }
+
                     if let Err(error) = self.persist_inbound(&event).await {
                         tracing::error!(session = %self.context.key, %error, "failed to persist inbound event");
                     }
@@ -335,8 +366,8 @@ impl SessionActor {
     async fn persist_inbound(&self, event: &InboundEvent) -> Result<()> {
         ensure_session(&self.pool, &self.context).await?;
         sqlx::query(
-            "INSERT INTO messages (id, session_key, role, content, metadata_json, created_at)
-             VALUES (?, ?, 'user', ?, ?, ?)
+            "INSERT INTO messages (id, session_key, role, content, metadata_json, created_at, platform_message_id)
+             VALUES (?, ?, 'user', ?, ?, ?, ?)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(event.id.to_string())
@@ -344,6 +375,11 @@ impl SessionActor {
         .bind(render_user_prompt(event))
         .bind(serde_json::to_string(&event.attachments).map_err(serialization_error)?)
         .bind(event.received_at)
+        .bind(if event.platform_message_id.is_empty() {
+            None
+        } else {
+            Some(&event.platform_message_id)
+        })
         .execute(&self.pool)
         .await?;
         Ok(())
