@@ -24,6 +24,15 @@ use crate::{
     OutboundDispatcher, Result, SessionKey,
 };
 
+/// Determines if a chunk at `chunk_index` should reference a triggering message.
+pub fn should_chunk_reference(chunk_index: usize, reply_to: Option<MessageId>) -> Option<MessageId> {
+    if chunk_index == 0 {
+        reply_to
+    } else {
+        None
+    }
+}
+
 /// Returns safe Discord `AllowedMentions` settings that permit user pings and
 /// reply mentions, but deny server-wide `@everyone`/`@here` and role pings by default.
 pub fn safe_allowed_mentions() -> CreateAllowedMentions {
@@ -1032,19 +1041,53 @@ impl OutboundDispatcher for DiscordEgress {
     async fn dispatch(&self, action: OutboundAction) -> Result<()> {
         match action {
             OutboundAction::SendMessage {
-                session, content, ..
+                session,
+                content,
+                reply_to,
             } => {
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
-                for chunk in chunk_markdown(&content, DISCORD_MESSAGE_LIMIT) {
-                    channel
-                        .send_message(
-                            &http,
-                            CreateMessage::new()
-                                .content(chunk)
-                                .allowed_mentions(safe_allowed_mentions()),
-                        )
-                        .await?;
+                let reply_id = reply_to
+                    .as_deref()
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .map(MessageId::new);
+
+                let chunks = chunk_markdown(&content, DISCORD_MESSAGE_LIMIT);
+                for (i, chunk) in chunks.into_iter().enumerate() {
+                    let reference = should_chunk_reference(i, reply_id);
+                    if let Some(target_msg_id) = reference {
+                        let builder = CreateMessage::new()
+                            .content(chunk.clone())
+                            .reference_message((channel, target_msg_id))
+                            .allowed_mentions(safe_allowed_mentions());
+                        match channel.send_message(&http, builder).await {
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    target_msg_id = %target_msg_id,
+                                    "Failed to send reply with message reference; retrying without reference"
+                                );
+                                channel
+                                    .send_message(
+                                        &http,
+                                        CreateMessage::new()
+                                            .content(chunk)
+                                            .allowed_mentions(safe_allowed_mentions()),
+                                    )
+                                    .await?;
+                            }
+                        }
+                    } else {
+                        channel
+                            .send_message(
+                                &http,
+                                CreateMessage::new()
+                                    .content(chunk)
+                                    .allowed_mentions(safe_allowed_mentions()),
+                            )
+                            .await?;
+                    }
                 }
             }
             OutboundAction::EditMessage {
@@ -1452,5 +1495,15 @@ mod tests {
                 "expected {text:?} NOT to be detected as silence"
             );
         }
+    }
+
+    #[test]
+    fn test_should_chunk_reference() {
+        let reply_id = MessageId::new(123456);
+        assert_eq!(should_chunk_reference(0, Some(reply_id)), Some(reply_id));
+        assert_eq!(should_chunk_reference(1, Some(reply_id)), None);
+        assert_eq!(should_chunk_reference(2, Some(reply_id)), None);
+        assert_eq!(should_chunk_reference(0, None), None);
+        assert_eq!(should_chunk_reference(1, None), None);
     }
 }
