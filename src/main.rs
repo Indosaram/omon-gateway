@@ -1423,6 +1423,23 @@ impl CronTaskExecutor for AgentCronExecutor {
         let cron_hint = "[IMPORTANT: You are running as a scheduled cron job. DELIVERY: Your final response will be automatically delivered to the user — do NOT use send_message or try to deliver the output yourself. Just produce your report/output as your final response and the system handles the rest. SILENT: If there is genuinely nothing new to report, respond with exactly \"[SILENT]\" (nothing else) to suppress delivery. Never combine [SILENT] with content — either report your findings normally, or say [SILENT] and nothing more.]\n\n";
         let mut prompt = cron_hint.to_string();
 
+        let workdir = if let Some(custom_workdir) = hermes.workdir.as_ref() {
+            let roots = authorized_cron_roots(&hermes, &self.runner.workspace_root).ok();
+            if let Some(roots) = roots {
+                canonical_authorized_directory(custom_workdir, &roots, "Hermes workdir")
+                    .unwrap_or_else(|_| self.runner.workspace_root.clone())
+            } else {
+                self.runner.workspace_root.clone()
+            }
+        } else {
+            self.runner.workspace_root.clone()
+        };
+
+        if let Some(instructions) = resolve_workspace_instructions(&workdir) {
+            prompt.push_str(&instructions);
+            prompt.push_str("\n\n");
+        }
+
         let context_ids = parse_context_from_ids(hermes.context_from.as_ref());
         if !context_ids.is_empty() {
             let home_path = hermes_home(&hermes).ok();
@@ -1898,6 +1915,31 @@ pub fn build_cron_llm_config(
     }
 
     config
+}
+
+pub fn resolve_workspace_instructions(workdir: &Path) -> Option<String> {
+    const MAX_WORKSPACE_INSTRUCTION_CHARS: usize = 8000;
+    for filename in &["AGENTS.md", "agents.md", "CLAUDE.md", "claude.md"] {
+        let candidate = workdir.join(filename);
+        if candidate.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&candidate) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    let truncated: String =
+                        if trimmed.chars().count() > MAX_WORKSPACE_INSTRUCTION_CHARS {
+                            trimmed
+                                .chars()
+                                .take(MAX_WORKSPACE_INSTRUCTION_CHARS)
+                                .collect()
+                        } else {
+                            trimmed.to_string()
+                        };
+                    return Some(format!("[Workspace instructions]\n{truncated}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn run_cron_script(job: &HermesJob, script: &str, workspace_root: &Path) -> Result<String> {
@@ -3966,5 +4008,56 @@ mod runner_tests {
         assert_eq!(cfg5.model, "gpt-4o-mini");
         assert_eq!(cfg5.provider, omon_gateway::LlmProvider::OpenAi);
         assert_eq!(cfg5.base_url, None);
+    }
+
+    #[test]
+    fn test_resolve_workspace_instructions() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("omon-test-instructions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. None when neither AGENTS.md nor CLAUDE.md exists
+        assert_eq!(super::resolve_workspace_instructions(&temp_dir), None);
+
+        // 2. Loads AGENTS.md
+        std::fs::write(
+            temp_dir.join("AGENTS.md"),
+            "Rule 1: Always format code with cargo fmt.\n",
+        )
+        .unwrap();
+        let loaded = super::resolve_workspace_instructions(&temp_dir).unwrap();
+        assert_eq!(
+            loaded,
+            "[Workspace instructions]\nRule 1: Always format code with cargo fmt."
+        );
+
+        // 3. Precedence: AGENTS.md beats CLAUDE.md
+        std::fs::write(
+            temp_dir.join("CLAUDE.md"),
+            "Claude rules that should be ignored.",
+        )
+        .unwrap();
+        let loaded_prec = super::resolve_workspace_instructions(&temp_dir).unwrap();
+        assert!(loaded_prec.contains("Rule 1: Always format code with cargo fmt."));
+        assert!(!loaded_prec.contains("Claude rules"));
+
+        // 4. CLAUDE.md when AGENTS.md removed
+        std::fs::remove_file(temp_dir.join("AGENTS.md")).unwrap();
+        let loaded_claude = super::resolve_workspace_instructions(&temp_dir).unwrap();
+        assert_eq!(
+            loaded_claude,
+            "[Workspace instructions]\nClaude rules that should be ignored."
+        );
+
+        // 5. Truncation when exceeding 8000 chars
+        let long_content = "X".repeat(8500);
+        std::fs::write(temp_dir.join("CLAUDE.md"), &long_content).unwrap();
+        let loaded_trunc = super::resolve_workspace_instructions(&temp_dir).unwrap();
+        assert_eq!(
+            loaded_trunc,
+            format!("[Workspace instructions]\n{}", "X".repeat(8000))
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
