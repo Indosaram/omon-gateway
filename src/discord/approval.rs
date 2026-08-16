@@ -68,6 +68,7 @@ pub trait ApprovalRequester: Send + Sync {
         &self,
         session: &SessionKey,
         command: &str,
+        reason: &str,
     ) -> Result<ApprovalDecision, ApprovalError>;
 }
 
@@ -102,6 +103,7 @@ impl ApprovalRequester for DiscordApprovalRequester {
         &self,
         session: &SessionKey,
         command: &str,
+        reason: &str,
     ) -> Result<ApprovalDecision, ApprovalError> {
         let pattern_key = crate::security::derive_pattern_key(command);
         if self.guard.is_approved(session, &pattern_key).await {
@@ -121,6 +123,7 @@ impl ApprovalRequester for DiscordApprovalRequester {
                 session: session.clone(),
                 request_id,
                 command: command.to_owned(),
+                reason: reason.to_owned(),
             })
             .await
             .is_err()
@@ -347,12 +350,15 @@ mod tests {
         assert!(!guard.is_approved(&session_b, &pattern).await);
 
         // requester immediately auto-approves session A without prompting
-        let decision = requester.request_approval(&session_a, cmd).await.unwrap();
+        let decision = requester
+            .request_approval(&session_a, cmd, "recursive delete")
+            .await
+            .unwrap();
         assert_eq!(decision, ApprovalDecision::Session);
 
         // session B is not cached and times out
         let err = requester
-            .request_approval(&session_b, cmd)
+            .request_approval(&session_b, cmd, "recursive delete")
             .await
             .unwrap_err();
         assert_eq!(err, ApprovalError::Timeout);

@@ -140,10 +140,19 @@ impl TerminalTool {
             )));
         }
 
-        let gated = match self.approval_policy {
-            ApprovalPolicy::Never => false,
-            ApprovalPolicy::Always => true,
-            ApprovalPolicy::Smart => is_dangerous(command),
+        let finding = crate::security::detect_dangerous_command(command);
+        let (gated, reason) = match self.approval_policy {
+            ApprovalPolicy::Never => (false, String::new()),
+            ApprovalPolicy::Always => {
+                let reason = finding
+                    .map(|f| f.description)
+                    .unwrap_or_else(|| "approval policy: always".to_string());
+                (true, reason)
+            }
+            ApprovalPolicy::Smart => match finding {
+                Some(f) => (true, f.description),
+                None => (false, String::new()),
+            },
         };
         if !gated {
             return Ok(());
@@ -161,7 +170,7 @@ impl TerminalTool {
         })?;
         let decision = tokio::time::timeout(
             self.approval_timeout,
-            requester.request_approval(session, command),
+            requester.request_approval(session, command, &reason),
         )
         .await
         .map_err(|_| OmonError::Approval("approval request timed out".into()))?
@@ -324,6 +333,7 @@ impl Tool for TerminalTool {
     }
 }
 
+#[allow(dead_code)]
 pub fn is_dangerous(command: &str) -> bool {
     crate::security::is_dangerous(command)
 }
@@ -384,6 +394,7 @@ mod approval_tests {
             &self,
             _session: &SessionKey,
             _command: &str,
+            _reason: &str,
         ) -> Result<ApprovalDecision, ApprovalError> {
             self.requests.fetch_add(1, Ordering::SeqCst);
             self.result.clone()

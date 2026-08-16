@@ -6,9 +6,10 @@ use async_trait::async_trait;
 use poise::serenity_prelude as serenity;
 use regex::Regex;
 use serenity::all::{
-    ChannelId, ChannelType, CreateAllowedMentions, CreateAttachment, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateMessage, CreateThread, EditMessage, FullEvent,
-    GatewayIntents, GetMessages, HttpBuilder, Interaction, Message, MessageId, Typing,
+    ChannelId, ChannelType, Color, CreateAllowedMentions, CreateAttachment, CreateEmbed,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateThread,
+    EditMessage, FullEvent, GatewayIntents, GetMessages, HttpBuilder, Interaction, Message,
+    MessageId, Typing,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -1271,18 +1272,18 @@ impl OutboundDispatcher for DiscordEgress {
                 session,
                 request_id,
                 command,
+                reason,
             } => {
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
-                let content = format!(
-                    "Approval required before running this command:\n```text\n{}\n```",
-                    command
-                );
+                let content = build_approval_content(&command, &reason);
+                let embed = build_approval_embed(&command, &reason);
                 channel
                     .send_message(
                         &http,
                         CreateMessage::new()
                             .content(content)
+                            .embed(embed)
                             .components(approval_buttons(request_id))
                             .allowed_mentions(safe_allowed_mentions()),
                     )
@@ -1291,6 +1292,54 @@ impl OutboundDispatcher for DiscordEgress {
         }
         Ok(())
     }
+}
+
+pub const APPROVAL_REASON_BUDGET: usize = 300;
+pub const APPROVAL_COMMAND_EMBED_LIMIT: usize = 4000;
+pub const APPROVAL_CONTENT_LIMIT: usize = 2000;
+
+pub fn truncate_approval_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.chars().count() > APPROVAL_REASON_BUDGET {
+        let prefix: String = trimmed
+            .chars()
+            .take(APPROVAL_REASON_BUDGET.saturating_sub(18))
+            .collect();
+        format!("{prefix}... [truncated]")
+    } else if trimmed.is_empty() {
+        "dangerous command".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn truncate_approval_command(command: &str, max_len: usize) -> String {
+    let trimmed = command.trim();
+    if trimmed.chars().count() > max_len {
+        let prefix: String = trimmed.chars().take(max_len.saturating_sub(18)).collect();
+        format!("{prefix}\n... [truncated]")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn build_approval_embed(command: &str, reason: &str) -> CreateEmbed {
+    let reason_display = truncate_approval_reason(reason);
+    let cmd_display = truncate_approval_command(command, APPROVAL_COMMAND_EMBED_LIMIT);
+    CreateEmbed::new()
+        .title("⚠️ Approval Required")
+        .description(format!("```text\n{cmd_display}\n```"))
+        .field("Reason", reason_display, false)
+        .color(Color::from_rgb(243, 156, 18))
+}
+
+pub fn build_approval_content(command: &str, reason: &str) -> String {
+    let reason_display = truncate_approval_reason(reason);
+    let prefix = "⚠️ **Approval Required**\n\nCommand requested:\n```text\n";
+    let suffix = format!("\n```\n**Reason:** {reason_display}");
+    let budget = APPROVAL_CONTENT_LIMIT.saturating_sub(prefix.len() + suffix.len());
+    let cmd_display = truncate_approval_command(command, budget);
+    format!("{prefix}{cmd_display}{suffix}")
 }
 
 pub fn is_authorized_clicker(user_id: u64, allowed: &[u64]) -> bool {
@@ -1675,5 +1724,49 @@ mod tests {
         assert_eq!(should_chunk_reference(2, Some(reply_id)), None);
         assert_eq!(should_chunk_reference(0, None), None);
         assert_eq!(should_chunk_reference(1, None), None);
+    }
+
+    #[test]
+    fn test_approval_reason_and_command_truncation() {
+        let short_reason = "recursive delete";
+        assert_eq!(truncate_approval_reason(short_reason), "recursive delete");
+        assert_eq!(truncate_approval_reason(""), "dangerous command");
+
+        let long_reason = "a".repeat(500);
+        let truncated_reason = truncate_approval_reason(&long_reason);
+        assert!(truncated_reason.ends_with("... [truncated]"));
+        assert!(truncated_reason.chars().count() <= APPROVAL_REASON_BUDGET);
+
+        let short_cmd = "rm -rf /tmp/data";
+        assert_eq!(
+            truncate_approval_command(short_cmd, 100),
+            "rm -rf /tmp/data"
+        );
+
+        let long_cmd = "echo ".to_string() + &"x".repeat(5000);
+        let truncated_cmd = truncate_approval_command(&long_cmd, APPROVAL_COMMAND_EMBED_LIMIT);
+        assert!(truncated_cmd.ends_with("\n... [truncated]"));
+        assert!(truncated_cmd.chars().count() <= APPROVAL_COMMAND_EMBED_LIMIT);
+    }
+
+    #[test]
+    fn test_build_approval_embed_and_content() {
+        let cmd = "rm -rf /tmp/build";
+        let reason = "recursive delete";
+        let embed = build_approval_embed(cmd, reason);
+        let content = build_approval_content(cmd, reason);
+
+        let json = serde_json::to_value(&embed).unwrap();
+        assert_eq!(json["title"], "⚠️ Approval Required");
+        assert!(json["description"]
+            .as_str()
+            .unwrap()
+            .contains("```text\nrm -rf /tmp/build\n```"));
+        assert_eq!(json["fields"][0]["name"], "Reason");
+        assert_eq!(json["fields"][0]["value"], "recursive delete");
+
+        assert!(content.contains("⚠️ **Approval Required**"));
+        assert!(content.contains("rm -rf /tmp/build"));
+        assert!(content.contains("**Reason:** recursive delete"));
     }
 }

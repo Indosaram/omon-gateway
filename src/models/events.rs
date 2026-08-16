@@ -163,6 +163,7 @@ pub enum OutboundAction {
         session: SessionKey,
         request_id: Uuid,
         command: String,
+        reason: String,
     },
 }
 

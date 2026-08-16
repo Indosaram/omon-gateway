@@ -166,4 +166,28 @@ mod tests {
         assert!(detect_hardline_command("git reset --hard HEAD").is_none());
         assert!(detect_hardline_command("rm -rf /tmp/my_dir").is_none());
     }
+
+    #[test]
+    fn test_dangerous_finding_reasons() {
+        let finding = detect_dangerous_command("rm -r my_dir").unwrap();
+        assert_eq!(finding.description, "recursive delete");
+
+        let finding = detect_dangerous_command("chmod 777 script.sh").unwrap();
+        assert_eq!(finding.description, "world/other-writable permissions");
+
+        let finding = detect_dangerous_command("dd if=/dev/zero of=/dev/sda").unwrap();
+        assert_eq!(finding.description, "dd to raw block device");
+
+        let finding = detect_dangerous_command("sudo -S whoami").unwrap();
+        assert_eq!(
+            finding.description,
+            "sudo with privilege flag (stdin/askpass/shell/list)"
+        );
+
+        let finding = detect_dangerous_command("git reset --hard HEAD~1").unwrap();
+        assert_eq!(
+            finding.description,
+            "git reset --hard (destroys uncommitted changes)"
+        );
+    }
 }
