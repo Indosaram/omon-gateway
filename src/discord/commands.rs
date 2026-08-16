@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use poise::serenity_prelude as serenity;
@@ -20,6 +22,9 @@ pub struct PoiseData {
     pub approvals: SmartApprovalGuard,
     pub free_response_channels: Vec<u64>,
     pub allowed_users: Vec<u64>,
+    /// Thread IDs the bot is actively participating in (created or @mentioned).
+    /// Kept in-memory: fast, zero-overhead, sufficient for active gateway runtime lifecycle.
+    pub active_threads: Arc<RwLock<HashSet<u64>>>,
     pub primary_bot_id: Option<u64>,
     pub attachment_downloader: Option<AttachmentDownloader>,
     pub tool_registry: crate::ToolRegistry,
@@ -44,10 +49,24 @@ impl PoiseData {
             approvals: SmartApprovalGuard::new(),
             free_response_channels: Vec::new(),
             allowed_users: Vec::new(),
+            active_threads: Arc::new(RwLock::new(HashSet::new())),
             primary_bot_id: None,
             attachment_downloader: None,
             tool_registry: crate::ToolRegistry::new(),
         }
+    }
+
+    pub fn mark_thread_active(&self, thread_id: u64) {
+        if let Ok(mut set) = self.active_threads.write() {
+            set.insert(thread_id);
+        }
+    }
+
+    pub fn is_thread_active(&self, thread_id: u64) -> bool {
+        self.active_threads
+            .read()
+            .map(|set| set.contains(&thread_id))
+            .unwrap_or(false)
     }
 
     pub async fn stats(&self) -> Result<GatewayStats, sqlx::Error> {

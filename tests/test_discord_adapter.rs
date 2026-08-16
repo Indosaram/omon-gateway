@@ -427,7 +427,7 @@ fn converts_serenity_dm_mentions_threads_and_attachments() {
     assert_eq!(event.content, "inspect this");
     assert_eq!(event.session.thread_id, None);
 
-    let thread = message_fixture(Some(9), "thread continuation", Vec::new());
+    let thread = message_fixture(Some(9), "<@42> thread continuation", vec![42]);
     let event = message_to_inbound(&thread, bot_id, Some(ChannelType::PublicThread)).unwrap();
     assert_eq!(event.session.thread_id.as_deref(), Some("7"));
 }
@@ -438,19 +438,34 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
     let secondary = UserId::new(84);
     let thread = message_fixture(Some(9), "continue", Vec::new());
 
+    // With thread 7 registered as active, primary bot processes it
     assert!(message_to_inbound_with_config(
         &thread,
         primary,
         Some(ChannelType::PublicThread),
         &[],
         &[],
+        &[7],
         Some(primary.get()),
     )
     .is_some());
+    // Secondary bot ignores unmentioned thread even if active
     assert!(message_to_inbound_with_config(
         &thread,
         secondary,
         Some(ChannelType::PublicThread),
+        &[],
+        &[],
+        &[7],
+        Some(primary.get()),
+    )
+    .is_none());
+    // If thread is NOT in active_threads, even primary bot ignores it (stops thread spam!)
+    assert!(message_to_inbound_with_config(
+        &thread,
+        primary,
+        Some(ChannelType::PublicThread),
+        &[],
         &[],
         &[],
         Some(primary.get()),
@@ -464,6 +479,7 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         Some(ChannelType::Text),
         &[7],
         &[],
+        &[],
         Some(primary.get()),
     )
     .is_some());
@@ -472,6 +488,7 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         secondary,
         Some(ChannelType::Text),
         &[7],
+        &[],
         &[],
         Some(primary.get()),
     )
@@ -488,6 +505,7 @@ fn every_bot_answers_its_own_direct_messages_regardless_of_primary_bot() {
         &dm,
         secondary,
         Some(ChannelType::Private),
+        &[],
         &[],
         &[],
         Some(primary.get()),
@@ -509,6 +527,7 @@ fn every_bot_answers_its_own_direct_messages_regardless_of_primary_bot() {
         Some(ChannelType::Private),
         &[],
         &[],
+        &[],
         Some(primary.get()),
     );
     assert!(primary_event.is_some());
@@ -528,6 +547,7 @@ fn every_explicitly_mentioned_bot_owns_exactly_its_target() {
         Some(ChannelType::Text),
         &[],
         &[],
+        &[],
         Some(42),
     )
     .is_some());
@@ -535,6 +555,7 @@ fn every_explicitly_mentioned_bot_owns_exactly_its_target() {
         &message,
         UserId::new(84),
         Some(ChannelType::Text),
+        &[],
         &[],
         &[],
         Some(42),
@@ -546,9 +567,54 @@ fn every_explicitly_mentioned_bot_owns_exactly_its_target() {
         Some(ChannelType::Text),
         &[],
         &[],
+        &[],
         Some(42),
     )
     .is_none());
+}
+
+#[test]
+fn scoped_thread_participation_gates_unmentioned_and_allows_mentioned() {
+    let bot_id = UserId::new(42);
+    let thread_msg_unmentioned =
+        message_fixture(Some(9), "random server chatter in thread", Vec::new());
+    let thread_msg_mentioned = message_fixture(Some(9), "<@42> please help here", vec![42]);
+
+    // 1. Thread not in active set and unmentioned -> MUST NOT ROUTE (no spam)
+    assert!(message_to_inbound_with_config(
+        &thread_msg_unmentioned,
+        bot_id,
+        Some(ChannelType::PublicThread),
+        &[],
+        &[],
+        &[],
+        Some(42),
+    )
+    .is_none());
+
+    // 2. Mentioned in thread -> routes even if not previously active
+    assert!(message_to_inbound_with_config(
+        &thread_msg_mentioned,
+        bot_id,
+        Some(ChannelType::PublicThread),
+        &[],
+        &[],
+        &[],
+        Some(42),
+    )
+    .is_some());
+
+    // 3. Thread IS in active set -> routes unmentioned message for primary bot
+    assert!(message_to_inbound_with_config(
+        &thread_msg_unmentioned,
+        bot_id,
+        Some(ChannelType::PublicThread),
+        &[],
+        &[],
+        &[7],
+        Some(42),
+    )
+    .is_some());
 }
 
 #[tokio::test]

@@ -272,16 +272,26 @@ impl DiscordAdapter {
         bot_user_id: serenity::UserId,
         channel_type: Option<ChannelType>,
     ) -> Result<bool> {
+        let active_threads: Vec<u64> = self
+            .data
+            .active_threads
+            .read()
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
         let Some(event) = message_to_inbound_with_config(
             message,
             bot_user_id,
             channel_type,
             &self.data.free_response_channels,
             &self.data.allowed_users,
+            &active_threads,
             self.data.primary_bot_id,
         ) else {
             return Ok(false);
         };
+        if channel_type.is_some_and(is_thread) {
+            self.data.mark_thread_active(message.channel_id.get());
+        }
         route_claimed_event(&self.data, event).await
     }
 }
@@ -315,14 +325,23 @@ async fn handle_event(
                 .await
                 .map(|u| u.id)
                 .unwrap_or(ctx.cache.current_user().id);
+            let active_threads: Vec<u64> = data
+                .active_threads
+                .read()
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default();
             if let Some(event) = message_to_inbound_with_config(
                 new_message,
                 bot_user_id,
                 channel_type,
                 &data.free_response_channels,
                 &data.allowed_users,
+                &active_threads,
                 data.primary_bot_id,
             ) {
+                if channel_type.is_some_and(is_thread) {
+                    data.mark_thread_active(new_message.channel_id.get());
+                }
                 if event.content.trim().eq_ignore_ascii_case("/stop") {
                     global_debouncer().cancel(&event.session).await;
                     tracing::info!(session = %event.session, "Routing Discord stop command immediately");
@@ -421,6 +440,7 @@ pub fn message_to_inbound(
         channel_type,
         &[],
         &[],
+        &[],
         Some(bot_user_id.get()),
     )
 }
@@ -431,6 +451,7 @@ pub fn message_to_inbound_with_config(
     channel_type: Option<ChannelType>,
     free_response_channels: &[u64],
     allowed_users: &[u64],
+    active_threads: &[u64],
     primary_bot_id: Option<u64>,
 ) -> Option<InboundEvent> {
     if message.author.bot || message.webhook_id.is_some() {
@@ -466,7 +487,8 @@ pub fn message_to_inbound_with_config(
             return None;
         }
     } else {
-        let is_implicit_response_channel = is_dm || is_thread || is_free_channel;
+        let is_active_thread = is_thread && active_threads.contains(&message.channel_id.get());
+        let is_implicit_response_channel = is_dm || is_active_thread || is_free_channel;
         if !is_implicit_response_channel {
             return None;
         }
