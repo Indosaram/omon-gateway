@@ -92,6 +92,7 @@ mod tests {
             "memories",
             "cron_runs",
             "delivery_obligations",
+            "approval_allowlist",
         ] {
             assert!(tables.contains(expected), "missing table {expected}");
         }

@@ -5,6 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serenity::all::{ButtonStyle, CreateActionRow, CreateButton};
+use sqlx::SqlitePool;
 use thiserror::Error;
 use tokio::sync::{oneshot, Mutex, RwLock};
 use uuid::Uuid;
@@ -111,6 +112,7 @@ pub struct SmartApprovalGuard {
     session_cache: Arc<RwLock<HashMap<SessionKey, HashSet<String>>>>,
     yolo_sessions: Arc<RwLock<HashSet<SessionKey>>>,
     always_cache: Arc<RwLock<HashSet<String>>>,
+    pool: Arc<RwLock<Option<SqlitePool>>>,
 }
 
 #[async_trait]
@@ -250,6 +252,31 @@ impl SmartApprovalGuard {
         Self::default()
     }
 
+    pub fn with_pool(self, pool: SqlitePool) -> Self {
+        *self.pool.try_write().expect("uncontended lock") = Some(pool);
+        self
+    }
+
+    pub async fn set_pool(&self, pool: SqlitePool) {
+        *self.pool.write().await = Some(pool);
+    }
+
+    pub async fn load_persisted_allowlist(&self) -> Result<usize, sqlx::Error> {
+        let pool = self.pool.read().await.clone();
+        let Some(pool) = pool else {
+            return Ok(0);
+        };
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT pattern_key FROM approval_allowlist")
+            .fetch_all(&pool)
+            .await?;
+        let mut always = self.always_cache.write().await;
+        let count = rows.len();
+        for (pattern,) in rows {
+            always.insert(pattern);
+        }
+        Ok(count)
+    }
+
     pub async fn is_approved(&self, session: &SessionKey, pattern_key: &str) -> bool {
         if self.always_cache.read().await.contains(pattern_key) {
             return true;
@@ -273,6 +300,31 @@ impl SmartApprovalGuard {
             .write()
             .await
             .insert(pattern_key.to_string());
+
+        let pool = self.pool.read().await.clone();
+        if let Some(pool) = pool {
+            let pattern = pattern_key.to_string();
+            if let Err(error) = sqlx::query(
+                "INSERT INTO approval_allowlist (pattern_key) VALUES (?) ON CONFLICT(pattern_key) DO NOTHING",
+            )
+            .bind(&pattern)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(%error, pattern = %pattern, "failed to persist always-allow approval");
+            }
+        }
+    }
+
+    pub async fn approve_permanent(&self, pattern_key: &str) {
+        self.approve_always(pattern_key).await;
+    }
+
+    pub async fn load_permanent(&self, patterns: impl IntoIterator<Item = String>) {
+        let mut always = self.always_cache.write().await;
+        for pat in patterns {
+            always.insert(pat);
+        }
     }
 
     pub async fn is_yolo(&self, session: &SessionKey) -> bool {
@@ -669,5 +721,48 @@ mod tests {
             "expected heartbeat callback to be called"
         );
         assert_eq!(sessions[0], session);
+    }
+
+    #[tokio::test]
+    async fn test_permanent_allowlist_persistence_roundtrip_and_auto_approval() {
+        let db = crate::Database::connect("sqlite::memory:").await.unwrap();
+
+        // 1. Initial guard with DB pool - approve a pattern as Always
+        let guard_1 = SmartApprovalGuard::new().with_pool(db.pool().clone());
+        let cmd = "rm -rf /tmp/build_cache";
+        let pattern_key = crate::security::derive_pattern_key(cmd);
+
+        let session = SessionKey::new("discord", None::<String>, "chan1", None::<String>, "user1");
+
+        assert!(!guard_1.is_approved(&session, &pattern_key).await);
+
+        guard_1.approve_always(&pattern_key).await;
+        assert!(guard_1.is_approved(&session, &pattern_key).await);
+
+        // 2. Verify row exists in DB
+        let db_rows: Vec<(String,)> = sqlx::query_as("SELECT pattern_key FROM approval_allowlist")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(db_rows.len(), 1);
+        assert_eq!(db_rows[0].0, pattern_key);
+
+        // 3. Simulate process restart: create fresh guard with the same pool and load allowlist
+        let guard_2 = SmartApprovalGuard::new().with_pool(db.pool().clone());
+        assert!(!guard_2.is_approved(&session, &pattern_key).await);
+
+        let loaded = guard_2.load_persisted_allowlist().await.unwrap();
+        assert_eq!(loaded, 1);
+        assert!(guard_2.is_approved(&session, &pattern_key).await);
+
+        // 4. Requester using restarted guard immediately auto-approves without prompting
+        let requester = DiscordApprovalRequester::new(guard_2, Duration::from_millis(50));
+        requester.set_dispatcher(Arc::new(MockDispatcher)).await;
+
+        let decision = requester
+            .request_approval(&session, cmd, "recursive delete")
+            .await
+            .unwrap();
+        assert_eq!(decision, ApprovalDecision::Session);
     }
 }

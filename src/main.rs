@@ -1811,7 +1811,12 @@ async fn run_gateway() -> Result<()> {
     let pool = init_pool(&config.database_url).await?;
     let memory = MemoryStore::new(pool.clone());
 
-    let approval_guard = SmartApprovalGuard::new();
+    let approval_guard = SmartApprovalGuard::new().with_pool(pool.clone());
+    let loaded_allowlist = approval_guard.load_persisted_allowlist().await?;
+    info!(
+        loaded_allowlist,
+        "loaded persisted approval allowlist entries"
+    );
     let approval_requester = Arc::new(DiscordApprovalRequester::new(
         approval_guard.clone(),
         std::time::Duration::from_secs(config.approval_timeout_secs),

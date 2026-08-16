@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS approval_allowlist (
+    pattern_key TEXT PRIMARY KEY NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
