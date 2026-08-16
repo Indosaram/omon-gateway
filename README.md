@@ -219,6 +219,8 @@ launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 | `DISCORD_ALLOW_BOTS` | `none` | Bot handling policy: `none` (default), `mentions` (respond only when @-mentioned), `all` |
 | `DISCORD_CHANNEL_CONTEXT` | `false` | When true, @mentions in guild channels backfill recent channel history as conversation context |
 | `DISCORD_CHANNEL_CONTEXT_LIMIT` | `10` | Maximum preceding messages to backfill when channel context is enabled (clamped to <= 25) |
+| `DISCORD_CHANNEL_TOPIC_CONTEXT` | `false` | When true, fetches channel topic and forum parent description as prompt context |
+| `DISCORD_CHANNEL_PROMPTS` | Optional | JSON object mapping channel IDs to custom `system_prompt` and `skills` |
 | `DISCORD_PROCESSING_REACTIONS` | `true` | When true, adds 👀 reaction when processing starts, swapping to ✅ on success or ❌ on failure |
 | `DISCORD_CHUNK_PAGINATION` | `true` | When true, adds (i/N) pagination indicator headers to messages split across multiple chunks |
 | `DISCORD_RUNTIME_FOOTER` | `false` | When true, appends a compact runtime metadata footer (`model · context% · cwd`) to the final assistant message |

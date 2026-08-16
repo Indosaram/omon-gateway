@@ -272,6 +272,67 @@ pub fn parse_profile_routes(json_str: &str) -> Vec<ProfileRoute> {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPromptConfig {
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default, alias = "toolsets")]
+    pub skills: Option<Vec<String>>,
+}
+
+/// Parses per-channel prompts and skill mappings from a JSON mapping string:
+/// `{"channel_id": {"system_prompt": "...", "skills": ["..."]}}` or `{"channel_id": "prompt"}`.
+pub fn parse_channel_prompts(json_str: &str) -> Vec<ProfileRoute> {
+    let trimmed = json_str.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PromptOrConfig {
+        Prompt(String),
+        Config(ChannelPromptConfig),
+    }
+
+    let map: std::result::Result<std::collections::HashMap<String, PromptOrConfig>, _> =
+        serde_json::from_str(trimmed);
+    match map {
+        Ok(entries) => {
+            let mut routes = Vec::new();
+            for (chan_key, val) in entries {
+                let Ok(channel_id) = chan_key.trim().parse::<u64>() else {
+                    tracing::warn!(
+                        chan_key,
+                        "invalid channel ID in DISCORD_CHANNEL_PROMPTS JSON key"
+                    );
+                    continue;
+                };
+                let (system_prompt, skills) = match val {
+                    PromptOrConfig::Prompt(p) => (Some(p), None),
+                    PromptOrConfig::Config(c) => (c.system_prompt, c.skills),
+                };
+                routes.push(ProfileRoute {
+                    name: Some(format!("channel-prompt-{channel_id}")),
+                    guild: None,
+                    channel: Some(channel_id),
+                    thread: None,
+                    enabled: true,
+                    model: None,
+                    system_prompt,
+                    enabled_toolsets: skills,
+                });
+            }
+            routes.sort_by_key(|r| r.channel);
+            routes
+        }
+        Err(err) => {
+            tracing::warn!(%err, raw = %trimmed, "failed to parse DISCORD_CHANNEL_PROMPTS JSON; falling back to empty");
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +433,41 @@ mod tests {
         }]);
 
         assert!(router.match_route(Some(100), 200, None).is_none());
+    }
+
+    #[test]
+    fn test_parse_channel_prompts_json() {
+        let json = r#"{
+            "123456": {
+                "system_prompt": "You are a Rust compiler specialist",
+                "skills": ["terminal", "file"]
+            },
+            "789012": "Short system prompt only"
+        }"#;
+
+        let routes = parse_channel_prompts(json);
+        assert_eq!(routes.len(), 2);
+
+        let r1 = routes.iter().find(|r| r.channel == Some(123456)).unwrap();
+        assert_eq!(
+            r1.system_prompt.as_deref(),
+            Some("You are a Rust compiler specialist")
+        );
+        assert_eq!(
+            r1.enabled_toolsets.as_deref(),
+            Some(&["terminal".to_string(), "file".to_string()][..])
+        );
+
+        let r2 = routes.iter().find(|r| r.channel == Some(789012)).unwrap();
+        assert_eq!(
+            r2.system_prompt.as_deref(),
+            Some("Short system prompt only")
+        );
+        assert_eq!(r2.enabled_toolsets, None);
+
+        // Empty string and invalid JSON
+        assert!(parse_channel_prompts("").is_empty());
+        assert!(parse_channel_prompts("not valid json").is_empty());
     }
 
     #[test]

@@ -20,8 +20,9 @@ pub use ledger::{DeliveryLedgerEntry, DeliveryLedgerService};
 pub use memory::{Memory, MemoryStore};
 pub use models::*;
 pub use multiplexer::{
-    parse_profile_routes, AgentRunner, MultiplexerConfig, OutboundDispatcher, ProfileRoute,
-    ProfileRouter, RestartLoopGuard, ScaleToZero, SessionActor, SessionMultiplexer,
+    parse_channel_prompts, parse_profile_routes, AgentRunner, ChannelPromptConfig,
+    MultiplexerConfig, OutboundDispatcher, ProfileRoute, ProfileRouter, RestartLoopGuard,
+    ScaleToZero, SessionActor, SessionMultiplexer,
 };
 pub use security::*;
 pub use storage::Database;

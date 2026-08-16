@@ -385,6 +385,7 @@ struct Config {
     profile_routes: Vec<ProfileRoute>,
     runtime_footer: bool,
     allow_bots: omon_gateway::AllowBotsMode,
+    channel_topic_context: bool,
 }
 
 impl Config {
@@ -461,6 +462,13 @@ impl Config {
             });
         let _ = std::fs::create_dir_all(&workspace_root);
 
+        let mut profile_routes =
+            parse_profile_routes(&optional_env("DISCORD_PROFILE_ROUTES").unwrap_or_default());
+        let channel_prompt_routes = omon_gateway::parse_channel_prompts(
+            &optional_env("DISCORD_CHANNEL_PROMPTS").unwrap_or_default(),
+        );
+        profile_routes.extend(channel_prompt_routes);
+
         Ok(Self {
             discord_bot_tokens: tokens,
             database_url: env::var("DATABASE_URL")
@@ -482,6 +490,10 @@ impl Config {
             auto_thread: parse_bool_from(optional_env("DISCORD_AUTO_THREAD").as_deref(), false),
             channel_context: parse_bool_from(
                 optional_env("DISCORD_CHANNEL_CONTEXT").as_deref(),
+                false,
+            ),
+            channel_topic_context: parse_bool_from(
+                optional_env("DISCORD_CHANNEL_TOPIC_CONTEXT").as_deref(),
                 false,
             ),
             channel_context_limit: optional_env("DISCORD_CHANNEL_CONTEXT_LIMIT")
@@ -510,9 +522,7 @@ impl Config {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
-            profile_routes: parse_profile_routes(
-                &optional_env("DISCORD_PROFILE_ROUTES").unwrap_or_default(),
-            ),
+            profile_routes,
             runtime_footer: parse_bool_from(
                 optional_env("DISCORD_RUNTIME_FOOTER").as_deref(),
                 false,
@@ -2270,6 +2280,7 @@ async fn run_gateway() -> Result<()> {
     poise_data.allowed_channels = config.allowed_channels.clone();
     poise_data.ignored_channels = config.ignored_channels.clone();
     poise_data.auto_thread = config.auto_thread;
+    poise_data.channel_topic_context = config.channel_topic_context;
     poise_data.channel_context = config.channel_context;
     poise_data.channel_context_limit = config.channel_context_limit;
     poise_data.processing_reactions = config.processing_reactions;

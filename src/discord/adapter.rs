@@ -191,6 +191,31 @@ pub fn format_channel_context<A: AsRef<str>, C: AsRef<str>>(messages: &[(A, C)])
     format!("[Recent channel context]\n{}", lines.join("\n"))
 }
 
+/// Formats channel topic and/or forum parent description into a conversational context block.
+pub fn format_channel_topic_context(
+    channel_topic: Option<&str>,
+    parent_topic: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(parent) = parent_topic {
+        let trimmed = parent.trim();
+        if !trimmed.is_empty() {
+            lines.push(format!("[Forum Description]\n{trimmed}"));
+        }
+    }
+    if let Some(topic) = channel_topic {
+        let trimmed = topic.trim();
+        if !trimmed.is_empty() {
+            lines.push(format!("[Channel Topic]\n{trimmed}"));
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n\n")
+    }
+}
+
 /// Derives a clean thread name from a user message when auto-threading on mention.
 pub fn derive_auto_thread_name(content: &str, bot_user_id: serenity::UserId) -> String {
     let stripped = strip_bot_mention(content, bot_user_id);
@@ -765,6 +790,32 @@ async fn handle_event(
                 message_to_inbound_with_config(new_message, bot_user_id, channel_type, &config)
             {
                 let is_dm = channel_type == Some(ChannelType::Private);
+                if data.channel_topic_context && !is_dm {
+                    if let Ok(serenity::Channel::Guild(guild_channel)) =
+                        new_message.channel_id.to_channel(ctx).await
+                    {
+                        let parent_topic = if let Some(parent_id) = guild_channel.parent_id {
+                            match parent_id.to_channel(ctx).await {
+                                Ok(serenity::Channel::Guild(parent_chan)) => parent_chan.topic,
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let topic_block = format_channel_topic_context(
+                            guild_channel.topic.as_deref(),
+                            parent_topic.as_deref(),
+                        );
+                        if !topic_block.is_empty() {
+                            if event.content.trim().is_empty() {
+                                event.content = topic_block;
+                            } else {
+                                event.content = format!("{topic_block}\n\n{}", event.content);
+                            }
+                        }
+                    }
+                }
+
                 if data.channel_context
                     && !is_dm
                     && is_explicit_mention
@@ -2115,6 +2166,31 @@ mod tests {
 
     fn test_session(name: &str) -> SessionKey {
         SessionKey::new("discord", Some("guild"), "channel", None::<String>, name)
+    }
+
+    #[test]
+    fn test_format_channel_topic_context() {
+        // Both channel topic and forum parent description
+        let both = format_channel_topic_context(
+            Some("Questions about async runtime"),
+            Some("Rust Engineering Forum"),
+        );
+        assert_eq!(
+            both,
+            "[Forum Description]\nRust Engineering Forum\n\n[Channel Topic]\nQuestions about async runtime"
+        );
+
+        // Only channel topic
+        let chan_only = format_channel_topic_context(Some("General discussion"), None);
+        assert_eq!(chan_only, "[Channel Topic]\nGeneral discussion");
+
+        // Only parent description
+        let parent_only = format_channel_topic_context(None, Some("Community Forum"));
+        assert_eq!(parent_only, "[Forum Description]\nCommunity Forum");
+
+        // Empty / whitespace
+        assert_eq!(format_channel_topic_context(None, None), "");
+        assert_eq!(format_channel_topic_context(Some("  "), Some("")), "");
     }
 
     #[test]
