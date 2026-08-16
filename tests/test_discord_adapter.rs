@@ -778,3 +778,49 @@ fn message_fixture(guild_id: Option<u64>, content: &str, mentions: Vec<u64>) -> 
     }))
     .unwrap()
 }
+
+#[tokio::test]
+async fn coalesces_split_messages_and_unions_attachments() {
+    let session = SessionKey::new(
+        "discord",
+        Some("guild"),
+        "channel",
+        None::<String>,
+        "author",
+    );
+    let mut event1 = InboundEvent::message(session.clone(), "msg-chunk-1", "Hello from part 1");
+    event1.attachments.push(MessageAttachment {
+        id: "att-1".into(),
+        filename: "file1.txt".into(),
+        url: "https://example.com/file1.txt".into(),
+        content_type: Some("text/plain".into()),
+        size_bytes: Some(123),
+        local_path: None,
+    });
+
+    let mut event2 =
+        InboundEvent::message(session.clone(), "msg-chunk-2", "and continuation part 2");
+    event2.delivery_id = Some("discord:msg-chunk-2".into());
+    event2.attachments.push(MessageAttachment {
+        id: "att-2".into(),
+        filename: "file2.png".into(),
+        url: "https://example.com/file2.png".into(),
+        content_type: Some("image/png".into()),
+        size_bytes: Some(456),
+        local_path: None,
+    });
+
+    let coalesced = omon_gateway::coalesce_inbound_events(vec![event1, event2]).unwrap();
+    assert_eq!(
+        coalesced.content,
+        "Hello from part 1\nand continuation part 2"
+    );
+    assert_eq!(coalesced.platform_message_id, "msg-chunk-2");
+    assert_eq!(
+        coalesced.delivery_id.as_deref(),
+        Some("discord:msg-chunk-2")
+    );
+    assert_eq!(coalesced.attachments.len(), 2);
+    assert_eq!(coalesced.attachments[0].id, "att-1");
+    assert_eq!(coalesced.attachments[1].id, "att-2");
+}

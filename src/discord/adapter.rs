@@ -23,6 +23,147 @@ use crate::{
     OutboundDispatcher, Result, SessionKey,
 };
 
+/// Default debounce window for coalescing rapid client-split messages (~600ms).
+pub const DEFAULT_DEBOUNCE_DURATION: std::time::Duration = std::time::Duration::from_millis(600);
+
+static GLOBAL_DEBOUNCER: std::sync::LazyLock<SplitMessageDebouncer> =
+    std::sync::LazyLock::new(SplitMessageDebouncer::default);
+
+pub fn global_debouncer() -> &'static SplitMessageDebouncer {
+    &GLOBAL_DEBOUNCER
+}
+
+/// Pure testable helper to coalesce multiple buffered messages from a single
+/// session into a single `InboundEvent`.
+///
+/// Contents are concatenated in arrival order (separated by newlines), attachments
+/// are unioned with duplicate IDs removed, and the LAST message's platform id and
+/// delivery id are used so that ledger deduplication semantics remain correct.
+pub fn coalesce_inbound_events(events: Vec<InboundEvent>) -> Option<InboundEvent> {
+    if events.is_empty() {
+        return None;
+    }
+    if events.len() == 1 {
+        return events.into_iter().next();
+    }
+
+    let first = &events[0];
+    let last = events.last().unwrap();
+    let session = first.session.clone();
+
+    let contents: Vec<&str> = events
+        .iter()
+        .map(|e| e.content.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    let content = contents.join("\n");
+
+    let mut attachments = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    for event in &events {
+        for attachment in &event.attachments {
+            if seen_ids.insert(attachment.id.clone()) {
+                attachments.push(attachment.clone());
+            }
+        }
+    }
+
+    let platform_message_id = last.platform_message_id.clone();
+    let delivery_id = last
+        .delivery_id
+        .clone()
+        .or_else(|| Some(format!("discord:{platform_message_id}")));
+
+    let mut coalesced =
+        InboundEvent::message(session, platform_message_id, content).with_attachments(attachments);
+    coalesced.id = first.id;
+    coalesced.received_at = first.received_at;
+    coalesced.delivery_id = delivery_id;
+    Some(coalesced)
+}
+
+struct DebounceBatch {
+    events: Vec<InboundEvent>,
+    generation: u64,
+}
+
+#[derive(Clone)]
+pub struct SplitMessageDebouncer {
+    duration: std::time::Duration,
+    buffer: Arc<Mutex<HashMap<SessionKey, DebounceBatch>>>,
+}
+
+impl SplitMessageDebouncer {
+    pub fn new(duration: std::time::Duration) -> Self {
+        Self {
+            duration,
+            buffer: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn enqueue(&self, event: InboundEvent, data: PoiseData) {
+        let session = event.session.clone();
+        let (generation, delay) = {
+            let mut lock = self.buffer.lock().await;
+            let batch = lock
+                .entry(session.clone())
+                .or_insert_with(|| DebounceBatch {
+                    events: Vec::new(),
+                    generation: 0,
+                });
+            batch.events.push(event);
+            batch.generation += 1;
+            (batch.generation, self.duration)
+        };
+
+        let buffer = self.buffer.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let events_to_route = {
+                let mut lock = buffer.lock().await;
+                if let Some(batch) = lock.get(&session) {
+                    if batch.generation == generation {
+                        lock.remove(&session).map(|b| b.events)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(events) = events_to_route {
+                if let Some(coalesced) = coalesce_inbound_events(events) {
+                    tracing::info!(
+                        session = %coalesced.session,
+                        delivery_id = ?coalesced.delivery_id,
+                        "Flushing debounced/coalesced Discord message"
+                    );
+                    if let Err(error) = route_claimed_event(&data, coalesced).await {
+                        tracing::error!(session = %session, %error, "failed to route debounced Discord event");
+                    }
+                }
+            }
+        });
+    }
+
+    pub async fn cancel(&self, session: &SessionKey) -> Option<Vec<InboundEvent>> {
+        let mut lock = self.buffer.lock().await;
+        lock.remove(session).map(|b| b.events)
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        let lock = self.buffer.lock().await;
+        lock.is_empty()
+    }
+}
+
+impl Default for SplitMessageDebouncer {
+    fn default() -> Self {
+        Self::new(DEFAULT_DEBOUNCE_DURATION)
+    }
+}
+
 #[derive(Clone)]
 pub struct DiscordAdapter {
     data: PoiseData,
@@ -137,8 +278,14 @@ async fn handle_event(
                 &data.allowed_users,
                 data.primary_bot_id,
             ) {
-                tracing::info!(session = %event.session, bot_id = %bot_user_id, "Routing inbound message to multiplexer");
-                route_claimed_event(data, event).await?;
+                if event.content.trim().eq_ignore_ascii_case("/stop") {
+                    global_debouncer().cancel(&event.session).await;
+                    tracing::info!(session = %event.session, "Routing Discord stop command immediately");
+                    route_claimed_event(data, event).await?;
+                } else {
+                    tracing::info!(session = %event.session, bot_id = %bot_user_id, "Enqueueing inbound message to debounce buffer");
+                    global_debouncer().enqueue(event, data.clone()).await;
+                }
             } else {
                 tracing::info!("Message ignored by filter (not DM, not thread, not mentioned, not in free channels)");
             }
@@ -605,4 +752,171 @@ impl OutboundDispatcher for DiscordEgress {
 
 pub fn is_authorized_clicker(user_id: u64, allowed: &[u64]) -> bool {
     allowed.is_empty() || allowed.contains(&user_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Database;
+    use std::time::Duration;
+
+    fn test_session(name: &str) -> SessionKey {
+        SessionKey::new("discord", Some("guild"), "channel", None::<String>, name)
+    }
+
+    #[test]
+    fn coalesce_empty_returns_none() {
+        assert!(coalesce_inbound_events(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn coalesce_single_message_preserves_event() {
+        let session = test_session("user-1");
+        let event = InboundEvent::message(session.clone(), "msg-1", "hello world");
+        let coalesced = coalesce_inbound_events(vec![event.clone()]).unwrap();
+        assert_eq!(coalesced.id, event.id);
+        assert_eq!(coalesced.content, "hello world");
+        assert_eq!(coalesced.platform_message_id, "msg-1");
+        assert_eq!(coalesced.session, session);
+    }
+
+    #[test]
+    fn coalesce_multiple_split_messages_concatenates_contents_and_unions_attachments() {
+        let session = test_session("user-2");
+        let mut event1 = InboundEvent::message(session.clone(), "chunk-1", "Part 1 of long text");
+        event1.attachments = vec![
+            MessageAttachment {
+                id: "att-1".into(),
+                filename: "file1.txt".into(),
+                url: "https://example.com/1".into(),
+                content_type: Some("text/plain".into()),
+                size_bytes: Some(100),
+                local_path: None,
+            },
+            MessageAttachment {
+                id: "att-2".into(),
+                filename: "file2.png".into(),
+                url: "https://example.com/2".into(),
+                content_type: Some("image/png".into()),
+                size_bytes: Some(200),
+                local_path: None,
+            },
+        ];
+
+        let mut event2 = InboundEvent::message(session.clone(), "chunk-2", "Part 2 of long text");
+        event2.delivery_id = Some("discord:chunk-2".into());
+        // att-2 duplicate + att-3 new
+        event2.attachments = vec![
+            MessageAttachment {
+                id: "att-2".into(),
+                filename: "file2-duplicate.png".into(),
+                url: "https://example.com/2".into(),
+                content_type: Some("image/png".into()),
+                size_bytes: Some(200),
+                local_path: None,
+            },
+            MessageAttachment {
+                id: "att-3".into(),
+                filename: "file3.pdf".into(),
+                url: "https://example.com/3".into(),
+                content_type: Some("application/pdf".into()),
+                size_bytes: Some(300),
+                local_path: None,
+            },
+        ];
+
+        let event3 = InboundEvent::message(session.clone(), "chunk-3", "Part 3 of long text");
+
+        let coalesced = coalesce_inbound_events(vec![event1.clone(), event2, event3]).unwrap();
+
+        assert_eq!(coalesced.id, event1.id);
+        assert_eq!(
+            coalesced.content,
+            "Part 1 of long text\nPart 2 of long text\nPart 3 of long text"
+        );
+        assert_eq!(coalesced.platform_message_id, "chunk-3");
+        assert_eq!(coalesced.delivery_id.as_deref(), Some("discord:chunk-3"));
+
+        assert_eq!(coalesced.attachments.len(), 3);
+        assert_eq!(coalesced.attachments[0].id, "att-1");
+        assert_eq!(coalesced.attachments[1].id, "att-2");
+        assert_eq!(coalesced.attachments[2].id, "att-3");
+    }
+
+    #[tokio::test]
+    async fn debouncer_coalesces_rapid_events_and_routes_single_event() {
+        use crate::{AgentRunner, MultiplexerConfig, SessionContext, SessionMultiplexer};
+
+        struct CollectingRunner {
+            events: Mutex<Vec<InboundEvent>>,
+        }
+
+        #[async_trait]
+        impl AgentRunner for CollectingRunner {
+            async fn run(&self, _session: &mut SessionContext, event: InboundEvent) -> Result<()> {
+                self.events.lock().await.push(event);
+                Ok(())
+            }
+        }
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let runner = Arc::new(CollectingRunner {
+            events: Mutex::new(Vec::new()),
+        });
+        let multiplexer = SessionMultiplexer::new(
+            db.pool().clone(),
+            runner.clone(),
+            MultiplexerConfig::default(),
+        );
+        let data = PoiseData::new(multiplexer, db.pool().clone());
+
+        let debouncer = SplitMessageDebouncer::new(Duration::from_millis(50));
+        let session = test_session("debouncer-test-user");
+
+        let msg1 = InboundEvent::message(session.clone(), "msg-1", "chunk 1");
+        let msg2 = InboundEvent::message(session.clone(), "msg-2", "chunk 2");
+        let msg3 = InboundEvent::message(session.clone(), "msg-3", "chunk 3");
+
+        debouncer.enqueue(msg1, data.clone()).await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        debouncer.enqueue(msg2, data.clone()).await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        debouncer.enqueue(msg3, data.clone()).await;
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let runs = runner.events.lock().await;
+        assert_eq!(runs.len(), 1, "expected exactly 1 coalesced turn");
+        assert_eq!(runs[0].content, "chunk 1\nchunk 2\nchunk 3");
+        assert_eq!(runs[0].platform_message_id, "msg-3");
+    }
+
+    #[tokio::test]
+    async fn debouncer_cancel_discards_pending_chunks() {
+        use crate::{AgentRunner, MultiplexerConfig, SessionContext, SessionMultiplexer};
+
+        struct DummyRunner;
+        #[async_trait]
+        impl AgentRunner for DummyRunner {
+            async fn run(&self, _session: &mut SessionContext, _event: InboundEvent) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let debouncer = SplitMessageDebouncer::new(Duration::from_millis(100));
+        let session = test_session("cancel-test-user");
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let runner = Arc::new(DummyRunner);
+        let multiplexer =
+            SessionMultiplexer::new(db.pool().clone(), runner, MultiplexerConfig::default());
+        let data = PoiseData::new(multiplexer, db.pool().clone());
+
+        let msg1 = InboundEvent::message(session.clone(), "msg-1", "chunk 1");
+        debouncer.enqueue(msg1, data).await;
+
+        let cancelled: Option<Vec<InboundEvent>> = debouncer.cancel(&session).await;
+        assert!(cancelled.is_some());
+        assert_eq!(cancelled.unwrap().len(), 1);
+        assert!(debouncer.is_empty().await);
+    }
 }
