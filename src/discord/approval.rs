@@ -43,6 +43,9 @@ pub enum ApprovalError {
     Cancelled,
 }
 
+pub const DEFAULT_APPROVAL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+pub type ActivityHeartbeat = Arc<dyn Fn(&SessionKey) + Send + Sync>;
+
 #[derive(Debug)]
 pub struct ApprovalPrompt {
     pub request_id: Uuid,
@@ -56,6 +59,40 @@ impl ApprovalPrompt {
             Ok(Ok(decision)) => Ok(decision),
             Ok(Err(_)) => Err(ApprovalError::Cancelled),
             Err(_) => Err(ApprovalError::Timeout),
+        }
+    }
+
+    pub async fn wait_with_heartbeat<F>(
+        self,
+        timeout: Duration,
+        interval: Duration,
+        mut heartbeat_fn: F,
+    ) -> Result<ApprovalDecision, ApprovalError>
+    where
+        F: FnMut() + Send,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+
+        let mut receiver = self.receiver;
+        loop {
+            tokio::select! {
+                biased;
+                res = &mut receiver => {
+                    return match res {
+                        Ok(decision) => Ok(decision),
+                        Err(_) => Err(ApprovalError::Cancelled),
+                    };
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(ApprovalError::Timeout);
+                }
+                _ = ticker.tick() => {
+                    heartbeat_fn();
+                }
+            }
         }
     }
 }
@@ -94,6 +131,8 @@ pub trait ApprovalRequester: Send + Sync {
 pub struct DiscordApprovalRequester {
     guard: SmartApprovalGuard,
     dispatcher: Arc<RwLock<Option<Arc<dyn OutboundDispatcher>>>>,
+    heartbeat: Arc<RwLock<Option<ActivityHeartbeat>>>,
+    heartbeat_interval: Duration,
     timeout: Duration,
 }
 
@@ -102,8 +141,24 @@ impl DiscordApprovalRequester {
         Self {
             guard,
             dispatcher: Arc::new(RwLock::new(None)),
+            heartbeat: Arc::new(RwLock::new(None)),
+            heartbeat_interval: DEFAULT_APPROVAL_HEARTBEAT_INTERVAL,
             timeout,
         }
+    }
+
+    pub fn with_heartbeat(self, heartbeat: ActivityHeartbeat) -> Self {
+        *self.heartbeat.try_write().expect("uncontended lock") = Some(heartbeat);
+        self
+    }
+
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self
+    }
+
+    pub async fn set_heartbeat(&self, heartbeat: ActivityHeartbeat) {
+        *self.heartbeat.write().await = Some(heartbeat);
     }
 
     pub async fn set_dispatcher(&self, dispatcher: Arc<dyn OutboundDispatcher>) {
@@ -157,7 +212,19 @@ impl ApprovalRequester for DiscordApprovalRequester {
             self.guard.cancel(request_id).await;
             return Err(ApprovalError::Cancelled);
         }
-        let result = prompt.wait(self.timeout).await;
+        let heartbeat = self.heartbeat.read().await.clone();
+        let heartbeat_interval = self.heartbeat_interval;
+        let result = match heartbeat {
+            Some(hb) => {
+                let session_clone = session.clone();
+                prompt
+                    .wait_with_heartbeat(self.timeout, heartbeat_interval, move || {
+                        hb(&session_clone);
+                    })
+                    .await
+            }
+            None => prompt.wait(self.timeout).await,
+        };
         if let Ok(decision) = &result {
             match decision {
                 ApprovalDecision::Session => {
@@ -347,6 +414,8 @@ pub fn parse_custom_id(custom_id: &str) -> Option<(Uuid, ApprovalDecision)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
 
     #[test]
@@ -534,5 +603,71 @@ mod tests {
         assert!(guard.is_yolo(&session_a).await);
         guard.clear_session(&session_a).await;
         assert!(!guard.is_yolo(&session_a).await);
+    }
+
+    #[tokio::test]
+    async fn test_wait_with_heartbeat_fires_periodically_and_stops_on_resolve() {
+        let guard = SmartApprovalGuard::new();
+        let prompt = guard.request().await;
+        let request_id = prompt.request_id;
+
+        let heartbeat_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hb = heartbeat_count.clone();
+
+        let wait_handle = tokio::spawn(async move {
+            prompt
+                .wait_with_heartbeat(
+                    Duration::from_millis(200),
+                    Duration::from_millis(20),
+                    move || {
+                        hb.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+                .await
+        });
+
+        // Wait 55ms, verify at least 2 heartbeats fired
+        tokio::time::sleep(Duration::from_millis(55)).await;
+        let custom_id = format!("omon:approval:{request_id}:once");
+        assert!(guard.resolve_custom_id(&custom_id).await);
+
+        let result = wait_handle.await.unwrap();
+        assert_eq!(result, Ok(ApprovalDecision::Once));
+
+        let count_after_resolve = heartbeat_count.load(Ordering::SeqCst);
+        assert!(count_after_resolve >= 2);
+
+        // Sleep longer, verify heartbeat stopped firing after resolution
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(heartbeat_count.load(Ordering::SeqCst), count_after_resolve);
+    }
+
+    #[tokio::test]
+    async fn test_requester_heartbeat_invoked_during_approval_wait() {
+        let guard = SmartApprovalGuard::new();
+        let heartbeat_sessions = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let hb_sessions = heartbeat_sessions.clone();
+
+        let requester = DiscordApprovalRequester::new(guard.clone(), Duration::from_millis(80))
+            .with_heartbeat_interval(Duration::from_millis(15))
+            .with_heartbeat(Arc::new(move |session: &SessionKey| {
+                hb_sessions.lock().push(session.clone());
+            }));
+        requester.set_dispatcher(Arc::new(MockDispatcher)).await;
+
+        let session = SessionKey::new("discord", None::<String>, "chan1", None::<String>, "user1");
+
+        let err = requester
+            .request_approval(&session, "rm -rf /tmp/danger", "danger")
+            .await
+            .unwrap_err();
+        assert_eq!(err, ApprovalError::Timeout);
+
+        let sessions = heartbeat_sessions.lock().clone();
+        assert!(
+            !sessions.is_empty(),
+            "expected heartbeat callback to be called"
+        );
+        assert_eq!(sessions[0], session);
     }
 }

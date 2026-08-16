@@ -1873,6 +1873,9 @@ async fn run_gateway() -> Result<()> {
     approval_requester
         .set_dispatcher(discord_egress.clone())
         .await;
+    approval_requester
+        .set_heartbeat(multiplexer.activity_heartbeat())
+        .await;
 
     let retention_days = cron_runs_retention_days_from_environment()?;
     let pruned = prune_terminal_cron_runs(&pool, retention_days, chrono::Utc::now()).await?;

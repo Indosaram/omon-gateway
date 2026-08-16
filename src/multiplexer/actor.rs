@@ -53,6 +53,7 @@ pub(crate) enum ActorCommand {
         idle_timeout: Duration,
         reply: oneshot::Sender<Result<bool>>,
     },
+    TouchActivity,
 }
 
 enum TurnOutcome {
@@ -159,6 +160,9 @@ impl SessionActor {
                                     Some(ActorCommand::EvictIfIdle { reply, .. }) => {
                                         let _ = reply.send(Ok(false));
                                     }
+                                    Some(ActorCommand::TouchActivity) => {
+                                        self.last_active_at = tokio::time::Instant::now();
+                                    }
                                     None => {
                                         cancellation.cancel();
                                         while let Some(pending) = pending_events.pop_front() {
@@ -227,6 +231,9 @@ impl SessionActor {
                         .await;
                     }
                     let _ = reply.send(Ok(false));
+                }
+                ActorCommand::TouchActivity => {
+                    self.last_active_at = tokio::time::Instant::now();
                 }
                 ActorCommand::EvictIfIdle {
                     idle_timeout,

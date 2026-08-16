@@ -274,6 +274,21 @@ impl SessionMultiplexer {
         self.sessions.contains_key(key)
     }
 
+    /// Touches the session's activity timestamp to prevent premature idle GC eviction.
+    pub fn touch_activity(&self, key: &SessionKey) {
+        if let Some(handle) = self.sessions.get(key) {
+            let _ = handle.sender.try_send(ActorCommand::TouchActivity);
+        }
+    }
+
+    /// Returns an activity heartbeat callback suitable for injecting into approval requesters.
+    pub fn activity_heartbeat(&self) -> Arc<dyn Fn(&SessionKey) + Send + Sync> {
+        let multiplexer = self.clone();
+        Arc::new(move |key: &SessionKey| {
+            multiplexer.touch_activity(key);
+        })
+    }
+
     pub async fn collect_garbage(&self) -> Result<usize> {
         super::gc::collect(self).await
     }
