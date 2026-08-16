@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use poise::serenity_prelude as serenity;
+use regex::Regex;
 use serenity::all::{
     ChannelId, ChannelType, CreateAllowedMentions, CreateAttachment, CreateInteractionResponse,
     CreateInteractionResponseMessage, CreateMessage, CreateThread, EditMessage, FullEvent,
@@ -31,6 +32,68 @@ pub fn safe_allowed_mentions() -> CreateAllowedMentions {
         .everyone(false)
         .all_roles(false)
         .replied_user(true)
+}
+
+const SILENCE_SENTINELS: &[&str] = &["[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"];
+
+static SILENCE_NARRATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^[\s*_~`]*\(?\s*(silent|silence|no\s+response|no\s+reply)\s*\.?\)?[\\s*_~`]*$|^[\s*_~`]*[\x{1f507}\.\x{2026}]+[\s*_~`]*$",
+    )
+    .expect("valid silence narration regex")
+});
+
+fn strip_edge_silence_punctuation(text: &str) -> &str {
+    let trimmed = text.trim();
+    let start = trimmed
+        .char_indices()
+        .find(|&(_, c)| !c.is_ascii_punctuation() || c == '[' || c == ']')
+        .map(|(idx, _)| idx)
+        .unwrap_or(trimmed.len());
+    let end = trimmed
+        .char_indices()
+        .rfind(|&(_, c)| !c.is_ascii_punctuation() || c == '[' || c == ']')
+        .map(|(idx, c)| idx + c.len_utf8())
+        .unwrap_or(0);
+    if start >= end {
+        ""
+    } else {
+        &trimmed[start..end]
+    }
+}
+
+/// Returns `true` if `text` is an intentional silence response sentinel or anti-loop narration token.
+pub fn is_silence_response(text: &str) -> bool {
+    let stripped = text.trim();
+    if stripped.is_empty() {
+        return true;
+    }
+    if stripped.chars().count() > 64 {
+        return false;
+    }
+
+    let normalized: String = stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase();
+    if SILENCE_SENTINELS.contains(&normalized.as_str()) {
+        return true;
+    }
+
+    let edge_stripped = strip_edge_silence_punctuation(stripped);
+    if !edge_stripped.is_empty() {
+        let normalized_edge: String = edge_stripped
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase();
+        if SILENCE_SENTINELS.contains(&normalized_edge.as_str()) {
+            return true;
+        }
+    }
+
+    SILENCE_NARRATION_RE.is_match(stripped)
 }
 
 /// Maximum character length for hydrated referenced message context.
@@ -1318,5 +1381,76 @@ mod tests {
             formatted,
             "[Recent channel context]\nalice: line 1 line 2 line 3"
         );
+    }
+
+    #[test]
+    fn test_is_silence_response_positive_cases() {
+        let positive = [
+            "",
+            "   \n\t ",
+            "[SILENT]",
+            " SILENT ",
+            "NO_REPLY",
+            "no reply",
+            "NO REPLY",
+            "no_reply",
+            ".NO_REPLY",
+            "*NO_REPLY*",
+            " .NO_REPLY ",
+            "*[SILENT]*",
+            "NO_REPLY.",
+            "[silent]",
+            "*(silent)*",
+            "*Silence.*",
+            "🔇",
+            ".",
+            "…",
+            "...",
+            "(silent)",
+            "_silent_",
+            "silent",
+            " *(silent)* ",
+            "`silent`",
+            "~silent~",
+            "Silence",
+            "no response",
+            "No Reply.",
+            &".".repeat(64),
+        ];
+
+        for text in positive {
+            assert!(
+                is_silence_response(text),
+                "expected {text:?} to be detected as silence"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_silence_response_negative_cases() {
+        let negative = [
+            "Use NO_REPLY when no answer is needed.",
+            "The reply was [SILENT], intentionally.",
+            "😄 NO_REPLY",
+            "[SILENT",
+            "Silence is golden — here is the plan...",
+            "Silent install completed",
+            "The deployment ran silently in the background",
+            "ok",
+            "👍",
+            "Here is the result:\n\n- item one\n- item two",
+            "I have nothing to add, but here is why: the build is green.",
+            "silently",
+            "no responses were collected from the survey",
+            &("silent ".to_string() + &"x".repeat(70)),
+            &".".repeat(65),
+        ];
+
+        for text in negative {
+            assert!(
+                !is_silence_response(text),
+                "expected {text:?} NOT to be detected as silence"
+            );
+        }
     }
 }

@@ -6,10 +6,11 @@ pub mod throttler;
 
 pub use adapter::{
     coalesce_inbound_events, compose_reply_context, derive_auto_thread_name,
-    format_channel_context, global_debouncer, is_authorized_clicker, safe_allowed_mentions,
-    DiscordAdapter, DiscordEgress, DiscordFileUploader, InboundFilterConfig, SerenityFileUploader,
-    SplitMessageDebouncer, DEFAULT_CHANNEL_CONTEXT_LIMIT, DEFAULT_DEBOUNCE_DURATION,
-    MAX_CHANNEL_CONTEXT_LIMIT, MAX_CONTEXT_LINE_CHARS, REFERENCED_CONTENT_CAP,
+    format_channel_context, global_debouncer, is_authorized_clicker, is_silence_response,
+    safe_allowed_mentions, DiscordAdapter, DiscordEgress, DiscordFileUploader, InboundFilterConfig,
+    SerenityFileUploader, SplitMessageDebouncer, DEFAULT_CHANNEL_CONTEXT_LIMIT,
+    DEFAULT_DEBOUNCE_DURATION, MAX_CHANNEL_CONTEXT_LIMIT, MAX_CONTEXT_LINE_CHARS,
+    REFERENCED_CONTENT_CAP,
 };
 pub use approval::{
     approval_buttons, is_approval_custom_id, parse_custom_id, ApprovalDecision, ApprovalError,

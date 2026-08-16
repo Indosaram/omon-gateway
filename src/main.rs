@@ -10,8 +10,8 @@ use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
     augmented_path_from_environment, cron_runs_retention_days_from_environment,
-    format_context_from_block, parse_context_from_ids, parse_profile_routes, parse_wake_gate,
-    prune_terminal_cron_runs, render_user_prompt, resolve_predecessor_output,
+    format_context_from_block, is_silence_response, parse_context_from_ids, parse_profile_routes,
+    parse_wake_gate, prune_terminal_cron_runs, render_user_prompt, resolve_predecessor_output,
     truncate_context_output, AgentRunner, ApprovalPolicy, AttachmentDownloader, ChatMessage,
     CronJob, CronScheduler, CronTaskExecutor, CronTool, DeliveryLedgerService, DiscordAdapter,
     DiscordApprovalRequester, DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer,
@@ -763,16 +763,18 @@ impl LiveAgentRunner {
                     .await
                     .map_err(|_| OmonError::Llm("LLM tool-call stream closed unexpectedly".into()))??;
                 if calls.is_empty() {
+                    if is_silence_response(&response) {
+                        if response.trim().is_empty() {
+                            tracing::warn!(session = %session.key, "LLM returned an empty response; suppressing delivery");
+                        } else {
+                            tracing::info!(session = %session.key, response = %response, "LLM returned silence sentinel or narration; suppressing delivery");
+                        }
+                        return Ok(response);
+                    }
+
                     if stream_output {
                         if !pending.is_empty() {
                             self.emit(session, pending, true).await?;
-                        } else if response.is_empty() {
-                            self.emit(
-                                session,
-                                "The model returned an empty response.".into(),
-                                true,
-                            )
-                            .await?;
                         } else {
                             self.emit(session, String::new(), true).await?;
                         }
@@ -2071,6 +2073,74 @@ mod runner_tests {
             streams: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         (runner, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_execute_suppresses_delivery_for_silence_sentinel_and_empty() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"[SILENT]\"}}]}\n\ndata: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner, _dir) =
+            build_test_runner(format!("http://{address}/v1"), dispatcher.clone()).await;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-silence",
+            None::<String>,
+            "user-silence",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        let event =
+            omon_gateway::InboundEvent::message(session_key.clone(), "msg-silence", "Hello");
+
+        let response = runner
+            .execute(&mut session, event, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(response, "[SILENT]");
+
+        let actions = dispatcher.actions.lock().await;
+        let stream_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, omon_gateway::OutboundAction::Stream { .. }))
+            .collect();
+        assert!(
+            stream_actions.is_empty(),
+            "Expected zero Stream outbound actions for silence sentinel, found: {stream_actions:?}"
+        );
+
+        // Assistant message should NOT be persisted in DB
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, content FROM messages WHERE session_key = $1 AND role = 'assistant'",
+        )
+        .bind(session_key.storage_key())
+        .fetch_all(&runner.pool)
+        .await
+        .unwrap();
+        assert!(
+            rows.is_empty(),
+            "Expected 0 assistant messages in DB for silence sentinel"
+        );
+
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
