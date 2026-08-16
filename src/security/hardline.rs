@@ -135,3 +135,55 @@ pub fn detect_hardline_command(command: &str) -> Option<String> {
     }
     None
 }
+
+/// Matches wildcard patterns (fnmatch style) where `*` matches any sequence of characters and `?` matches any single character.
+pub fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let text = text.to_ascii_lowercase();
+    let p_chars: Vec<char> = pattern.chars().collect();
+    let t_chars: Vec<char> = text.chars().collect();
+    let (p_len, t_len) = (p_chars.len(), t_chars.len());
+    let mut dp = vec![vec![false; t_len + 1]; p_len + 1];
+    dp[0][0] = true;
+    for i in 1..=p_len {
+        if p_chars[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        } else {
+            break;
+        }
+    }
+    for i in 1..=p_len {
+        for j in 1..=t_len {
+            if p_chars[i - 1] == '*' {
+                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+            } else if p_chars[i - 1] == '?' || p_chars[i - 1] == t_chars[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1];
+            }
+        }
+    }
+    dp[p_len][t_len]
+}
+
+/// Returns the matching `APPROVALS_DENY` pattern if the command or any normalized variant matches.
+pub fn match_user_deny_rule<'a>(command: &str, deny_patterns: &'a [String]) -> Option<&'a str> {
+    if deny_patterns.is_empty() {
+        return None;
+    }
+    let globs: Vec<&'a str> = deny_patterns
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if globs.is_empty() {
+        return None;
+    }
+    for variant in command_detection_variants(command) {
+        let candidate = variant.trim();
+        for pattern in &globs {
+            if wildcard_match(pattern, candidate) {
+                return Some(pattern);
+            }
+        }
+    }
+    None
+}

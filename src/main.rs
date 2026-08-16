@@ -379,6 +379,7 @@ struct Config {
     approval_policy: ApprovalPolicy,
     approval_timeout_secs: u64,
     approval_mentions: bool,
+    approvals_deny: Vec<String>,
     profile_routes: Vec<ProfileRoute>,
 }
 
@@ -490,6 +491,16 @@ impl Config {
                 optional_env("DISCORD_APPROVAL_MENTIONS").as_deref(),
                 false,
             ),
+            approvals_deny: env::var("APPROVALS_DENY")
+                .or_else(|_| env::var("OMON_APPROVALS_DENY"))
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
             profile_routes: parse_profile_routes(
                 &optional_env("DISCORD_PROFILE_ROUTES").unwrap_or_default(),
             ),
@@ -1806,11 +1817,15 @@ async fn run_gateway() -> Result<()> {
         std::time::Duration::from_secs(config.approval_timeout_secs),
     ));
     let mut tools = ToolRegistry::new();
-    tools.register(TerminalTool::new(&config.workspace_root).with_approval(
-        config.approval_policy,
-        approval_requester.clone(),
-        std::time::Duration::from_secs(config.approval_timeout_secs + 5),
-    ));
+    tools.register(
+        TerminalTool::new(&config.workspace_root)
+            .with_approval(
+                config.approval_policy,
+                approval_requester.clone(),
+                std::time::Duration::from_secs(config.approval_timeout_secs + 5),
+            )
+            .with_deny_globs(config.approvals_deny.clone()),
+    );
     tools.register(FileTool::new(&config.workspace_root));
     tools.register(McpTool::default());
     tools.register(CronTool::new(pool.clone()));
@@ -1918,6 +1933,7 @@ async fn run_gateway() -> Result<()> {
     poise_data.channel_context_limit = config.channel_context_limit;
     poise_data.processing_reactions = config.processing_reactions;
     poise_data.approval_mentions = config.approval_mentions;
+    poise_data.approvals_deny = config.approvals_deny.clone();
     poise_data.attachment_downloader = Some(AttachmentDownloader::new(&config.workspace_root)?);
     poise_data.primary_bot_id = Some(default_bot_id.parse().map_err(|_| {
         OmonError::Config(format!(

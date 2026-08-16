@@ -36,6 +36,7 @@ pub struct TerminalTool {
     approval_policy: ApprovalPolicy,
     approval_requester: Option<Arc<dyn ApprovalRequester>>,
     approval_timeout: Duration,
+    deny_globs: Vec<String>,
 }
 
 impl std::fmt::Debug for TerminalTool {
@@ -47,6 +48,7 @@ impl std::fmt::Debug for TerminalTool {
             .field("max_output_bytes", &self.max_output_bytes)
             .field("approval_policy", &self.approval_policy)
             .field("approval_timeout", &self.approval_timeout)
+            .field("deny_globs", &self.deny_globs)
             .finish_non_exhaustive()
     }
 }
@@ -60,7 +62,13 @@ impl TerminalTool {
             approval_policy: ApprovalPolicy::Smart,
             approval_requester: None,
             approval_timeout: Duration::from_secs(120),
+            deny_globs: Vec::new(),
         }
+    }
+
+    pub fn with_deny_globs(mut self, deny_globs: Vec<String>) -> Self {
+        self.deny_globs = deny_globs;
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -137,6 +145,12 @@ impl TerminalTool {
         if let Some(reason) = crate::security::detect_hardline_command(command) {
             return Err(OmonError::Approval(format!(
                 "BLOCKED (hardline): {reason}. This command is on the unconditional blocklist and cannot be executed."
+            )));
+        }
+
+        if let Some(pattern) = crate::security::match_user_deny_rule(command, &self.deny_globs) {
+            return Err(OmonError::Approval(format!(
+                "BLOCKED: this command matches the user-defined deny rule '{pattern}' (APPROVALS_DENY). It cannot be executed via the agent — not even with /yolo or approval bypass. Do NOT retry or rephrase this command; the user has explicitly forbidden it."
             )));
         }
 
@@ -678,5 +692,53 @@ mod approval_tests {
 
         assert!(matches!(error, OmonError::Approval(msg) if msg.contains("BLOCKED (hardline)")));
         assert_eq!(approver.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_deny_globs_rejected_unconditionally_and_under_yolo() {
+        let approver = Arc::new(StubApprover::new(Ok(ApprovalDecision::Once)).with_yolo(true));
+        let tool = TerminalTool::new(std::env::temp_dir())
+            .with_approval(
+                ApprovalPolicy::Smart,
+                approver.clone(),
+                Duration::from_secs(1),
+            )
+            .with_deny_globs(vec![
+                "npm publish *".to_string(),
+                "kubectl delete *".to_string(),
+            ]);
+
+        // Matches deny glob -> rejected even with YOLO
+        let error = tool
+            .execute_with_context(
+                json!({"program": "npm", "args": ["publish", "--access", "public"]}),
+                Some(&session()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OmonError::Approval(msg) if msg.contains("BLOCKED: this command matches the user-defined deny rule 'npm publish *'")
+        ));
+        assert_eq!(approver.requests.load(Ordering::SeqCst), 0);
+
+        // Also rejected under Never policy
+        let tool_never = TerminalTool::new(std::env::temp_dir())
+            .with_approval_policy(ApprovalPolicy::Never)
+            .with_deny_globs(vec!["kubectl delete *".to_string()]);
+
+        let error_never = tool_never
+            .execute_with_context(
+                json!({"program": "kubectl", "args": ["delete", "pods", "--all"]}),
+                Some(&session()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error_never,
+            OmonError::Approval(msg) if msg.contains("BLOCKED: this command matches the user-defined deny rule 'kubectl delete *'")
+        ));
     }
 }

@@ -4,7 +4,9 @@ pub mod normalize;
 pub mod scan;
 
 pub use dangerous::{derive_pattern_key, detect_dangerous_command, is_dangerous, DangerousFinding};
-pub use hardline::{check_sudo_stdin_guard, detect_hardline_command};
+pub use hardline::{
+    check_sudo_stdin_guard, detect_hardline_command, match_user_deny_rule, wildcard_match,
+};
 pub use normalize::normalize_command_for_detection;
 pub use scan::scan_cron_prompt;
 
@@ -189,5 +191,50 @@ mod tests {
             finding.description,
             "git reset --hard (destroys uncommitted changes)"
         );
+    }
+
+    #[test]
+    fn test_wildcard_matching() {
+        assert!(wildcard_match(
+            "npm publish *",
+            "npm publish --access public"
+        ));
+        assert!(wildcard_match(
+            "kubectl delete *",
+            "kubectl delete pods --all"
+        ));
+        assert!(wildcard_match("cargo publish", "cargo publish"));
+        assert!(wildcard_match("*prod*", "deploy to production"));
+        assert!(wildcard_match("?bc", "abc"));
+        assert!(!wildcard_match("npm publish *", "npm run build"));
+        assert!(!wildcard_match("cargo *", "npm install"));
+    }
+
+    #[test]
+    fn test_match_user_deny_rule() {
+        let deny = vec![
+            "npm publish *".to_string(),
+            "kubectl delete *".to_string(),
+            "git push --force*".to_string(),
+        ];
+
+        assert_eq!(
+            match_user_deny_rule("npm publish --access public", &deny),
+            Some("npm publish *")
+        );
+        assert_eq!(
+            match_user_deny_rule("kubectl delete pod foo-123", &deny),
+            Some("kubectl delete *")
+        );
+        assert_eq!(
+            match_user_deny_rule("git push --force origin main", &deny),
+            Some("git push --force*")
+        );
+        assert_eq!(
+            match_user_deny_rule("n\\pm publish --access public", &deny),
+            Some("npm publish *")
+        );
+        assert_eq!(match_user_deny_rule("npm run build", &deny), None);
+        assert_eq!(match_user_deny_rule("cargo test", &deny), None);
     }
 }
