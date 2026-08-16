@@ -24,6 +24,56 @@ use crate::{
     OutboundDispatcher, Result, SessionKey,
 };
 
+static MEDIA_DIRECTIVE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"[`"']?MEDIA:\s*[`"']?([^`"'\r\n]+?)[`"']?(?:$|\s)"#)
+        .expect("valid media directive regex")
+});
+
+/// Extracts `MEDIA:<path>` directives from text, returning `(text_without_media, paths)`.
+/// Directives like `[[audio_as_voice]]` and `[[as_document]]` are also stripped.
+pub fn extract_media_directives(text: &str) -> (String, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut cleaned_lines = Vec::new();
+
+    let preprocessed = text
+        .replace("[[audio_as_voice]]", "")
+        .replace("[[as_document]]", "");
+
+    for line in preprocessed.lines() {
+        if !line.contains("MEDIA:") {
+            cleaned_lines.push(line.to_string());
+            continue;
+        }
+
+        let mut line_paths = Vec::new();
+        for caps in MEDIA_DIRECTIVE_RE.captures_iter(line) {
+            if let Some(matched) = caps.get(1) {
+                let raw_path = matched.as_str().trim();
+                let clean_path = raw_path
+                    .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+                    .trim();
+                if !clean_path.is_empty() {
+                    line_paths.push(clean_path.to_string());
+                }
+            }
+        }
+
+        if !line_paths.is_empty() {
+            paths.extend(line_paths);
+            let stripped_line = MEDIA_DIRECTIVE_RE.replace_all(line, "");
+            let trimmed = stripped_line.trim();
+            if !trimmed.is_empty() {
+                cleaned_lines.push(trimmed.to_string());
+            }
+        } else {
+            cleaned_lines.push(line.to_string());
+        }
+    }
+
+    let cleaned_text = cleaned_lines.join("\n").trim().to_string();
+    (cleaned_text, paths)
+}
+
 /// Determines if a chunk at `chunk_index` should reference a triggering message.
 pub fn should_chunk_reference(
     chunk_index: usize,
@@ -1560,6 +1610,61 @@ mod tests {
                 "expected {text:?} NOT to be detected as silence"
             );
         }
+    }
+
+    #[test]
+    fn test_extract_media_directives_single() {
+        let text = "Here is the screenshot:\nMEDIA:/tmp/screenshot.png";
+        let (cleaned, paths) = extract_media_directives(text);
+        assert_eq!(cleaned, "Here is the screenshot:");
+        assert_eq!(paths, vec!["/tmp/screenshot.png"]);
+    }
+
+    #[test]
+    fn test_extract_media_directives_multiple_and_wrapped() {
+        let text = "MEDIA: `/tmp/data.csv`\nMEDIA: \"/tmp/report.pdf\"\nMEDIA: '/tmp/notes.txt'";
+        let (cleaned, paths) = extract_media_directives(text);
+        assert_eq!(cleaned, "");
+        assert_eq!(
+            paths,
+            vec!["/tmp/data.csv", "/tmp/report.pdf", "/tmp/notes.txt"]
+        );
+    }
+
+    #[test]
+    fn test_extract_media_directives_mixed_with_text() {
+        let text =
+            "Generated the document below:\nMEDIA:/tmp/doc.pdf\nPlease review and let me know.";
+        let (cleaned, paths) = extract_media_directives(text);
+        assert_eq!(
+            cleaned,
+            "Generated the document below:\nPlease review and let me know."
+        );
+        assert_eq!(paths, vec!["/tmp/doc.pdf"]);
+    }
+
+    #[test]
+    fn test_extract_media_directives_nonexistent_paths_returned() {
+        let text = "MEDIA:/does/not/exist/file.jpg";
+        let (cleaned, paths) = extract_media_directives(text);
+        assert_eq!(cleaned, "");
+        assert_eq!(paths, vec!["/does/not/exist/file.jpg"]);
+    }
+
+    #[test]
+    fn test_extract_media_directives_strips_audio_directives() {
+        let text = "[[audio_as_voice]]\n[[as_document]]\nMEDIA:/tmp/voice.ogg";
+        let (cleaned, paths) = extract_media_directives(text);
+        assert_eq!(cleaned, "");
+        assert_eq!(paths, vec!["/tmp/voice.ogg"]);
+    }
+
+    #[test]
+    fn test_extract_media_directives_plain_text_unchanged() {
+        let text = "Just normal conversational text without media.";
+        let (cleaned, paths) = extract_media_directives(text);
+        assert_eq!(cleaned, text);
+        assert!(paths.is_empty());
     }
 
     #[test]

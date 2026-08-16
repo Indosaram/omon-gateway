@@ -10,15 +10,16 @@ use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
     augmented_path_from_environment, cron_runs_retention_days_from_environment,
-    format_context_from_block, is_silence_response, parse_context_from_ids, parse_profile_routes,
-    parse_wake_gate, prune_terminal_cron_runs, render_user_prompt, resolve_predecessor_output,
-    truncate_context_output, AgentRunner, ApprovalPolicy, AttachmentDownloader, ChatMessage,
-    CronJob, CronScheduler, CronTaskExecutor, CronTool, DeliveryLedgerService, DiscordAdapter,
-    DiscordApprovalRequester, DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer,
-    InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore, MultiplexerConfig,
-    OmonError, OutboundAction, OutboundDispatcher, PoiseData, ProfileRoute, ProfileRouter, Result,
-    ScaleToZero, SessionContext, SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool,
-    ToolDefinition, ToolRegistry, MAX_CONTEXT_CHARS,
+    extract_media_directives, format_context_from_block, is_silence_response,
+    parse_context_from_ids, parse_profile_routes, parse_wake_gate, prune_terminal_cron_runs,
+    render_user_prompt, resolve_predecessor_output, truncate_context_output, AgentRunner,
+    ApprovalPolicy, AttachmentDownloader, ChatMessage, CronJob, CronScheduler, CronTaskExecutor,
+    CronTool, DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress,
+    FileTool, HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider,
+    McpTool, MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher,
+    PoiseData, ProfileRoute, ProfileRouter, Result, ScaleToZero, SessionContext, SessionKey,
+    SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry,
+    DISCORD_ATTACHMENT_MAX_BYTES, MAX_CONTEXT_CHARS,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -769,21 +770,81 @@ impl LiveAgentRunner {
                     .await
                     .map_err(|_| OmonError::Llm("LLM tool-call stream closed unexpectedly".into()))??;
                 if calls.is_empty() {
-                    if is_silence_response(&response) {
-                        if response.trim().is_empty() {
-                            tracing::warn!(session = %session.key, "LLM returned an empty response; suppressing delivery");
+                    let (stripped_text, media_paths) = extract_media_directives(&response);
+
+                    let mut uploaded_media = false;
+                    for path_str in &media_paths {
+                        let path = PathBuf::from(path_str);
+                        if path.is_file() {
+                            match std::fs::metadata(&path) {
+                                Ok(meta) if meta.len() <= DISCORD_ATTACHMENT_MAX_BYTES => {
+                                    self.dispatcher
+                                        .dispatch(OutboundAction::UploadFile {
+                                            session: session.key.clone(),
+                                            path,
+                                        })
+                                        .await?;
+                                    uploaded_media = true;
+                                }
+                                Ok(meta) => {
+                                    tracing::warn!(
+                                        session = %session.key,
+                                        path = %path.display(),
+                                        size = meta.len(),
+                                        "MEDIA file exceeds Discord attachment size limit; skipping upload"
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        session = %session.key,
+                                        path = %path.display(),
+                                        %error,
+                                        "Failed to read MEDIA file metadata"
+                                    );
+                                }
+                            }
                         } else {
-                            tracing::info!(session = %session.key, response = %response, "LLM returned silence sentinel or narration; suppressing delivery");
+                            tracing::warn!(
+                                session = %session.key,
+                                path = %path.display(),
+                                "MEDIA directive path does not exist; skipping upload"
+                            );
                         }
+                    }
+
+                    let is_silent = is_silence_response(&stripped_text);
+                    if is_silent {
+                        if !uploaded_media {
+                            if stripped_text.trim().is_empty() {
+                                tracing::warn!(session = %session.key, "LLM returned an empty response; suppressing delivery");
+                            } else {
+                                tracing::info!(session = %session.key, response = %response, "LLM returned silence sentinel or narration; suppressing delivery");
+                            }
+                            if stream_output {
+                                let mut streams = self.streams.lock();
+                                streams.remove(&session.key.storage_key());
+                            }
+                            return Ok(response);
+                        }
+                        if stream_output {
+                            let mut streams = self.streams.lock();
+                            streams.remove(&session.key.storage_key());
+                        }
+                        self.persist_message(session, "assistant", &response, json!({}))
+                            .await?;
                         return Ok(response);
                     }
 
                     if stream_output {
-                        if !pending.is_empty() {
-                            self.emit(session, pending, true).await?;
-                        } else {
-                            self.emit(session, String::new(), true).await?;
-                        }
+                        self.emit_final(session, stripped_text).await?;
+                    } else if !stripped_text.trim().is_empty() {
+                        self.dispatcher
+                            .dispatch(OutboundAction::SendMessage {
+                                session: session.key.clone(),
+                                content: stripped_text,
+                                reply_to: None,
+                            })
+                            .await?;
                     }
                     self.persist_message(session, "assistant", &response, json!({}))
                         .await?;
@@ -950,6 +1011,62 @@ impl LiveAgentRunner {
             {
                 streams.remove(&session_key);
             }
+        }
+        result
+    }
+
+    async fn emit_final(&self, session: &SessionContext, content: String) -> Result<()> {
+        let session_key = session.key.storage_key();
+        let chunk = {
+            let mut streams = self.streams.lock();
+            let state = streams
+                .entry(session_key.clone())
+                .or_insert_with(|| StreamEmissionState {
+                    stream_id: Uuid::new_v4(),
+                    next_sequence: 0,
+                    content: String::new(),
+                });
+            state.content = content;
+            omon_gateway::StreamChunk {
+                stream_id: state.stream_id,
+                sequence: state.next_sequence,
+                content: state.content.clone(),
+                is_final: true,
+            }
+        };
+        let stream_id = chunk.stream_id;
+        let obligation_id = format!("obl_{stream_id}");
+        let ledger = DeliveryLedgerService::new(self.pool.clone());
+
+        let _ = ledger
+            .record_obligation(&obligation_id, &session.key, &chunk.content)
+            .await;
+        let _ = ledger.mark_obligation_attempting(&obligation_id).await;
+
+        let result = self
+            .dispatcher
+            .dispatch(OutboundAction::Stream {
+                session: session.key.clone(),
+                chunk,
+            })
+            .await;
+
+        match &result {
+            Ok(_) => {
+                let _ = ledger.mark_obligation_delivered(&obligation_id).await;
+            }
+            Err(error) => {
+                let _ = ledger
+                    .mark_obligation_failed(&obligation_id, &error.to_string())
+                    .await;
+            }
+        }
+        let mut streams = self.streams.lock();
+        if streams
+            .get(&session_key)
+            .is_some_and(|state| state.stream_id == stream_id)
+        {
+            streams.remove(&session_key);
         }
         result
     }
@@ -2418,6 +2535,150 @@ mod runner_tests {
             "Non-streaming turn must still dispatch success reaction"
         );
         server_handle_non_stream.await.unwrap();
+    }
+
+    async fn spawn_single_turn_llm_server(
+        content: String,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let escaped = serde_json::to_string(&content).unwrap();
+                let body = format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{escaped}}}}}]}}\n\ndata: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{address}/v1"), server_handle)
+    }
+
+    #[tokio::test]
+    async fn test_execute_uploads_media_directive_and_delivers_stripped_text() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let image_path = temp_dir.path().join("chart.png");
+        std::fs::write(&image_path, b"fake png data").unwrap();
+
+        let llm_text = format!(
+            "Here is the generated chart:\nMEDIA:{}\nEnjoy!",
+            image_path.display()
+        );
+        let (base_url, server_handle) = spawn_single_turn_llm_server(llm_text).await;
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-media",
+            None::<String>,
+            "user-media",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        let event =
+            omon_gateway::InboundEvent::message(session_key.clone(), "msg-media", "Draw a chart");
+
+        let response = runner
+            .execute(&mut session, event, None, None, true)
+            .await
+            .unwrap();
+        assert!(response.contains("MEDIA:"));
+
+        let actions = dispatcher.actions.lock().await.clone();
+
+        // Verify UploadFile was dispatched for the local file
+        let uploads: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                omon_gateway::OutboundAction::UploadFile { path, session: s } => {
+                    Some((path.clone(), s.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].0, image_path);
+        assert_eq!(uploads[0].1, session_key);
+
+        // Verify final stream chunk delivered stripped text without MEDIA line
+        let final_stream = actions.iter().find(|a| match a {
+            omon_gateway::OutboundAction::Stream { chunk, .. } => chunk.is_final,
+            _ => false,
+        });
+        assert!(final_stream.is_some());
+        if let Some(omon_gateway::OutboundAction::Stream { chunk, .. }) = final_stream {
+            assert!(!chunk.content.contains("MEDIA:"));
+            assert_eq!(chunk.content, "Here is the generated chart:\nEnjoy!");
+        }
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_execute_uploads_media_only_and_suppresses_empty_text_delivery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let report_path = temp_dir.path().join("report.pdf");
+        std::fs::write(&report_path, b"fake pdf data").unwrap();
+
+        let llm_text = format!("MEDIA:{}", report_path.display());
+        let (base_url, server_handle) = spawn_single_turn_llm_server(llm_text).await;
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-media",
+            None::<String>,
+            "user-media",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        let event = omon_gateway::InboundEvent::message(
+            session_key.clone(),
+            "msg-media-only",
+            "Generate report",
+        );
+
+        let response = runner
+            .execute(&mut session, event, None, None, true)
+            .await
+            .unwrap();
+        assert!(response.contains("MEDIA:"));
+
+        let actions = dispatcher.actions.lock().await.clone();
+
+        // Verify UploadFile was dispatched
+        let uploads: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                omon_gateway::OutboundAction::UploadFile { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uploads, vec![report_path]);
+
+        // Verify no stream chunk was delivered with empty text
+        let has_final_stream = actions.iter().any(|a| match a {
+            omon_gateway::OutboundAction::Stream { chunk, .. } => chunk.is_final,
+            _ => false,
+        });
+        assert!(
+            !has_final_stream,
+            "Must suppress empty text message when only media is delivered"
+        );
+
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
