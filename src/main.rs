@@ -59,6 +59,7 @@ struct Config {
     free_response_channels: Vec<u64>,
     allowed_users: Vec<u64>,
     approval_policy: ApprovalPolicy,
+    approval_timeout_secs: u64,
 }
 
 impl Config {
@@ -135,6 +136,9 @@ impl Config {
             free_response_channels,
             allowed_users,
             approval_policy: ApprovalPolicy::parse(optional_env("APPROVAL_MODE").as_deref()),
+            approval_timeout_secs: approval_timeout_secs_from(
+                optional_env("APPROVAL_TIMEOUT_SECS").as_deref(),
+            ),
         })
     }
 
@@ -981,13 +985,13 @@ async fn run_gateway() -> Result<()> {
     let approval_guard = SmartApprovalGuard::new();
     let approval_requester = Arc::new(DiscordApprovalRequester::new(
         approval_guard.clone(),
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(config.approval_timeout_secs),
     ));
     let mut tools = ToolRegistry::new();
     tools.register(TerminalTool::new(&config.workspace_root).with_approval(
         config.approval_policy,
         approval_requester.clone(),
-        std::time::Duration::from_secs(125),
+        std::time::Duration::from_secs(config.approval_timeout_secs + 5),
     ));
     tools.register(FileTool::new(&config.workspace_root));
     tools.register(McpTool::default());
@@ -1130,6 +1134,12 @@ fn optional_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
+fn approval_timeout_secs_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(900)
+}
+
 #[cfg(test)]
 mod runner_tests {
     use std::fs;
@@ -1137,7 +1147,22 @@ mod runner_tests {
     use clap::Parser;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{canonical_authorized_directory, hermes_skill_dirs, tool_enabled, Cli, Command};
+    use super::{
+        approval_timeout_secs_from, canonical_authorized_directory, hermes_skill_dirs,
+        tool_enabled, Cli, Command,
+    };
+
+    #[test]
+    fn parses_approval_timeout_secs_from_env() {
+        assert_eq!(approval_timeout_secs_from(Some("120")), 120);
+        assert_eq!(approval_timeout_secs_from(Some(" 300 ")), 300);
+        assert_eq!(approval_timeout_secs_from(None), 900);
+        assert_eq!(approval_timeout_secs_from(Some("")), 900);
+        assert_eq!(approval_timeout_secs_from(Some("   ")), 900);
+        assert_eq!(approval_timeout_secs_from(Some("0")), 900);
+        assert_eq!(approval_timeout_secs_from(Some("-10")), 900);
+        assert_eq!(approval_timeout_secs_from(Some("invalid")), 900);
+    }
 
     #[test]
     fn hermes_skill_dirs_use_documented_roots() {

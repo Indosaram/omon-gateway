@@ -219,6 +219,7 @@ launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 | `HERMES_HOME` | `$HOME/.hermes` | Hermes root used by migration, cron synchronization, and Hermes skill discovery |
 | `OMON_HERMES_PROFILES` | Auto-discover | Optional comma-separated Hermes cron profiles; when unset, synchronizes `default` plus discovered profile directories |
 | `APPROVAL_MODE` | `smart` | Enforced terminal approval policy: `smart` gates dangerous commands, `always` gates every command, and `never`/`yolo` bypass approval |
+| `APPROVAL_TIMEOUT_SECS` | `900` | Seconds to wait for a Discord command approval before the request expires (default 900) |
 
 ---
 
