@@ -175,25 +175,14 @@ pub fn format_channel_context<A: AsRef<str>, C: AsRef<str>>(messages: &[(A, C)])
     }
     let mut lines = Vec::new();
     for (author, content) in messages {
-        let author = author.as_ref().trim();
-        let collapsed: String = content
-            .as_ref()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let trimmed = collapsed.trim();
-        if author.is_empty() || trimmed.is_empty() {
+        let author = crate::security::neutralize_untrusted_inline_text(author.as_ref(), 64);
+        let truncated = crate::security::neutralize_untrusted_inline_text(
+            content.as_ref(),
+            MAX_CONTEXT_LINE_CHARS,
+        );
+        if author.is_empty() || truncated.is_empty() {
             continue;
         }
-        let truncated = if trimmed.chars().count() > MAX_CONTEXT_LINE_CHARS {
-            let prefix: String = trimmed
-                .chars()
-                .take(MAX_CONTEXT_LINE_CHARS.saturating_sub(3))
-                .collect();
-            format!("{prefix}...")
-        } else {
-            trimmed.to_string()
-        };
         lines.push(format!("{author}: {truncated}"));
     }
     if lines.is_empty() {

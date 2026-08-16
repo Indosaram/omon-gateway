@@ -11,15 +11,16 @@ use omon_gateway::storage::init_pool;
 use omon_gateway::{
     augmented_path_from_environment, cron_runs_retention_days_from_environment,
     extract_media_directives, format_context_from_block, is_silence_response,
-    parse_context_from_ids, parse_profile_routes, parse_wake_gate, prune_terminal_cron_runs,
-    render_user_prompt, resolve_predecessor_output, truncate_context_output, AgentRunner,
-    ApprovalPolicy, AttachmentDownloader, ChatMessage, CronJob, CronScheduler, CronTaskExecutor,
-    CronTool, DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress,
-    FileTool, HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider,
-    McpTool, MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher,
-    PoiseData, ProfileRoute, ProfileRouter, RestartLoopGuard, Result, ScaleToZero, SessionContext,
-    SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry,
-    DISCORD_ATTACHMENT_MAX_BYTES, MAX_CONTEXT_CHARS,
+    neutralize_untrusted_inline_text, parse_context_from_ids, parse_profile_routes,
+    parse_wake_gate, prune_terminal_cron_runs, render_user_prompt, resolve_predecessor_output,
+    truncate_context_output, AgentRunner, ApprovalPolicy, AttachmentDownloader, ChatMessage,
+    CronJob, CronScheduler, CronTaskExecutor, CronTool, DeliveryLedgerService, DiscordAdapter,
+    DiscordApprovalRequester, DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer,
+    InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore, MultiplexerConfig,
+    OmonError, OutboundAction, OutboundDispatcher, PoiseData, ProfileRoute, ProfileRouter,
+    RestartLoopGuard, Result, ScaleToZero, SessionContext, SessionKey, SessionMultiplexer,
+    SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry, DISCORD_ATTACHMENT_MAX_BYTES,
+    MAX_CONTEXT_CHARS,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -601,7 +602,10 @@ impl LiveAgentRunner {
             cron_jobs
                 .iter()
                 .map(|(id, expr, payload)| {
-                    format!("- [{id}] Schedule `{expr}` | Payload: {payload}")
+                    let safe_id = neutralize_untrusted_inline_text(id, 64);
+                    let safe_expr = neutralize_untrusted_inline_text(expr, 64);
+                    let safe_payload = neutralize_untrusted_inline_text(payload, 240);
+                    format!("- [{safe_id}] Schedule `{safe_expr}` | Payload: {safe_payload}")
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -609,6 +613,7 @@ impl LiveAgentRunner {
 
         let mut messages = Vec::new();
 
+        let safe_session_key = neutralize_untrusted_inline_text(&session.key.to_string(), 240);
         let system_prompt = if let Some(prompt) = session.state.system_prompt.as_deref() {
             prompt.to_string()
         } else {
@@ -624,7 +629,7 @@ impl LiveAgentRunner {
                 {}\n\n\
                 You operate inside your dedicated workspace at `{}`. You have full access to tools to execute commands, create files, manage cron jobs, and perform tasks. When asked about who you are, your workspace, or your cron jobs, answer accurately using the above environment facts and the `cron` tool.",
                 self.workspace_root.display(),
-                session.key,
+                safe_session_key,
                 cron_summary,
                 self.workspace_root.display()
             )
@@ -634,7 +639,12 @@ impl LiveAgentRunner {
         if !memories.is_empty() {
             let context = memories
                 .into_iter()
-                .map(|memory| format!("- {}", memory.content))
+                .map(|memory| {
+                    format!(
+                        "- {}",
+                        neutralize_untrusted_inline_text(&memory.content, 400)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             messages.push(ChatMessage::new(
