@@ -14,10 +14,10 @@ use omon_gateway::discord::commands::{is_user_allowed, is_user_authorized};
 use omon_gateway::{
     approval_buttons, chunk_markdown, chunk_markdown_paginated, compose_reply_context,
     derive_auto_thread_name, is_authorized_clicker, parse_custom_id, render_user_prompt,
-    safe_allowed_mentions, ApprovalDecision, ApprovalError, AttachmentDownloader, ChatMessage,
-    Database, DeliveryLedgerService, DiscordEgress, DiscordFileUploader, DiscordMessageTransport,
-    InboundEvent, LiveEditThrottler, LlmClient, LlmConfig, LlmProvider, MessageAttachment,
-    OutboundAction, OutboundDispatcher, Result, SessionKey, SmartApprovalGuard,
+    safe_allowed_mentions, AllowBotsMode, ApprovalDecision, ApprovalError, AttachmentDownloader,
+    ChatMessage, Database, DeliveryLedgerService, DiscordEgress, DiscordFileUploader,
+    DiscordMessageTransport, InboundEvent, LiveEditThrottler, LlmClient, LlmConfig, LlmProvider,
+    MessageAttachment, OutboundAction, OutboundDispatcher, Result, SessionKey, SmartApprovalGuard,
     DISCORD_ATTACHMENT_MAX_BYTES,
 };
 use serenity::all::{ChannelId, ChannelType, Message, MessageId, UserId};
@@ -677,6 +677,99 @@ fn every_explicitly_mentioned_bot_owns_exactly_its_target() {
             primary_bot_id: Some(42),
             ..Default::default()
         },
+    )
+    .is_none());
+}
+
+#[test]
+fn test_allow_bots_policy_modes() {
+    let bot_id = UserId::new(42);
+
+    let mut bot_msg = message_fixture(None, "Hello from another bot", Vec::new());
+    bot_msg.author.bot = true;
+    bot_msg.author.id = UserId::new(999);
+
+    let mut bot_msg_mentioned = message_fixture(None, "<@42> question from bot", vec![42]);
+    bot_msg_mentioned.author.bot = true;
+    bot_msg_mentioned.author.id = UserId::new(999);
+
+    let mut self_msg = message_fixture(None, "<@42> self ping", vec![42]);
+    self_msg.author.bot = true;
+    self_msg.author.id = UserId::new(42);
+
+    // 1. None: all bot authors dropped even if mentioned
+    assert!(message_to_inbound_with_config(
+        &bot_msg,
+        bot_id,
+        Some(ChannelType::Private),
+        &InboundFilterConfig {
+            allow_bots: AllowBotsMode::None,
+            primary_bot_id: Some(42),
+            ..Default::default()
+        }
+    )
+    .is_none());
+
+    assert!(message_to_inbound_with_config(
+        &bot_msg_mentioned,
+        bot_id,
+        Some(ChannelType::Private),
+        &InboundFilterConfig {
+            allow_bots: AllowBotsMode::None,
+            primary_bot_id: Some(42),
+            ..Default::default()
+        }
+    )
+    .is_none());
+
+    // 2. Mentions: dropped if unmentioned, allowed if mentioned
+    assert!(message_to_inbound_with_config(
+        &bot_msg,
+        bot_id,
+        Some(ChannelType::Private),
+        &InboundFilterConfig {
+            allow_bots: AllowBotsMode::Mentions,
+            primary_bot_id: Some(42),
+            ..Default::default()
+        }
+    )
+    .is_none());
+
+    assert!(message_to_inbound_with_config(
+        &bot_msg_mentioned,
+        bot_id,
+        Some(ChannelType::Private),
+        &InboundFilterConfig {
+            allow_bots: AllowBotsMode::Mentions,
+            primary_bot_id: Some(42),
+            ..Default::default()
+        }
+    )
+    .is_some());
+
+    // 3. All: allowed without mention in DM / free channels
+    assert!(message_to_inbound_with_config(
+        &bot_msg,
+        bot_id,
+        Some(ChannelType::Private),
+        &InboundFilterConfig {
+            allow_bots: AllowBotsMode::All,
+            primary_bot_id: Some(42),
+            ..Default::default()
+        }
+    )
+    .is_some());
+
+    // Self message is always dropped across all modes to prevent loops
+    assert!(message_to_inbound_with_config(
+        &self_msg,
+        bot_id,
+        Some(ChannelType::Private),
+        &InboundFilterConfig {
+            allow_bots: AllowBotsMode::All,
+            primary_bot_id: Some(42),
+            ..Default::default()
+        }
     )
     .is_none());
 }

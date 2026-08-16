@@ -384,6 +384,7 @@ struct Config {
     approvals_deny: Vec<String>,
     profile_routes: Vec<ProfileRoute>,
     runtime_footer: bool,
+    allow_bots: omon_gateway::AllowBotsMode,
 }
 
 impl Config {
@@ -515,6 +516,9 @@ impl Config {
             runtime_footer: parse_bool_from(
                 optional_env("DISCORD_RUNTIME_FOOTER").as_deref(),
                 false,
+            ),
+            allow_bots: omon_gateway::AllowBotsMode::parse(
+                optional_env("DISCORD_ALLOW_BOTS").as_deref(),
             ),
         })
     }
@@ -2262,6 +2266,7 @@ async fn run_gateway() -> Result<()> {
     poise_data.allow_all_users = config.allow_all_users;
     poise_data.thread_sessions_per_user = config.thread_sessions_per_user;
     poise_data.thread_require_mention = config.thread_require_mention;
+    poise_data.allow_bots = config.allow_bots;
     poise_data.allowed_channels = config.allowed_channels.clone();
     poise_data.ignored_channels = config.ignored_channels.clone();
     poise_data.auto_thread = config.auto_thread;

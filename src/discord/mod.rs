@@ -9,9 +9,9 @@ pub use adapter::{
     derive_auto_thread_name, derive_forum_post_title, extract_media_directives,
     format_channel_context, format_runtime_footer, global_debouncer, is_authorized_clicker,
     is_discord_dead_target_error, is_silence_response, is_voice_audio_file, safe_allowed_mentions,
-    should_chunk_reference, DeadTargetEntry, DeadTargetRegistry, DiscordAdapter, DiscordEgress,
-    DiscordFileUploader, InboundFilterConfig, SerenityFileUploader, SplitMessageDebouncer,
-    VoiceMetadata, DEFAULT_CHANNEL_CONTEXT_LIMIT, DEFAULT_DEBOUNCE_DURATION,
+    should_chunk_reference, AllowBotsMode, DeadTargetEntry, DeadTargetRegistry, DiscordAdapter,
+    DiscordEgress, DiscordFileUploader, InboundFilterConfig, SerenityFileUploader,
+    SplitMessageDebouncer, VoiceMetadata, DEFAULT_CHANNEL_CONTEXT_LIMIT, DEFAULT_DEBOUNCE_DURATION,
     DISCORD_VOICE_MESSAGE_FLAG, MAX_CHANNEL_CONTEXT_LIMIT, MAX_CONTEXT_LINE_CHARS,
     REFERENCED_CONTENT_CAP,
 };

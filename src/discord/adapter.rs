@@ -312,6 +312,24 @@ pub fn derive_forum_post_title(content: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AllowBotsMode {
+    #[default]
+    None,
+    Mentions,
+    All,
+}
+
+impl AllowBotsMode {
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("all") => Self::All,
+            Some("mentions") | Some("mention") => Self::Mentions,
+            _ => Self::None,
+        }
+    }
+}
+
 /// Configuration options for filtering and routing inbound Discord messages.
 #[derive(Clone, Debug)]
 pub struct InboundFilterConfig<'a> {
@@ -326,6 +344,7 @@ pub struct InboundFilterConfig<'a> {
     pub ignored_channels: &'a [u64],
     pub primary_bot_id: Option<u64>,
     pub thread_require_mention: bool,
+    pub allow_bots: AllowBotsMode,
 }
 
 impl Default for InboundFilterConfig<'_> {
@@ -342,6 +361,7 @@ impl Default for InboundFilterConfig<'_> {
             ignored_channels: &[],
             primary_bot_id: None,
             thread_require_mention: false,
+            allow_bots: AllowBotsMode::None,
         }
     }
 }
@@ -600,6 +620,7 @@ impl DiscordAdapter {
             ignored_channels: &self.data.ignored_channels,
             primary_bot_id: self.data.primary_bot_id,
             thread_require_mention: self.data.thread_require_mention,
+            allow_bots: self.data.allow_bots,
         };
         let Some(event) =
             message_to_inbound_with_config(message, bot_user_id, channel_type, &config)
@@ -677,6 +698,7 @@ async fn handle_event(
                 ignored_channels: &data.ignored_channels,
                 primary_bot_id: data.primary_bot_id,
                 thread_require_mention: data.thread_require_mention,
+                allow_bots: data.allow_bots,
             };
             if let Some(mut event) =
                 message_to_inbound_with_config(new_message, bot_user_id, channel_type, &config)
@@ -910,8 +932,30 @@ pub fn message_to_inbound_with_config(
     channel_type: Option<ChannelType>,
     config: &InboundFilterConfig<'_>,
 ) -> Option<InboundEvent> {
-    if message.author.bot || message.webhook_id.is_some() {
+    if message.webhook_id.is_some() {
         return None;
+    }
+
+    if message.author.id == bot_user_id {
+        return None;
+    }
+
+    if message.author.bot {
+        match config.allow_bots {
+            AllowBotsMode::None => return None,
+            AllowBotsMode::Mentions => {
+                let mentioned_bot_ids = message
+                    .mentions
+                    .iter()
+                    .filter(|user| user.bot)
+                    .map(|user| user.id)
+                    .collect::<Vec<_>>();
+                if !mentioned_bot_ids.contains(&bot_user_id) {
+                    return None;
+                }
+            }
+            AllowBotsMode::All => {}
+        }
     }
 
     // Only process standard text messages and replies. Ignore system messages (thread joins, removals, pins, etc.)
