@@ -1374,25 +1374,75 @@ fn load_cron_skills(job: &HermesJob) -> Result<String> {
     if names.is_empty() {
         return Ok(String::new());
     }
-    let home = hermes_home(job)?;
-    let root = canonical_directory(&home.join("skills"), "Hermes skills root")?;
+    let Ok(home) = hermes_home(job) else {
+        if job.prompt.trim().is_empty() {
+            return Err(OmonError::Config(format!(
+                "Hermes job {} has an empty prompt and all skills are missing: {}",
+                job.id,
+                names.join(", ")
+            )));
+        }
+        return Ok(format!(
+            "⚠️ Skill(s) not found and skipped: {}",
+            names.join(", ")
+        ));
+    };
+    let Ok(root) = canonical_directory(&home.join("skills"), "Hermes skills root") else {
+        if job.prompt.trim().is_empty() {
+            return Err(OmonError::Config(format!(
+                "Hermes job {} has an empty prompt and all skills are missing: {}",
+                job.id,
+                names.join(", ")
+            )));
+        }
+        return Ok(format!(
+            "⚠️ Skill(s) not found and skipped: {}",
+            names.join(", ")
+        ));
+    };
     let mut assembled = String::new();
+    let mut skipped = Vec::new();
     for name in names {
-        let path = find_skill_file(&root, &name).ok_or_else(|| {
-            OmonError::Config(format!(
-                "Hermes job {} references missing skill `{name}`",
-                job.id
-            ))
-        })?;
-        let content = std::fs::read_to_string(&path).map_err(|error| {
-            OmonError::Config(format!("failed to read skill {}: {error}", path.display()))
-        })?;
+        let path = match find_skill_file(&root, &name) {
+            Some(p) => p,
+            None => {
+                warn!(job_id = %job.id, skill = %name, "Cron job skill not found, skipping");
+                skipped.push(name);
+                continue;
+            }
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(error) => {
+                warn!(job_id = %job.id, skill = %name, %error, "Failed to read cron skill file, skipping");
+                skipped.push(name);
+                continue;
+            }
+        };
         if !assembled.is_empty() {
             assembled.push_str("\n\n");
         }
         assembled.push_str(&format!("[Skill: {name}]\n{content}"));
     }
-    Ok(assembled)
+
+    if assembled.is_empty() && !skipped.is_empty() && job.prompt.trim().is_empty() {
+        return Err(OmonError::Config(format!(
+            "Hermes job {} has an empty prompt and all skills were missing: {}",
+            job.id,
+            skipped.join(", ")
+        )));
+    }
+
+    if !skipped.is_empty() {
+        let warning = format!("⚠️ Skill(s) not found and skipped: {}", skipped.join(", "));
+        if !assembled.is_empty() {
+            Ok(format!("{warning}\n\n{assembled}"))
+        } else {
+            Ok(warning)
+        }
+    } else {
+        Ok(assembled)
+    }
 }
 
 fn find_skill_file(root: &Path, name: &str) -> Option<PathBuf> {
@@ -1793,6 +1843,7 @@ pub fn parse_u64_list(raw: Option<&str>) -> Vec<u64> {
 
 #[cfg(test)]
 mod runner_tests {
+    use std::collections::HashMap;
     use std::fs;
 
     use clap::Parser;
@@ -1800,8 +1851,9 @@ mod runner_tests {
 
     use super::{
         approval_timeout_secs_from, canonical_authorized_directory, hermes_skill_dirs,
-        tool_enabled, Cli, Command,
+        load_cron_skills, tool_enabled, Cli, Command,
     };
+    use omon_gateway::HermesJob;
 
     #[test]
     fn parses_approval_timeout_secs_from_env() {
@@ -2726,5 +2778,131 @@ mod runner_tests {
         );
 
         server_handle.await.unwrap();
+    }
+
+    #[test]
+    fn test_load_cron_skills_missing_skill_resilience() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("omon-test-skills-{}", uuid::Uuid::new_v4()));
+        let skills_dir = temp_dir.join("skills");
+        let skill_a_dir = skills_dir.join("skill_a");
+        std::fs::create_dir_all(&skill_a_dir).unwrap();
+        std::fs::write(skill_a_dir.join("SKILL.md"), "Instructions for skill A").unwrap();
+
+        let mut extra = HashMap::new();
+        extra.insert(
+            "_omon_hermes_home".into(),
+            serde_json::Value::String(temp_dir.to_string_lossy().into_owned()),
+        );
+
+        // 1. Partial missing skills with prompt -> warning prepended, job does not fail
+        let partial_job = HermesJob {
+            id: "job_partial".into(),
+            name: "Partial".into(),
+            prompt: "Summarize status".into(),
+            skills: vec!["skill_a".into(), "skill_missing".into()],
+            skill: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            script: None,
+            no_agent: false,
+            context_from: None,
+            schedule: omon_gateway::HermesSchedule::default(),
+            schedule_display: "".into(),
+            repeat: omon_gateway::HermesRepeat::default(),
+            enabled: true,
+            state: "".into(),
+            created_at: None,
+            next_run_at: None,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            deliver: None,
+            origin: None,
+            enabled_toolsets: None,
+            workdir: None,
+            attach_to_session: None,
+            extra: extra.clone(),
+        };
+        let loaded = load_cron_skills(&partial_job).unwrap();
+        assert!(loaded.contains("⚠️ Skill(s) not found and skipped: skill_missing"));
+        assert!(loaded.contains("[Skill: skill_a]\nInstructions for skill A"));
+
+        // 2. All skills missing but non-empty prompt -> returns warning only, succeeds
+        let missing_with_prompt_job = HermesJob {
+            id: "job_missing".into(),
+            name: "Missing".into(),
+            prompt: "Do something anyway".into(),
+            skills: vec!["missing_1".into(), "missing_2".into()],
+            skill: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            script: None,
+            no_agent: false,
+            context_from: None,
+            schedule: omon_gateway::HermesSchedule::default(),
+            schedule_display: "".into(),
+            repeat: omon_gateway::HermesRepeat::default(),
+            enabled: true,
+            state: "".into(),
+            created_at: None,
+            next_run_at: None,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            deliver: None,
+            origin: None,
+            enabled_toolsets: None,
+            workdir: None,
+            attach_to_session: None,
+            extra: extra.clone(),
+        };
+        let loaded_warn = load_cron_skills(&missing_with_prompt_job).unwrap();
+        assert_eq!(
+            loaded_warn,
+            "⚠️ Skill(s) not found and skipped: missing_1, missing_2"
+        );
+
+        // 3. All skills missing and EMPTY prompt -> fails with Config error
+        let empty_prompt_missing_job = HermesJob {
+            id: "job_empty".into(),
+            name: "Empty".into(),
+            prompt: "".into(),
+            skills: vec!["missing_skill".into()],
+            skill: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            script: None,
+            no_agent: false,
+            context_from: None,
+            schedule: omon_gateway::HermesSchedule::default(),
+            schedule_display: "".into(),
+            repeat: omon_gateway::HermesRepeat::default(),
+            enabled: true,
+            state: "".into(),
+            created_at: None,
+            next_run_at: None,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            deliver: None,
+            origin: None,
+            enabled_toolsets: None,
+            workdir: None,
+            attach_to_session: None,
+            extra,
+        };
+        let err = load_cron_skills(&empty_prompt_missing_job).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("empty prompt and all skills were missing"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
