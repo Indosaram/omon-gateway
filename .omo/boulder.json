@@ -1,13 +1,15 @@
 {
   "schema_version": 2,
-  "active_work_id": "hermes-oneclick-migration",
+  "active_work_id": null,
   "works": {
     "hermes-oneclick-migration": {
       "work_id": "hermes-oneclick-migration",
       "active_plan": ".omo/plans/hermes-oneclick-migration.md",
       "plan_name": "hermes-oneclick-migration",
-      "session_ids": ["senpi:01a00559-273c-731f-bbf4-26de8b3617ae"],
-      "status": "active",
+      "session_ids": [
+        "senpi:01a00559-273c-731f-bbf4-26de8b3617ae"
+      ],
+      "status": "completed",
       "worktree_path": null
     }
   }
