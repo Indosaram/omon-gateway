@@ -1596,7 +1596,7 @@ async fn run_gateway() -> Result<()> {
         pool: pool.clone(),
         memory,
         tools: tools.clone(),
-        llm,
+        llm: llm.clone(),
         dispatcher: shared_dispatcher.clone(),
         workspace_root: config.workspace_root.clone(),
         streams: ParkingMutex::new(HashMap::new()),
@@ -1659,6 +1659,7 @@ async fn run_gateway() -> Result<()> {
     scheduler.start().await;
 
     let mut poise_data = PoiseData::new(multiplexer, pool.clone());
+    poise_data.llm = Some(llm.clone());
     poise_data.tools = tool_names;
     poise_data.tool_registry = tools.clone();
     poise_data.free_response_channels = config.free_response_channels.clone();
