@@ -29,15 +29,18 @@ impl Database {
         if !in_memory {
             options = options
                 .journal_mode(SqliteJournalMode::Wal)
-                .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+                .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+                .pragma("wal_autocheckpoint", "1000");
         }
 
-        // A plain `sqlite::memory:` database is private to each connection.
-        // Keeping its pool at one connection gives tests and callers one
-        // coherent database while preserving normal pooling for file URLs.
-        let max_connections = if in_memory { 1 } else { 10 };
+        // SQLite permits only one writer at a time. A single warm connection
+        // queues all access in sqlx instead of letting pooled write transactions
+        // collide at SQLite and fail with SQLITE_BUSY. It also keeps a plain
+        // `sqlite::memory:` database coherent because each connection would
+        // otherwise receive a private database.
         let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
+            .min_connections(1)
+            .max_connections(1)
             .connect_with(options)
             .await?;
 
@@ -57,8 +60,10 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     use sqlx::Row;
+    use tokio::sync::Barrier;
 
     use super::Database;
 
@@ -89,6 +94,61 @@ mod tests {
             assert!(tables.contains(expected), "missing table {expected}");
         }
         assert!(tables.contains("_sqlx_migrations"));
+    }
+
+    #[tokio::test]
+    async fn file_database_serializes_concurrent_writers_without_lock_errors() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("writers.db");
+        let database = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("file database should initialize");
+        assert_eq!(database.pool().options().get_max_connections(), 1);
+        assert_eq!(database.pool().options().get_min_connections(), 1);
+
+        sqlx::query("CREATE TABLE concurrent_writes (value INTEGER NOT NULL)")
+            .execute(database.pool())
+            .await
+            .expect("test table should be created");
+
+        // The former 10-connection file pool made this workload flaky because
+        // independently acquired writers could collide and return SQLITE_BUSY.
+        const WRITERS: usize = 32;
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let mut tasks = Vec::with_capacity(WRITERS);
+        for value in 0..WRITERS {
+            let pool = database.pool().clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                sqlx::query("INSERT INTO concurrent_writes (value) VALUES (?)")
+                    .bind(value as i64)
+                    .execute(&pool)
+                    .await
+            }));
+        }
+
+        for task in tasks {
+            task.await
+                .expect("writer task should not panic")
+                .expect("serialized writer should not return SQLITE_BUSY");
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM concurrent_writes")
+            .fetch_one(database.pool())
+            .await
+            .expect("written rows should be queryable");
+        assert_eq!(count, WRITERS as i64);
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(database.pool())
+            .await
+            .expect("journal mode should be queryable");
+        let autocheckpoint: i64 = sqlx::query_scalar("PRAGMA wal_autocheckpoint")
+            .fetch_one(database.pool())
+            .await
+            .expect("WAL autocheckpoint should be queryable");
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(autocheckpoint, 1000);
     }
 
     #[tokio::test]

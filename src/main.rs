@@ -9,12 +9,13 @@ use futures_util::StreamExt;
 use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
-    render_user_prompt, AgentRunner, ApprovalPolicy, AttachmentDownloader, ChatMessage, CronJob,
-    CronScheduler, CronTaskExecutor, CronTool, DiscordAdapter, DiscordApprovalRequester,
-    DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient,
-    LlmConfig, LlmProvider, McpTool, MemoryStore, MultiplexerConfig, OmonError, OutboundAction,
-    OutboundDispatcher, PoiseData, Result, ScaleToZero, SessionContext, SessionKey,
-    SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry,
+    cron_runs_retention_days_from_environment, prune_terminal_cron_runs, render_user_prompt,
+    AgentRunner, ApprovalPolicy, AttachmentDownloader, ChatMessage, CronJob, CronScheduler,
+    CronTaskExecutor, CronTool, DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool,
+    HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool,
+    MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher, PoiseData,
+    Result, ScaleToZero, SessionContext, SessionKey, SessionMultiplexer, SmartApprovalGuard,
+    TerminalTool, ToolDefinition, ToolRegistry,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -1018,6 +1019,10 @@ async fn run_gateway() -> Result<()> {
     approval_requester
         .set_dispatcher(discord_egress.clone())
         .await;
+
+    let retention_days = cron_runs_retention_days_from_environment()?;
+    let pruned = prune_terminal_cron_runs(&pool, retention_days, chrono::Utc::now()).await?;
+    info!(pruned, retention_days, "pruned old terminal cron runs");
 
     let cron_sync = HermesStoreSynchronizer::from_environment(pool.clone())?;
     let imported = cron_sync.sync().await?;

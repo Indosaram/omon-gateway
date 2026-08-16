@@ -9,6 +9,47 @@ use sqlx::SqlitePool;
 use crate::{next_run, OmonError, Result};
 
 const SOURCE_KEY: &str = "_omon_hermes_source";
+pub const DEFAULT_CRON_RUNS_RETENTION_DAYS: i64 = 14;
+
+pub fn cron_runs_retention_days_from_environment() -> Result<i64> {
+    let Some(value) = std::env::var_os("CRON_RUNS_RETENTION_DAYS") else {
+        return Ok(DEFAULT_CRON_RUNS_RETENTION_DAYS);
+    };
+    let value = value.to_string_lossy();
+    let days = value.parse::<i64>().map_err(|_| {
+        OmonError::Config(format!(
+            "CRON_RUNS_RETENTION_DAYS must be a non-negative integer, got `{value}`"
+        ))
+    })?;
+    if days < 0 {
+        return Err(OmonError::Config(format!(
+            "CRON_RUNS_RETENTION_DAYS must be a non-negative integer, got `{value}`"
+        )));
+    }
+    Ok(days)
+}
+
+pub async fn prune_terminal_cron_runs(
+    pool: &SqlitePool,
+    retention_days: i64,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    if retention_days < 0 {
+        return Err(OmonError::Config(
+            "cron run retention days must be non-negative".into(),
+        ));
+    }
+    let cutoff = now - chrono::TimeDelta::days(retention_days);
+    let result = sqlx::query(
+        "DELETE FROM cron_runs
+         WHERE status IN ('succeeded', 'failed')
+           AND COALESCE(completed_at, started_at) < ?",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HermesSchedule {
@@ -392,6 +433,80 @@ mod tests {
         );
         assert_eq!(interval.expression().unwrap(), "interval:5m");
         assert_eq!(once.expression().unwrap(), "once:2026-08-15T09:00:00+09:00");
+    }
+
+    #[tokio::test]
+    async fn prunes_only_old_terminal_cron_runs() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO cron_jobs
+             (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)
+             VALUES ('retention-job', 'interval:1h', '{}', 1, NULL, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        for (run_id, status, started_at, completed_at) in [
+            (
+                "old-succeeded",
+                "succeeded",
+                now - chrono::TimeDelta::days(31),
+                Some(now - chrono::TimeDelta::days(30)),
+            ),
+            (
+                "old-failed",
+                "failed",
+                now - chrono::TimeDelta::days(30),
+                None,
+            ),
+            (
+                "recent-succeeded",
+                "succeeded",
+                now - chrono::TimeDelta::days(2),
+                Some(now - chrono::TimeDelta::days(1)),
+            ),
+            (
+                "old-running",
+                "running",
+                now - chrono::TimeDelta::days(30),
+                None,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO cron_runs
+                 (run_id, job_id, claim_token, lease_expires_at, started_at, completed_at, status, attempt, error)
+                 VALUES (?, 'retention-job', ?, ?, ?, ?, ?, 1, NULL)",
+            )
+            .bind(run_id)
+            .bind(format!("token-{run_id}"))
+            .bind(now + chrono::TimeDelta::hours(1))
+            .bind(started_at)
+            .bind(completed_at)
+            .bind(status)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        }
+
+        let deleted = prune_terminal_cron_runs(database.pool(), 14, now)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+        let remaining: HashSet<String> =
+            sqlx::query_scalar("SELECT run_id FROM cron_runs ORDER BY run_id")
+                .fetch_all(database.pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+        assert_eq!(
+            remaining,
+            HashSet::from(["old-running".to_owned(), "recent-succeeded".to_owned()])
+        );
     }
 
     #[tokio::test]
