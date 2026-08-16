@@ -1551,6 +1551,88 @@ fn test_format_channel_context_empty_and_skip_empty_lines() {
     );
 }
 
+#[test]
+fn test_forwarded_message_snapshots_routing() {
+    let bot_id = UserId::new(42);
+
+    let raw_str = r#"{
+        "id": "500",
+        "channel_id": "7",
+        "guild_id": null,
+        "author": {
+            "id": "100", "username": "alice", "discriminator": "0001", "avatar": null,
+            "bot": false, "system": false, "mfa_enabled": false, "banner": null,
+            "accent_color": null, "locale": null, "verified": false, "email": null,
+            "flags": 0, "premium_type": 0, "public_flags": 0
+        },
+        "content": "",
+        "timestamp": "2026-08-16T12:00:00Z",
+        "edited_timestamp": null,
+        "tts": false,
+        "mention_everyone": false,
+        "mentions": [],
+        "mention_roles": [],
+        "attachments": [],
+        "embeds": [],
+        "reactions": [],
+        "nonce": null,
+        "pinned": false,
+        "webhook_id": null,
+        "type": 0,
+        "activity": null,
+        "application": null,
+        "application_id": null,
+        "message_reference": null,
+        "flags": null,
+        "referenced_message": null,
+        "message_snapshots": [
+            {
+                "message": {
+                    "content": "This was originally sent in another channel",
+                    "timestamp": "2026-08-16T11:55:00Z",
+                    "edited_timestamp": null,
+                    "mentions": [],
+                    "mention_roles": [],
+                    "attachments": [
+                        {
+                            "id": "999", "filename": "plan.md", "description": null,
+                            "height": null, "width": null, "proxy_url": "https://cdn.example/plan.md",
+                            "size": 500, "url": "https://cdn.example/plan.md",
+                            "content_type": "text/markdown", "ephemeral": false,
+                            "duration_secs": null, "waveform": null
+                        }
+                    ],
+                    "embeds": [],
+                    "type": 0,
+                    "flags": null,
+                    "components": [],
+                    "sticker_items": []
+                }
+            }
+        ],
+        "interaction": null,
+        "interaction_metadata": null,
+        "thread": null,
+        "components": [],
+        "sticker_items": [],
+        "position": null,
+        "role_subscription_data": null,
+        "member": null,
+        "poll": null
+    }"#;
+
+    let msg: Message = serde_json::from_str(raw_str).unwrap();
+    let event = message_to_inbound(&msg, bot_id, Some(ChannelType::Private));
+    assert!(event.is_some(), "Forwarded message should not be dropped");
+    let event = event.unwrap();
+    assert_eq!(
+        event.content,
+        "[Forwarded]\nThis was originally sent in another channel [Attachment: plan.md]"
+    );
+    assert_eq!(event.attachments.len(), 1);
+    assert_eq!(event.attachments[0].filename, "plan.md");
+}
+
 #[tokio::test]
 async fn test_dead_target_short_circuit_in_egress() {
     use omon_gateway::{

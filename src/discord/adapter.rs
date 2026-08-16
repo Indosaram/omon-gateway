@@ -330,6 +330,67 @@ impl AllowBotsMode {
     }
 }
 
+/// Extracts forwarded message content and attachments from Discord `message_snapshots`.
+/// Returns `(forwarded_text_block, extracted_attachments)`.
+pub fn extract_forwarded_snapshots(
+    snapshots: &[serenity::all::MessageSnapshot],
+) -> (String, Vec<MessageAttachment>) {
+    if snapshots.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    let mut text_parts = Vec::new();
+    let mut attachments = Vec::new();
+
+    for snapshot in snapshots {
+        let mut part = snapshot.content.trim().to_string();
+        if !snapshot.attachments.is_empty() {
+            let att_summary = if snapshot.attachments.len() == 1 {
+                format!("[Attachment: {}]", snapshot.attachments[0].filename)
+            } else {
+                let names: Vec<&str> = snapshot
+                    .attachments
+                    .iter()
+                    .map(|a| a.filename.as_str())
+                    .collect();
+                format!("[Attachments: {}]", names.join(", "))
+            };
+            if part.is_empty() {
+                part = att_summary;
+            } else {
+                part = format!("{part} {att_summary}");
+            }
+            for att in &snapshot.attachments {
+                attachments.push(MessageAttachment {
+                    id: att.id.to_string(),
+                    filename: att.filename.clone(),
+                    url: att.url.clone(),
+                    content_type: att.content_type.clone(),
+                    size_bytes: Some(att.size as u64),
+                    local_path: None,
+                    text_content: None,
+                });
+            }
+        }
+        if !part.is_empty() {
+            text_parts.push(part);
+        }
+    }
+
+    if text_parts.is_empty() && attachments.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    let joined = text_parts.join("\n");
+    let block = if joined.is_empty() {
+        String::new()
+    } else {
+        format!("[Forwarded]\n{joined}")
+    };
+
+    (block, attachments)
+}
+
 /// Configuration options for filtering and routing inbound Discord messages.
 #[derive(Clone, Debug)]
 pub struct InboundFilterConfig<'a> {
@@ -1025,8 +1086,34 @@ pub fn message_to_inbound_with_config(
         }
     }
 
-    let raw_content = strip_bot_mention(&message.content, bot_user_id);
-    if raw_content.trim().is_empty() && message.attachments.is_empty() {
+    let (forwarded_block, forwarded_attachments) =
+        extract_forwarded_snapshots(&message.message_snapshots);
+
+    let mut raw_content = strip_bot_mention(&message.content, bot_user_id);
+    if !forwarded_block.is_empty() {
+        if raw_content.trim().is_empty() {
+            raw_content = forwarded_block;
+        } else {
+            raw_content = format!("{raw_content}\n\n{forwarded_block}");
+        }
+    }
+
+    let mut attachments: Vec<MessageAttachment> = message
+        .attachments
+        .iter()
+        .map(|attachment| MessageAttachment {
+            id: attachment.id.to_string(),
+            filename: attachment.filename.clone(),
+            url: attachment.url.clone(),
+            content_type: attachment.content_type.clone(),
+            size_bytes: Some(u64::from(attachment.size)),
+            local_path: None,
+            text_content: None,
+        })
+        .collect();
+    attachments.extend(forwarded_attachments);
+
+    if raw_content.trim().is_empty() && attachments.is_empty() {
         return None; // Do NOT auto-inject "Hello!" for empty/system messages
     }
     let content = if let Some(parent) = &message.referenced_message {
@@ -1066,19 +1153,6 @@ pub fn message_to_inbound_with_config(
         user_id,
     )
     .with_bot_id(bot_user_id.to_string());
-    let attachments = message
-        .attachments
-        .iter()
-        .map(|attachment| MessageAttachment {
-            id: attachment.id.to_string(),
-            filename: attachment.filename.clone(),
-            url: attachment.url.clone(),
-            content_type: attachment.content_type.clone(),
-            size_bytes: Some(u64::from(attachment.size)),
-            local_path: None,
-            text_content: None,
-        })
-        .collect();
     let mut event = InboundEvent::message(session, message.id.to_string(), content)
         .with_attachments(attachments);
     let delivery_id = if mentioned_bot_ids.len() > 1 {
@@ -2041,6 +2115,29 @@ mod tests {
 
     fn test_session(name: &str) -> SessionKey {
         SessionKey::new("discord", Some("guild"), "channel", None::<String>, name)
+    }
+
+    #[test]
+    fn test_extract_forwarded_snapshots() {
+        // Empty snapshots
+        let (empty_text, empty_atts) = extract_forwarded_snapshots(&[]);
+        assert!(empty_text.is_empty());
+        assert!(empty_atts.is_empty());
+
+        // Snapshot with text
+        let snap_json = serde_json::json!({
+            "content": "Check this forwarded update",
+            "timestamp": "2026-08-16T12:00:00Z",
+            "edited_timestamp": null,
+            "mentions": [],
+            "attachments": [],
+            "embeds": [],
+            "type": 0
+        });
+        let snap: serenity::all::MessageSnapshot = serde_json::from_value(snap_json).unwrap();
+        let (text, atts) = extract_forwarded_snapshots(&[snap]);
+        assert_eq!(text, "[Forwarded]\nCheck this forwarded update");
+        assert!(atts.is_empty());
     }
 
     #[test]
