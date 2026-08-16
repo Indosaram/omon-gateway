@@ -1,5 +1,8 @@
+pub mod guard;
 mod scheduler;
 mod store;
+
+pub use guard::check_gateway_lifecycle;
 
 pub use scheduler::{
     extract_repeat_info, failure_backoff_duration, format_context_from_block,

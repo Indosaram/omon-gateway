@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use sqlx::{FromRow, SqlitePool};
 
 use super::Tool;
-use crate::{next_run, OmonError};
+use crate::{check_gateway_lifecycle, next_run, OmonError};
 
 #[derive(Clone, Debug, FromRow, Serialize, Deserialize)]
 pub struct DbCronJob {
@@ -143,6 +143,12 @@ impl Tool for CronTool {
                     return Err(OmonError::ToolExecution(
                         "add requires at least one of 'prompt' or 'script'".into(),
                     ));
+                }
+                if let Some(p) = prompt {
+                    check_gateway_lifecycle(p).map_err(OmonError::ToolExecution)?;
+                }
+                if let Some(s) = script {
+                    check_gateway_lifecycle(s).map_err(OmonError::ToolExecution)?;
                 }
                 let desc = args
                     .get("description")

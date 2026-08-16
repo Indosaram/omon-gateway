@@ -345,6 +345,16 @@ impl HermesStoreSynchronizer {
                         "Hermes store {source} contains a job without an id"
                     )));
                 }
+                if let Err(err) = crate::cron::check_gateway_lifecycle(&job.prompt) {
+                    tracing::warn!(job_id = %job.id, reason = %err, "skipping Hermes job due to gateway lifecycle violation");
+                    continue;
+                }
+                if let Some(script) = job.script.as_deref() {
+                    if let Err(err) = crate::cron::check_gateway_lifecycle(script) {
+                        tracing::warn!(job_id = %job.id, reason = %err, "skipping Hermes job due to gateway lifecycle violation");
+                        continue;
+                    }
+                }
                 let expression = job.expression()?;
                 let id = format!("hermes:{}:{}", store.profile(), job.id);
                 live.insert(id.clone());
@@ -638,6 +648,51 @@ mod tests {
         assert_eq!(state.1, None, "Disabled job must not have next_run_at");
         let payload: Value = serde_json::from_str(&state.2).unwrap();
         assert_eq!(payload["repeat"]["completed"], 2);
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronization_skips_gateway_lifecycle_violators() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let root = std::env::temp_dir().join(format!("omon-hermes-guard-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(root.join("cron")).await.unwrap();
+        tokio::fs::write(
+            root.join("cron/jobs.json"),
+            serde_json::to_vec(&json!({"jobs": [
+                {
+                    "id": "benign", "prompt": "check weather", "enabled": true,
+                    "schedule": {"kind": "interval", "minutes": 5},
+                    "deliver": "local"
+                },
+                {
+                    "id": "evil_restart", "prompt": "launchctl kickstart gui/501/omon-gateway", "enabled": true,
+                    "schedule": {"kind": "interval", "minutes": 5},
+                    "deliver": "local"
+                },
+                {
+                    "id": "evil_script", "prompt": "check status", "script": "systemctl restart hermes-gateway", "enabled": true,
+                    "schedule": {"kind": "interval", "minutes": 5},
+                    "deliver": "local"
+                }
+            ]}))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let sync = HermesStoreSynchronizer::new(
+            database.pool().clone(),
+            vec![HermesStore::new("default", &root)],
+        );
+        let imported = sync.sync().await.unwrap();
+        assert_eq!(imported, 1, "Only benign job should be imported");
+
+        let jobs: Vec<String> = sqlx::query_scalar("SELECT id FROM cron_jobs ORDER BY id")
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(jobs, vec!["hermes:default:benign".to_string()]);
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
