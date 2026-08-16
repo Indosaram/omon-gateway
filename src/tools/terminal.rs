@@ -319,42 +319,7 @@ impl Tool for TerminalTool {
 }
 
 pub fn is_dangerous(command: &str) -> bool {
-    let normalized = command
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let words = normalized
-        .split(|character: char| character.is_whitespace() || ";|&()".contains(character))
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-
-    let has_word = |needle: &str| words.contains(&needle);
-    let privileged = normalized == "sudo"
-        || normalized.starts_with("sudo ")
-        || normalized.contains("; sudo ")
-        || normalized.contains("| sudo ")
-        || normalized.contains("&& sudo ");
-    let destructive_rm = has_word("rm")
-        && (normalized.contains("rm -rf")
-            || normalized.contains("rm -fr")
-            || normalized.contains("rm --recursive --force"));
-    let raw_device_write = normalized.contains("/dev/")
-        && (has_word("dd") || normalized.contains(" > /dev/") || normalized.contains(">/dev/"));
-    let recursive_world_writable = has_word("chmod")
-        && (normalized.contains("chmod -r 777") || normalized.contains("chmod 777 -r"));
-    let network_to_shell = (has_word("curl") || has_word("wget"))
-        && normalized.contains('|')
-        && (has_word("sh") || has_word("bash"));
-
-    destructive_rm
-        || privileged
-        || words.iter().any(|word| word.starts_with("mkfs"))
-        || raw_device_write
-        || recursive_world_writable
-        || network_to_shell
-        || normalized.contains(":(){")
-        || normalized.contains(": () {")
+    crate::security::is_dangerous(command)
 }
 
 fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str, OmonError> {
@@ -447,7 +412,7 @@ mod approval_tests {
     fn dangerous_command_classifier_is_conservative() {
         for command in [
             "rm -rf target",
-            "sudo launchctl bootout system/foo",
+            "sudo -S launchctl bootout system/foo",
             "mkfs.ext4 /dev/disk2",
             "dd if=image of=/dev/disk2",
             "chmod -R 777 .",
@@ -493,6 +458,14 @@ mod approval_tests {
         assert_eq!(approver.requests.load(Ordering::SeqCst), 0);
     }
 
+    fn dangerous_exec_args() -> serde_json::Value {
+        json!({"program": "bash", "args": ["-c", "rm -rf /tmp/test_nonexistent && echo ok"]})
+    }
+
+    fn dangerous_rm_args() -> serde_json::Value {
+        json!({"program": "rm", "args": ["-rf", "/tmp/test_nonexistent"]})
+    }
+
     #[tokio::test]
     async fn smart_approval_runs_dangerous_command_after_approval() {
         let approver = Arc::new(StubApprover {
@@ -506,7 +479,7 @@ mod approval_tests {
         );
 
         let result = tool
-            .execute_with_context(echo_args("rm -rf is only text"), Some(&session()))
+            .execute_with_context(dangerous_exec_args(), Some(&session()))
             .await
             .unwrap();
 
@@ -537,7 +510,7 @@ mod approval_tests {
             }
 
             let error = tool
-                .execute_with_context(echo_args("rm -rf is only text"), Some(&session()))
+                .execute_with_context(dangerous_rm_args(), Some(&session()))
                 .await
                 .unwrap_err();
             assert!(matches!(error, OmonError::Approval(_)));

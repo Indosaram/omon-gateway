@@ -7,6 +7,7 @@ pub mod memory;
 pub mod migrate;
 pub mod models;
 pub mod multiplexer;
+pub mod security;
 pub mod storage;
 pub mod tools;
 pub mod voice;
@@ -22,6 +23,7 @@ pub use multiplexer::{
     AgentRunner, MultiplexerConfig, OutboundDispatcher, ScaleToZero, SessionActor,
     SessionMultiplexer,
 };
+pub use security::*;
 pub use storage::Database;
 pub use tools::{
     augmented_path_from_environment, build_augmented_path, ApprovalPolicy, BrowserTool, CronTool,

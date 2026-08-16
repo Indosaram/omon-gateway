@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use omon_gateway::{
-    ChatMessage, Database, FileTool, LlmClient, LlmConfig, LlmProvider, McpClientTool,
-    McpTransport, MemoryStore, SessionKey, TerminalTool, Tool, ToolDefinition,
+    ApprovalPolicy, ChatMessage, Database, FileTool, LlmClient, LlmConfig, LlmProvider,
+    McpClientTool, McpTransport, MemoryStore, SessionKey, TerminalTool, Tool, ToolDefinition,
 };
 use serde_json::json;
 
@@ -46,7 +46,9 @@ fn builds_provider_specific_llm_payloads_and_parses_tool_calls() {
 #[tokio::test]
 async fn terminal_executes_processes_and_captures_status() {
     let root = tempfile_dir("terminal");
-    let tool = TerminalTool::new(&root).with_timeout(Duration::from_secs(2));
+    let tool = TerminalTool::new(&root)
+        .with_approval_policy(ApprovalPolicy::Never)
+        .with_timeout(Duration::from_secs(2));
     let output = tool
         .execute(
             json!({"program": "sh", "args": ["-c", "printf hello; printf warning >&2; exit 3"]}),
