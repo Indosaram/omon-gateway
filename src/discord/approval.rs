@@ -72,6 +72,7 @@ struct PendingApprovalEntry {
 pub struct SmartApprovalGuard {
     pending: Arc<Mutex<HashMap<Uuid, PendingApprovalEntry>>>,
     session_cache: Arc<RwLock<HashMap<SessionKey, HashSet<String>>>>,
+    yolo_sessions: Arc<RwLock<HashSet<SessionKey>>>,
     always_cache: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -83,6 +84,10 @@ pub trait ApprovalRequester: Send + Sync {
         command: &str,
         reason: &str,
     ) -> Result<ApprovalDecision, ApprovalError>;
+
+    async fn is_yolo(&self, _session: &SessionKey) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -112,12 +117,20 @@ impl DiscordApprovalRequester {
 
 #[async_trait]
 impl ApprovalRequester for DiscordApprovalRequester {
+    async fn is_yolo(&self, session: &SessionKey) -> bool {
+        self.guard.is_yolo(session).await
+    }
+
     async fn request_approval(
         &self,
         session: &SessionKey,
         command: &str,
         reason: &str,
     ) -> Result<ApprovalDecision, ApprovalError> {
+        if self.guard.is_yolo(session).await {
+            return Ok(ApprovalDecision::Once);
+        }
+
         let pattern_key = crate::security::derive_pattern_key(command);
         if self.guard.is_approved(session, &pattern_key).await {
             return Ok(ApprovalDecision::Session);
@@ -195,8 +208,22 @@ impl SmartApprovalGuard {
             .insert(pattern_key.to_string());
     }
 
+    pub async fn is_yolo(&self, session: &SessionKey) -> bool {
+        self.yolo_sessions.read().await.contains(session)
+    }
+
+    pub async fn set_yolo(&self, session: &SessionKey, enabled: bool) {
+        let mut yolo = self.yolo_sessions.write().await;
+        if enabled {
+            yolo.insert(session.clone());
+        } else {
+            yolo.remove(session);
+        }
+    }
+
     pub async fn clear_session(&self, session: &SessionKey) {
         self.session_cache.write().await.remove(session);
+        self.yolo_sessions.write().await.remove(session);
     }
 
     pub async fn request(&self) -> ApprovalPrompt {
@@ -462,5 +489,50 @@ mod tests {
 
         // Subsequent resolve fails
         assert!(!guard.resolve_session_deny(&session, None).await);
+    }
+
+    #[tokio::test]
+    async fn test_yolo_toggle_and_auto_approval() {
+        let guard = SmartApprovalGuard::new();
+        let requester = DiscordApprovalRequester::new(guard.clone(), Duration::from_millis(50));
+        requester.set_dispatcher(Arc::new(MockDispatcher)).await;
+
+        let session_a =
+            SessionKey::new("discord", None::<String>, "chan1", None::<String>, "user1");
+        let session_b =
+            SessionKey::new("discord", None::<String>, "chan2", None::<String>, "user2");
+
+        assert!(!guard.is_yolo(&session_a).await);
+        assert!(!guard.is_yolo(&session_b).await);
+        assert!(!requester.is_yolo(&session_a).await);
+
+        guard.set_yolo(&session_a, true).await;
+        assert!(guard.is_yolo(&session_a).await);
+        assert!(requester.is_yolo(&session_a).await);
+        assert!(!guard.is_yolo(&session_b).await);
+
+        // Session A auto-approves via request_approval
+        let decision = requester
+            .request_approval(&session_a, "rm -rf /tmp/scratch", "recursive delete")
+            .await
+            .unwrap();
+        assert!(decision.is_approved());
+
+        // Session B still times out
+        let err = requester
+            .request_approval(&session_b, "rm -rf /tmp/scratch", "recursive delete")
+            .await
+            .unwrap_err();
+        assert_eq!(err, ApprovalError::Timeout);
+
+        // Disable YOLO
+        guard.set_yolo(&session_a, false).await;
+        assert!(!guard.is_yolo(&session_a).await);
+
+        // Clear session clears YOLO
+        guard.set_yolo(&session_a, true).await;
+        assert!(guard.is_yolo(&session_a).await);
+        guard.clear_session(&session_a).await;
+        assert!(!guard.is_yolo(&session_a).await);
     }
 }

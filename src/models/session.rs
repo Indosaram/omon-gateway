@@ -86,6 +86,8 @@ pub struct SessionState {
     #[serde(default)]
     pub enabled_toolsets: Option<Vec<String>>,
     #[serde(default)]
+    pub yolo: bool,
+    #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
 }
 

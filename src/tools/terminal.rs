@@ -168,6 +168,9 @@ impl TerminalTool {
                 "command requires interactive approval, but no approval guard is configured".into(),
             )
         })?;
+        if requester.is_yolo(session).await {
+            return Ok(());
+        }
         let decision = tokio::time::timeout(
             self.approval_timeout,
             requester.request_approval(session, command, &reason),
@@ -392,6 +395,22 @@ mod approval_tests {
     struct StubApprover {
         requests: AtomicUsize,
         result: Result<ApprovalDecision, ApprovalError>,
+        yolo: bool,
+    }
+
+    impl StubApprover {
+        fn new(result: Result<ApprovalDecision, ApprovalError>) -> Self {
+            Self {
+                requests: AtomicUsize::new(0),
+                result,
+                yolo: false,
+            }
+        }
+
+        fn with_yolo(mut self, yolo: bool) -> Self {
+            self.yolo = yolo;
+            self
+        }
     }
 
     #[async_trait]
@@ -404,6 +423,10 @@ mod approval_tests {
         ) -> Result<ApprovalDecision, ApprovalError> {
             self.requests.fetch_add(1, Ordering::SeqCst);
             self.result.clone()
+        }
+
+        async fn is_yolo(&self, _session: &SessionKey) -> bool {
+            self.yolo
         }
     }
 
@@ -462,10 +485,7 @@ mod approval_tests {
 
     #[tokio::test]
     async fn hardline_commands_are_rejected_even_under_never_policy() {
-        let approver = Arc::new(StubApprover {
-            requests: AtomicUsize::new(0),
-            result: Ok(ApprovalDecision::Once),
-        });
+        let approver = Arc::new(StubApprover::new(Ok(ApprovalDecision::Once)));
         let tool = TerminalTool::new(std::env::temp_dir()).with_approval(
             ApprovalPolicy::Never,
             approver.clone(),
@@ -494,10 +514,7 @@ mod approval_tests {
 
     #[tokio::test]
     async fn smart_approval_runs_dangerous_command_after_approval() {
-        let approver = Arc::new(StubApprover {
-            requests: AtomicUsize::new(0),
-            result: Ok(ApprovalDecision::Once),
-        });
+        let approver = Arc::new(StubApprover::new(Ok(ApprovalDecision::Once)));
         let tool = TerminalTool::new(std::env::temp_dir()).with_approval(
             ApprovalPolicy::Smart,
             approver.clone(),
@@ -525,10 +542,7 @@ mod approval_tests {
             if let Some(result) = approval {
                 tool = tool.with_approval(
                     ApprovalPolicy::Smart,
-                    Arc::new(StubApprover {
-                        requests: AtomicUsize::new(0),
-                        result,
-                    }),
+                    Arc::new(StubApprover::new(result)),
                     Duration::from_millis(1),
                 );
             } else {
@@ -545,10 +559,9 @@ mod approval_tests {
 
     #[tokio::test]
     async fn benign_command_runs_without_request_under_smart_policy() {
-        let approver = Arc::new(StubApprover {
-            requests: AtomicUsize::new(0),
-            result: Ok(ApprovalDecision::Deny { reason: None }),
-        });
+        let approver = Arc::new(StubApprover::new(Ok(ApprovalDecision::Deny {
+            reason: None,
+        })));
         let tool = TerminalTool::new(std::env::temp_dir()).with_approval(
             ApprovalPolicy::Smart,
             approver.clone(),
@@ -605,12 +618,9 @@ mod approval_tests {
 
     #[tokio::test]
     async fn test_denial_reason_surfaced_in_terminal_error() {
-        let approver = Arc::new(StubApprover {
-            requests: AtomicUsize::new(0),
-            result: Ok(ApprovalDecision::Deny {
-                reason: Some("please run inside docker instead".to_string()),
-            }),
-        });
+        let approver = Arc::new(StubApprover::new(Ok(ApprovalDecision::Deny {
+            reason: Some("please run inside docker instead".to_string()),
+        })));
         let tool = TerminalTool::new(std::env::temp_dir()).with_approval(
             ApprovalPolicy::Smart,
             approver,
@@ -626,5 +636,47 @@ mod approval_tests {
             error,
             OmonError::Approval(msg) if msg == "command denied by user: please run inside docker instead"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_yolo_bypasses_dangerous_prompt() {
+        let approver = Arc::new(
+            StubApprover::new(Ok(ApprovalDecision::Deny { reason: None })).with_yolo(true),
+        );
+        let tool = TerminalTool::new(std::env::temp_dir()).with_approval(
+            ApprovalPolicy::Smart,
+            approver.clone(),
+            Duration::from_secs(1),
+        );
+
+        let result = tool
+            .execute_with_context(dangerous_exec_args(), Some(&session()))
+            .await
+            .unwrap();
+
+        assert!(result["success"].as_bool().unwrap());
+        // Bypassed without invoking interactive requester
+        assert_eq!(approver.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_hardline_rejected_even_under_yolo() {
+        let approver = Arc::new(StubApprover::new(Ok(ApprovalDecision::Once)).with_yolo(true));
+        let tool = TerminalTool::new(std::env::temp_dir()).with_approval(
+            ApprovalPolicy::Smart,
+            approver.clone(),
+            Duration::from_secs(1),
+        );
+
+        let error = tool
+            .execute_with_context(
+                json!({"program": "rm", "args": ["-rf", "/"]}),
+                Some(&session()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OmonError::Approval(msg) if msg.contains("BLOCKED (hardline)")));
+        assert_eq!(approver.requests.load(Ordering::SeqCst), 0);
     }
 }

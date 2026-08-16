@@ -127,6 +127,7 @@ pub fn all() -> Vec<poise::Command<PoiseData, CommandError>> {
         title(),
         thread(),
         deny(),
+        yolo(),
     ]
 }
 
@@ -793,6 +794,58 @@ pub async fn deny(
     Ok(())
 }
 
+#[poise::command(slash_command)]
+/// Toggle YOLO mode (approval bypass) for this session.
+pub async fn yolo(
+    ctx: PoiseContext<'_>,
+    #[description = "Enable or disable YOLO mode (on/off)"] mode: Option<String>,
+) -> Result<(), CommandError> {
+    let key = session_key(ctx).await?;
+    ensure_session(&ctx.data().pool, &key).await?;
+    let state_json: String =
+        sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
+            .bind(key.storage_key())
+            .fetch_one(&ctx.data().pool)
+            .await?;
+    let mut state: crate::SessionState = serde_json::from_str(&state_json).unwrap_or_default();
+    let new_yolo = match mode
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("on" | "enable" | "true" | "yes" | "1") => true,
+        Some("off" | "disable" | "false" | "no" | "0") => false,
+        _ => !state.yolo,
+    };
+    state.yolo = new_yolo;
+    sqlx::query(
+        "UPDATE sessions SET state_json = ?, updated_at = CURRENT_TIMESTAMP WHERE session_key = ?",
+    )
+    .bind(serde_json::to_string(&state)?)
+    .bind(key.storage_key())
+    .execute(&ctx.data().pool)
+    .await?;
+
+    ctx.data().approvals.set_yolo(&key, new_yolo).await;
+
+    let status_str = if new_yolo { "enabled" } else { "disabled" };
+    let note = if new_yolo {
+        "\n⚠️ Unconditional hardline and deny rules are still enforced."
+    } else {
+        ""
+    };
+    ctx.send(
+        poise::CreateReply::default()
+            .content(format!(
+                "⚡ YOLO mode **{status_str}** for this session.{note}"
+            ))
+            .ephemeral(true),
+    )
+    .await?;
+    Ok(())
+}
+
 pub fn format_steer_prompt(text: &str) -> String {
     format!("[Steering] {}", text.trim())
 }
@@ -901,11 +954,11 @@ mod tests {
     #[test]
     fn test_all_commands_count() {
         let commands = all();
-        assert_eq!(commands.len(), 14);
+        assert_eq!(commands.len(), 15);
         let names: HashSet<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         for expected in &[
             "model", "reset", "stop", "status", "tools", "skill", "cron", "steer", "undo", "retry",
-            "compress", "title", "thread", "deny",
+            "compress", "title", "thread", "deny", "yolo",
         ] {
             assert!(names.contains(expected), "missing command {expected}");
         }
