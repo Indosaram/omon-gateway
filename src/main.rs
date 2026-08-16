@@ -370,6 +370,8 @@ struct Config {
     allowed_channels: Vec<u64>,
     ignored_channels: Vec<u64>,
     auto_thread: bool,
+    channel_context: bool,
+    channel_context_limit: usize,
     approval_policy: ApprovalPolicy,
     approval_timeout_secs: u64,
 }
@@ -462,6 +464,14 @@ impl Config {
             allowed_channels,
             ignored_channels,
             auto_thread: parse_bool_from(optional_env("DISCORD_AUTO_THREAD").as_deref(), false),
+            channel_context: parse_bool_from(
+                optional_env("DISCORD_CHANNEL_CONTEXT").as_deref(),
+                false,
+            ),
+            channel_context_limit: optional_env("DISCORD_CHANNEL_CONTEXT_LIMIT")
+                .and_then(|val| val.trim().parse::<usize>().ok())
+                .unwrap_or(omon_gateway::DEFAULT_CHANNEL_CONTEXT_LIMIT)
+                .min(omon_gateway::MAX_CHANNEL_CONTEXT_LIMIT),
             approval_policy: ApprovalPolicy::parse(optional_env("APPROVAL_MODE").as_deref()),
             approval_timeout_secs: approval_timeout_secs_from(
                 optional_env("APPROVAL_TIMEOUT_SECS").as_deref(),
@@ -1659,6 +1669,8 @@ async fn run_gateway() -> Result<()> {
     poise_data.allowed_channels = config.allowed_channels.clone();
     poise_data.ignored_channels = config.ignored_channels.clone();
     poise_data.auto_thread = config.auto_thread;
+    poise_data.channel_context = config.channel_context;
+    poise_data.channel_context_limit = config.channel_context_limit;
     poise_data.attachment_downloader = Some(AttachmentDownloader::new(&config.workspace_root)?);
     poise_data.primary_bot_id = Some(default_bot_id.parse().map_err(|_| {
         OmonError::Config(format!(

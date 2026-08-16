@@ -31,6 +31,8 @@ pub struct PoiseData {
     /// Kept in-memory: fast, zero-overhead, sufficient for active gateway runtime lifecycle.
     pub active_threads: Arc<RwLock<HashSet<u64>>>,
     pub auto_thread: bool,
+    pub channel_context: bool,
+    pub channel_context_limit: usize,
     pub primary_bot_id: Option<u64>,
     pub attachment_downloader: Option<AttachmentDownloader>,
     pub tool_registry: crate::ToolRegistry,
@@ -62,6 +64,8 @@ impl PoiseData {
             ignored_channels: Vec::new(),
             active_threads: Arc::new(RwLock::new(HashSet::new())),
             auto_thread: false,
+            channel_context: false,
+            channel_context_limit: 10,
             primary_bot_id: None,
             attachment_downloader: None,
             tool_registry: crate::ToolRegistry::new(),

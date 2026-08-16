@@ -1295,3 +1295,32 @@ async fn coalesces_split_messages_and_unions_attachments() {
     assert_eq!(coalesced.attachments[0].id, "att-1");
     assert_eq!(coalesced.attachments[1].id, "att-2");
 }
+
+#[test]
+fn test_format_channel_context_ordering_and_truncation() {
+    let history = vec![
+        ("alice", "first message from earlier"),
+        ("bob", "second message asking for info"),
+        ("charlie", "third message with more details"),
+    ];
+
+    let formatted = omon_gateway::format_channel_context(&history);
+    let expected = "[Recent channel context]\nalice: first message from earlier\nbob: second message asking for info\ncharlie: third message with more details";
+    assert_eq!(formatted, expected);
+}
+
+#[test]
+fn test_format_channel_context_empty_and_skip_empty_lines() {
+    let empty: Vec<(&str, &str)> = Vec::new();
+    assert_eq!(omon_gateway::format_channel_context(&empty), "");
+
+    let with_blanks = vec![
+        ("alice", "   \n\t  "),
+        ("", "message with no author"),
+        ("bob", "valid message"),
+    ];
+    assert_eq!(
+        omon_gateway::format_channel_context(&with_blanks),
+        "[Recent channel context]\nbob: valid message"
+    );
+}

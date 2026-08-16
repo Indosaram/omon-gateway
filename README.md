@@ -215,6 +215,8 @@ launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 | `DISCORD_FREE_RESPONSE_CHANNELS` | Optional | Channels where the bot responds without @mention |
 | `DISCORD_AUTO_THREAD` | `false` | When true, @mentions in guild text channels auto-create a public thread and route responses there |
 | `DISCORD_THREAD_SESSIONS_PER_USER` | `true` | When false, all users in a thread share the same conversation session |
+| `DISCORD_CHANNEL_CONTEXT` | `false` | When true, @mentions in guild channels backfill recent channel history as conversation context |
+| `DISCORD_CHANNEL_CONTEXT_LIMIT` | `10` | Maximum preceding messages to backfill when channel context is enabled (clamped to <= 25) |
 | `DEFAULT_MODEL` | `gpt-4o` | Default LLM model identifier |
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | OpenAI-compatible endpoint URL |
 | `OPENAI_API_KEY` | Optional | OpenAI API key |

@@ -7,7 +7,7 @@ use poise::serenity_prelude as serenity;
 use serenity::all::{
     ChannelId, ChannelType, CreateAllowedMentions, CreateAttachment, CreateInteractionResponse,
     CreateInteractionResponseMessage, CreateMessage, CreateThread, EditMessage, FullEvent,
-    GatewayIntents, HttpBuilder, Interaction, Message, MessageId, Typing,
+    GatewayIntents, GetMessages, HttpBuilder, Interaction, Message, MessageId, Typing,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -35,6 +35,44 @@ pub fn safe_allowed_mentions() -> CreateAllowedMentions {
 
 /// Maximum character length for hydrated referenced message context.
 pub const REFERENCED_CONTENT_CAP: usize = 500;
+
+pub const DEFAULT_CHANNEL_CONTEXT_LIMIT: usize = 10;
+pub const MAX_CHANNEL_CONTEXT_LIMIT: usize = 25;
+pub const MAX_CONTEXT_LINE_CHARS: usize = 200;
+
+/// Formats a list of recent channel messages into a compact conversational context block.
+pub fn format_channel_context<A: AsRef<str>, C: AsRef<str>>(messages: &[(A, C)]) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    for (author, content) in messages {
+        let author = author.as_ref().trim();
+        let collapsed: String = content
+            .as_ref()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let trimmed = collapsed.trim();
+        if author.is_empty() || trimmed.is_empty() {
+            continue;
+        }
+        let truncated = if trimmed.chars().count() > MAX_CONTEXT_LINE_CHARS {
+            let prefix: String = trimmed
+                .chars()
+                .take(MAX_CONTEXT_LINE_CHARS.saturating_sub(3))
+                .collect();
+            format!("{prefix}...")
+        } else {
+            trimmed.to_string()
+        };
+        lines.push(format!("{author}: {truncated}"));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("[Recent channel context]\n{}", lines.join("\n"))
+}
 
 /// Derives a clean thread name from a user message when auto-threading on mention.
 pub fn derive_auto_thread_name(content: &str, bot_user_id: serenity::UserId) -> String {
@@ -416,6 +454,43 @@ async fn handle_event(
             if let Some(mut event) =
                 message_to_inbound_with_config(new_message, bot_user_id, channel_type, &config)
             {
+                let is_dm = channel_type == Some(ChannelType::Private);
+                if data.channel_context
+                    && !is_dm
+                    && is_explicit_mention
+                    && data.channel_context_limit > 0
+                {
+                    let limit = data.channel_context_limit.min(MAX_CHANNEL_CONTEXT_LIMIT) as u8;
+                    let builder = GetMessages::new().before(new_message.id).limit(limit);
+                    match new_message.channel_id.messages(&ctx.http, builder).await {
+                        Ok(mut messages) => {
+                            messages.reverse();
+                            let history: Vec<(String, String)> = messages
+                                .into_iter()
+                                .filter(|m| {
+                                    m.author.id != bot_user_id && !m.content.trim().is_empty()
+                                })
+                                .map(|m| (m.author.name, m.content))
+                                .collect();
+                            let context_block = format_channel_context(&history);
+                            if !context_block.is_empty() {
+                                if event.content.trim().is_empty() {
+                                    event.content = context_block;
+                                } else {
+                                    event.content = format!("{context_block}\n\n{}", event.content);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                channel = %new_message.channel_id,
+                                "Failed to fetch recent channel context"
+                            );
+                        }
+                    }
+                }
+
                 if channel_type.is_some_and(is_thread) {
                     data.mark_thread_active(new_message.channel_id.get());
                 } else if data.auto_thread && is_guild_text && is_explicit_mention {
@@ -1198,5 +1273,50 @@ mod tests {
     fn compose_reply_context_empty_referenced_content() {
         let result = compose_reply_context("dave", "", "my response");
         assert_eq!(result, "> [Replying to @dave]\n\nmy response");
+    }
+
+    #[test]
+    fn test_format_channel_context_standard() {
+        let history = vec![
+            ("alice", "What's the weather today?"),
+            ("bob", "Looks like rain in Seattle."),
+        ];
+        let formatted = format_channel_context(&history);
+        assert_eq!(
+            formatted,
+            "[Recent channel context]\nalice: What's the weather today?\nbob: Looks like rain in Seattle."
+        );
+    }
+
+    #[test]
+    fn test_format_channel_context_empty_and_whitespace() {
+        let history: Vec<(&str, &str)> = vec![];
+        assert_eq!(format_channel_context(&history), "");
+
+        let history = vec![("alice", "   "), ("", "hello"), ("bob", "actual message")];
+        assert_eq!(
+            format_channel_context(&history),
+            "[Recent channel context]\nbob: actual message"
+        );
+    }
+
+    #[test]
+    fn test_format_channel_context_line_truncation() {
+        let long_line = "a".repeat(300);
+        let history = vec![("charlie", long_line.as_str())];
+        let formatted = format_channel_context(&history);
+        let expected = format!("[Recent channel context]\ncharlie: {}...", "a".repeat(197));
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn test_format_channel_context_collapses_multiline() {
+        let multiline = "line 1\nline 2\n    line 3";
+        let history = vec![("alice", multiline)];
+        let formatted = format_channel_context(&history);
+        assert_eq!(
+            formatted,
+            "[Recent channel context]\nalice: line 1 line 2 line 3"
+        );
     }
 }
