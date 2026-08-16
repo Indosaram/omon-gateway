@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serenity::all::{ButtonStyle, CreateActionRow, CreateButton};
 use thiserror::Error;
 use tokio::sync::{oneshot, Mutex, RwLock};
@@ -10,10 +11,21 @@ use uuid::Uuid;
 
 use crate::{OutboundAction, OutboundDispatcher, SessionKey};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
-    Approved,
-    Rejected,
+    #[serde(alias = "approved")]
+    Once,
+    Session,
+    Always,
+    #[serde(alias = "rejected")]
+    Deny,
+}
+
+impl ApprovalDecision {
+    pub fn is_approved(&self) -> bool {
+        matches!(self, Self::Once | Self::Session | Self::Always)
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -41,11 +53,13 @@ impl ApprovalPrompt {
     }
 }
 
-/// Tracks pending approval requests and resolves Discord button interactions
-/// through a one-shot channel. Custom IDs contain an unguessable request UUID.
+/// Tracks pending approval requests, resolves Discord button interactions
+/// through a one-shot channel, and maintains per-session and global approval caches.
 #[derive(Clone, Default)]
 pub struct SmartApprovalGuard {
     pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<ApprovalDecision>>>>,
+    session_cache: Arc<RwLock<HashMap<SessionKey, HashSet<String>>>>,
+    always_cache: Arc<RwLock<HashSet<String>>>,
 }
 
 #[async_trait]
@@ -76,6 +90,10 @@ impl DiscordApprovalRequester {
     pub async fn set_dispatcher(&self, dispatcher: Arc<dyn OutboundDispatcher>) {
         *self.dispatcher.write().await = Some(dispatcher);
     }
+
+    pub fn guard(&self) -> &SmartApprovalGuard {
+        &self.guard
+    }
 }
 
 #[async_trait]
@@ -85,6 +103,11 @@ impl ApprovalRequester for DiscordApprovalRequester {
         session: &SessionKey,
         command: &str,
     ) -> Result<ApprovalDecision, ApprovalError> {
+        let pattern_key = crate::security::derive_pattern_key(command);
+        if self.guard.is_approved(session, &pattern_key).await {
+            return Ok(ApprovalDecision::Session);
+        }
+
         let dispatcher = self
             .dispatcher
             .read()
@@ -106,7 +129,17 @@ impl ApprovalRequester for DiscordApprovalRequester {
             return Err(ApprovalError::Cancelled);
         }
         let result = prompt.wait(self.timeout).await;
-        if result.is_err() {
+        if let Ok(decision) = &result {
+            match decision {
+                ApprovalDecision::Session => {
+                    self.guard.approve_session(session, &pattern_key).await;
+                }
+                ApprovalDecision::Always => {
+                    self.guard.approve_always(&pattern_key).await;
+                }
+                _ => {}
+            }
+        } else {
             self.guard.cancel(request_id).await;
         }
         result
@@ -116,6 +149,35 @@ impl ApprovalRequester for DiscordApprovalRequester {
 impl SmartApprovalGuard {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub async fn is_approved(&self, session: &SessionKey, pattern_key: &str) -> bool {
+        if self.always_cache.read().await.contains(pattern_key) {
+            return true;
+        }
+        if let Some(session_patterns) = self.session_cache.read().await.get(session) {
+            return session_patterns.contains(pattern_key);
+        }
+        false
+    }
+
+    pub async fn approve_session(&self, session: &SessionKey, pattern_key: &str) {
+        let mut cache = self.session_cache.write().await;
+        cache
+            .entry(session.clone())
+            .or_default()
+            .insert(pattern_key.to_string());
+    }
+
+    pub async fn approve_always(&self, pattern_key: &str) {
+        self.always_cache
+            .write()
+            .await
+            .insert(pattern_key.to_string());
+    }
+
+    pub async fn clear_session(&self, session: &SessionKey) {
+        self.session_cache.write().await.remove(session);
     }
 
     pub async fn request(&self) -> ApprovalPrompt {
@@ -150,11 +212,17 @@ impl SmartApprovalGuard {
 
 pub fn approval_buttons(request_id: Uuid) -> Vec<CreateActionRow> {
     vec![CreateActionRow::Buttons(vec![
-        CreateButton::new(format!("omon:approval:{request_id}:approve"))
-            .label("Approve")
+        CreateButton::new(format!("omon:approval:{request_id}:once"))
+            .label("Allow Once")
+            .style(ButtonStyle::Primary),
+        CreateButton::new(format!("omon:approval:{request_id}:session"))
+            .label("Allow Session")
             .style(ButtonStyle::Success),
-        CreateButton::new(format!("omon:approval:{request_id}:reject"))
-            .label("Reject")
+        CreateButton::new(format!("omon:approval:{request_id}:always"))
+            .label("Always Allow")
+            .style(ButtonStyle::Success),
+        CreateButton::new(format!("omon:approval:{request_id}:deny"))
+            .label("Deny")
             .style(ButtonStyle::Danger),
     ])]
 }
@@ -163,15 +231,17 @@ pub fn is_approval_custom_id(custom_id: &str) -> bool {
     parse_custom_id(custom_id).is_some()
 }
 
-fn parse_custom_id(custom_id: &str) -> Option<(Uuid, ApprovalDecision)> {
+pub fn parse_custom_id(custom_id: &str) -> Option<(Uuid, ApprovalDecision)> {
     let mut parts = custom_id.split(':');
     if parts.next()? != "omon" || parts.next()? != "approval" {
         return None;
     }
     let request_id = Uuid::parse_str(parts.next()?).ok()?;
     let decision = match parts.next()? {
-        "approve" => ApprovalDecision::Approved,
-        "reject" => ApprovalDecision::Rejected,
+        "once" | "approve" => ApprovalDecision::Once,
+        "session" => ApprovalDecision::Session,
+        "always" => ApprovalDecision::Always,
+        "deny" | "reject" => ApprovalDecision::Deny,
         _ => return None,
     };
     if parts.next().is_some() {
@@ -187,26 +257,122 @@ mod tests {
     #[test]
     fn test_is_approval_custom_id() {
         let id = Uuid::new_v4();
+        assert!(is_approval_custom_id(&format!("omon:approval:{id}:once")));
+        assert!(is_approval_custom_id(&format!(
+            "omon:approval:{id}:session"
+        )));
+        assert!(is_approval_custom_id(&format!("omon:approval:{id}:always")));
+        assert!(is_approval_custom_id(&format!("omon:approval:{id}:deny")));
         assert!(is_approval_custom_id(&format!(
             "omon:approval:{id}:approve"
         )));
         assert!(is_approval_custom_id(&format!("omon:approval:{id}:reject")));
         assert!(!is_approval_custom_id("other:custom:id"));
-        assert!(!is_approval_custom_id("omon:approval:not-a-uuid:approve"));
+        assert!(!is_approval_custom_id("omon:approval:not-a-uuid:once"));
         assert!(!is_approval_custom_id("omon:approval:"));
         assert!(!is_approval_custom_id(&format!(
             "omon:approval:{id}:unknown"
         )));
         assert!(!is_approval_custom_id(&format!(
-            "omon:approval:{id}:approve:extra"
+            "omon:approval:{id}:once:extra"
         )));
+    }
+
+    #[test]
+    fn test_parse_custom_id_round_trip() {
+        let id = Uuid::new_v4();
+        assert_eq!(
+            parse_custom_id(&format!("omon:approval:{id}:once")),
+            Some((id, ApprovalDecision::Once))
+        );
+        assert_eq!(
+            parse_custom_id(&format!("omon:approval:{id}:session")),
+            Some((id, ApprovalDecision::Session))
+        );
+        assert_eq!(
+            parse_custom_id(&format!("omon:approval:{id}:always")),
+            Some((id, ApprovalDecision::Always))
+        );
+        assert_eq!(
+            parse_custom_id(&format!("omon:approval:{id}:deny")),
+            Some((id, ApprovalDecision::Deny))
+        );
+        assert_eq!(
+            parse_custom_id(&format!("omon:approval:{id}:approve")),
+            Some((id, ApprovalDecision::Once))
+        );
+        assert_eq!(
+            parse_custom_id(&format!("omon:approval:{id}:reject")),
+            Some((id, ApprovalDecision::Deny))
+        );
     }
 
     #[tokio::test]
     async fn test_resolve_custom_id_unknown_uuid() {
         let guard = SmartApprovalGuard::new();
         let unknown_id = Uuid::new_v4();
-        let custom_id = format!("omon:approval:{unknown_id}:approve");
+        let custom_id = format!("omon:approval:{unknown_id}:once");
         assert!(!guard.resolve_custom_id(&custom_id).await);
+    }
+
+    struct MockDispatcher;
+
+    #[async_trait]
+    impl OutboundDispatcher for MockDispatcher {
+        async fn dispatch(&self, _action: OutboundAction) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_approval_cache_suppresses_repeat_prompts() {
+        let guard = SmartApprovalGuard::new();
+        let requester = DiscordApprovalRequester::new(guard.clone(), Duration::from_millis(50));
+        requester.set_dispatcher(Arc::new(MockDispatcher)).await;
+
+        let session_a =
+            SessionKey::new("discord", None::<String>, "chan1", None::<String>, "user1");
+        let session_b =
+            SessionKey::new("discord", None::<String>, "chan2", None::<String>, "user2");
+
+        let cmd = "rm -rf /tmp/build";
+        let pattern = crate::security::derive_pattern_key(cmd);
+        assert!(!guard.is_approved(&session_a, &pattern).await);
+        assert!(!guard.is_approved(&session_b, &pattern).await);
+
+        // Approve session A
+        guard.approve_session(&session_a, &pattern).await;
+
+        assert!(guard.is_approved(&session_a, &pattern).await);
+        assert!(!guard.is_approved(&session_b, &pattern).await);
+
+        // requester immediately auto-approves session A without prompting
+        let decision = requester.request_approval(&session_a, cmd).await.unwrap();
+        assert_eq!(decision, ApprovalDecision::Session);
+
+        // session B is not cached and times out
+        let err = requester
+            .request_approval(&session_b, cmd)
+            .await
+            .unwrap_err();
+        assert_eq!(err, ApprovalError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_always_approval_cache_applies_globally() {
+        let guard = SmartApprovalGuard::new();
+        let session_a =
+            SessionKey::new("discord", None::<String>, "chan1", None::<String>, "user1");
+        let session_b =
+            SessionKey::new("discord", None::<String>, "chan2", None::<String>, "user2");
+
+        let pattern = "disk copy";
+        assert!(!guard.is_approved(&session_a, pattern).await);
+        assert!(!guard.is_approved(&session_b, pattern).await);
+
+        guard.approve_always(pattern).await;
+
+        assert!(guard.is_approved(&session_a, pattern).await);
+        assert!(guard.is_approved(&session_b, pattern).await);
     }
 }

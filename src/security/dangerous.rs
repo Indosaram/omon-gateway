@@ -365,3 +365,16 @@ pub fn detect_dangerous_command(command: &str) -> Option<DangerousFinding> {
 pub fn is_dangerous(command: &str) -> bool {
     detect_dangerous_command(command).is_some()
 }
+
+pub fn derive_pattern_key(command: &str) -> String {
+    if let Some(finding) = detect_dangerous_command(command) {
+        return finding.pattern_key;
+    }
+    let normalized = normalize_command_for_detection(command);
+    let parts: Vec<&str> = normalized.split_whitespace().take(3).collect();
+    if parts.is_empty() {
+        "command".to_string()
+    } else {
+        parts.join(" ")
+    }
+}

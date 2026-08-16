@@ -167,8 +167,8 @@ impl TerminalTool {
         .map_err(|_| OmonError::Approval("approval request timed out".into()))?
         .map_err(|error| OmonError::Approval(error.to_string()))?;
         match decision {
-            ApprovalDecision::Approved => Ok(()),
-            ApprovalDecision::Rejected => Err(OmonError::Approval(
+            ApprovalDecision::Once | ApprovalDecision::Session | ApprovalDecision::Always => Ok(()),
+            ApprovalDecision::Deny => Err(OmonError::Approval(
                 "command was rejected by the user".into(),
             )),
         }
@@ -447,7 +447,7 @@ mod approval_tests {
     async fn hardline_commands_are_rejected_even_under_never_policy() {
         let approver = Arc::new(StubApprover {
             requests: AtomicUsize::new(0),
-            result: Ok(ApprovalDecision::Approved),
+            result: Ok(ApprovalDecision::Once),
         });
         let tool = TerminalTool::new(std::env::temp_dir()).with_approval(
             ApprovalPolicy::Never,
@@ -479,7 +479,7 @@ mod approval_tests {
     async fn smart_approval_runs_dangerous_command_after_approval() {
         let approver = Arc::new(StubApprover {
             requests: AtomicUsize::new(0),
-            result: Ok(ApprovalDecision::Approved),
+            result: Ok(ApprovalDecision::Once),
         });
         let tool = TerminalTool::new(std::env::temp_dir()).with_approval(
             ApprovalPolicy::Smart,
@@ -499,7 +499,7 @@ mod approval_tests {
     #[tokio::test]
     async fn smart_approval_refuses_rejection_timeout_and_missing_guard() {
         for approval in [
-            Some(Ok(ApprovalDecision::Rejected)),
+            Some(Ok(ApprovalDecision::Deny)),
             Some(Err(ApprovalError::Cancelled)),
             Some(Err(ApprovalError::Timeout)),
             None,
@@ -530,7 +530,7 @@ mod approval_tests {
     async fn benign_command_runs_without_request_under_smart_policy() {
         let approver = Arc::new(StubApprover {
             requests: AtomicUsize::new(0),
-            result: Ok(ApprovalDecision::Rejected),
+            result: Ok(ApprovalDecision::Deny),
         });
         let tool = TerminalTool::new(std::env::temp_dir()).with_approval(
             ApprovalPolicy::Smart,

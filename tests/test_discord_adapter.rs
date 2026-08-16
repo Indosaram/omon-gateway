@@ -214,7 +214,7 @@ async fn approval_guard_resolves_both_buttons_and_times_out() {
     );
     assert_eq!(
         approved.wait(Duration::from_secs(60)).await,
-        Ok(ApprovalDecision::Approved)
+        Ok(ApprovalDecision::Once)
     );
 
     let rejected = guard.request().await;
@@ -226,7 +226,7 @@ async fn approval_guard_resolves_both_buttons_and_times_out() {
     );
     assert_eq!(
         rejected.wait(Duration::from_secs(60)).await,
-        Ok(ApprovalDecision::Rejected)
+        Ok(ApprovalDecision::Deny)
     );
 
     let pending = guard.request().await;
