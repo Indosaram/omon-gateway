@@ -21,7 +21,7 @@ pub use approval::{
     ApprovalPrompt, ApprovalRequester, DiscordApprovalRequester, SmartApprovalGuard,
 };
 pub use attachments::{
-    is_text_attachment, AttachmentDownloader, DISCORD_ATTACHMENT_MAX_BYTES,
+    is_text_attachment, is_voice_attachment, AttachmentDownloader, DISCORD_ATTACHMENT_MAX_BYTES,
     DISCORD_ATTACHMENT_TIMEOUT, MAX_INLINED_ATTACHMENT_BYTES,
 };
 pub use commands::{is_user_authorized, GatewayStats, PoiseContext, PoiseData};

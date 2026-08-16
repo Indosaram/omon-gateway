@@ -1,16 +1,58 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+use crate::voice::SpeechToText;
 use crate::{MessageAttachment, OmonError, Result};
 
 pub const DISCORD_ATTACHMENT_MAX_BYTES: u64 = 25 * 1024 * 1024;
 pub const DISCORD_ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_INLINED_ATTACHMENT_BYTES: u64 = 100 * 1024;
 const ATTACHMENT_DIR: &str = ".discord-attachments";
+
+/// Determines whether an inbound attachment represents a Discord voice note.
+pub fn is_voice_attachment(
+    filename: &str,
+    content_type: Option<&str>,
+    waveform_present: bool,
+    is_voice_flag: bool,
+) -> bool {
+    if is_voice_flag || waveform_present {
+        return true;
+    }
+    if let Some(ct) = content_type {
+        let ct_lower = ct.to_ascii_lowercase();
+        let mime = ct_lower.split(';').next().unwrap_or("").trim();
+        if mime == "audio/ogg"
+            || mime == "audio/opus"
+            || mime == "audio/wav"
+            || mime == "audio/x-wav"
+            || mime == "audio/mpeg"
+            || mime == "audio/mp4"
+            || mime == "audio/aac"
+            || mime.starts_with("audio/")
+        {
+            let fn_lower = filename.to_ascii_lowercase();
+            if fn_lower.contains("voice-message")
+                || fn_lower.contains("voice_message")
+                || fn_lower.ends_with(".ogg")
+                || fn_lower.ends_with(".opus")
+                || fn_lower.ends_with(".wav")
+            {
+                return true;
+            }
+        }
+    }
+    let lower = filename.to_ascii_lowercase();
+    lower.contains("voice-message")
+        || lower.contains("voice_message")
+        || lower.ends_with(".ogg")
+        || lower.ends_with(".opus")
+}
 
 /// Determines whether an inbound attachment is a text or code document
 /// that should have its content inlined directly into the prompt context.
@@ -83,6 +125,7 @@ pub struct AttachmentDownloader {
     workspace_root: PathBuf,
     attachment_root: PathBuf,
     http: reqwest::Client,
+    stt: Option<Arc<dyn SpeechToText>>,
 }
 
 impl AttachmentDownloader {
@@ -132,7 +175,13 @@ impl AttachmentDownloader {
             workspace_root,
             attachment_root,
             http,
+            stt: None,
         })
+    }
+
+    pub fn with_stt(mut self, stt: Arc<dyn SpeechToText>) -> Self {
+        self.stt = Some(stt);
+        self
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -146,6 +195,43 @@ impl AttachmentDownloader {
     pub async fn hydrate(&self, attachment: &mut MessageAttachment) -> Result<()> {
         let path = self.download(attachment).await?;
         attachment.local_path = Some(path.clone());
+
+        if is_voice_attachment(
+            &attachment.filename,
+            attachment.content_type.as_deref(),
+            false,
+            false,
+        ) {
+            if let Some(stt) = &self.stt {
+                if let Ok(bytes) = tokio::fs::read(&path).await {
+                    let frame = crate::voice::AudioFrame {
+                        channel_id: 0,
+                        source_id: None,
+                        sequence: 0,
+                        sample_rate: 48_000,
+                        channels: 2,
+                        direction: crate::voice::AudioDirection::Incoming,
+                        payload: crate::voice::AudioPayload::Opus(bytes),
+                    };
+                    match stt.transcribe(&[frame]).await {
+                        Ok(transcript) if !transcript.trim().is_empty() => {
+                            attachment.text_content = Some(format!(
+                                "[Voice message transcription]: {}",
+                                transcript.trim()
+                            ));
+                        }
+                        _ => {
+                            attachment.text_content =
+                                Some("[Voice message (audio downloaded)]".to_string());
+                        }
+                    }
+                }
+            } else {
+                attachment.text_content = Some("[Voice message (audio downloaded)]".to_string());
+            }
+            return Ok(());
+        }
+
         if is_text_attachment(&attachment.filename, attachment.content_type.as_deref()) {
             let size = attachment.size_bytes.unwrap_or(0);
             if size <= MAX_INLINED_ATTACHMENT_BYTES {
@@ -374,6 +460,46 @@ fn attachment_error(message: impl Into<String>) -> OmonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_voice_attachment_detection() {
+        assert!(is_voice_attachment("voice-message.ogg", None, false, false));
+        assert!(is_voice_attachment("recording.opus", None, false, false));
+        assert!(is_voice_attachment(
+            "audio.ogg",
+            Some("audio/ogg"),
+            false,
+            false
+        ));
+        assert!(is_voice_attachment(
+            "audio.wav",
+            Some("audio/wav"),
+            false,
+            false
+        ));
+        assert!(is_voice_attachment("mystery", None, true, false));
+        assert!(is_voice_attachment("file.bin", None, false, true));
+
+        // Negative cases
+        assert!(!is_voice_attachment(
+            "song.mp3",
+            Some("audio/mpeg"),
+            false,
+            false
+        ));
+        assert!(!is_voice_attachment(
+            "doc.pdf",
+            Some("application/pdf"),
+            false,
+            false
+        ));
+        assert!(!is_voice_attachment(
+            "photo.png",
+            Some("image/png"),
+            false,
+            false
+        ));
+    }
 
     #[test]
     fn test_is_text_attachment_by_content_type() {

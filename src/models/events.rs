@@ -102,13 +102,28 @@ pub fn render_user_prompt(event: &InboundEvent) -> String {
         .attachments
         .iter()
         .map(|attachment| {
+            let is_voice = attachment.filename.ends_with(".ogg")
+                || attachment.filename.ends_with(".opus")
+                || attachment.filename.contains("voice-message")
+                || attachment.filename.contains("voice_message")
+                || attachment.content_type.as_deref().is_some_and(|ct| {
+                    ct.starts_with("audio/ogg")
+                        || ct.starts_with("audio/opus")
+                        || ct.contains("voice")
+                });
+            let label = if is_voice {
+                "Voice message"
+            } else {
+                "Attachment"
+            };
             let local = attachment
                 .local_path
                 .as_ref()
                 .map(|path| format!(" | local path: {}", path.display()))
                 .unwrap_or_default();
             let mut formatted = format!(
-                "[Attachment: {} ({}, {} bytes) - {}{}]",
+                "[{}: {} ({}, {} bytes) - {}{}]",
+                label,
                 attachment.filename,
                 attachment.content_type.as_deref().unwrap_or("unknown"),
                 attachment
@@ -385,6 +400,28 @@ mod tests {
         let turn2 = format!("{formatted} {clean1}");
         let clean2 = strip_leading_message_timestamps(&turn2);
         assert_eq!(clean2, raw);
+    }
+
+    #[test]
+    fn render_user_prompt_labels_voice_message() {
+        let mut event = InboundEvent::message(
+            SessionKey::new("discord", None::<String>, "1", None::<String>, "u1"),
+            "msg-1",
+            "Please listen to this",
+        );
+        event.attachments = vec![MessageAttachment {
+            id: "att-voice".into(),
+            filename: "voice-message.ogg".into(),
+            url: "https://cdn.discordapp.com/voice.ogg".into(),
+            content_type: Some("audio/ogg".into()),
+            size_bytes: Some(12345),
+            local_path: None,
+            text_content: Some("[Voice message (audio downloaded)]".into()),
+        }];
+
+        let rendered = render_user_prompt(&event);
+        assert!(rendered.contains("[Voice message: voice-message.ogg (audio/ogg, 12345 bytes)"));
+        assert!(rendered.contains("[Voice message (audio downloaded)]"));
     }
 
     #[test]
