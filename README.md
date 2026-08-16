@@ -208,6 +208,8 @@ launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 | `DISCORD_BOT_TOKEN` | Required | Primary Discord Bot Token |
 | `DISCORD_BOT_TOKENS` | Optional | Comma-separated tokens for Multi-Bot sharding |
 | `DISCORD_ALLOWED_USERS` | Optional | Allowed Discord user IDs (empty allows all) |
+| `DISCORD_ALLOWED_CHANNELS` | Optional | Comma-separated channel IDs allowed to process messages (DMs exempt) |
+| `DISCORD_IGNORED_CHANNELS` | Optional | Comma-separated channel IDs ignored completely |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | Optional | Channels where the bot responds without @mention |
 | `DISCORD_AUTO_THREAD` | `false` | When true, @mentions in guild text channels auto-create a public thread and route responses there |
 | `DEFAULT_MODEL` | `gpt-4o` | Default LLM model identifier |

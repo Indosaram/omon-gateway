@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use omon_gateway::discord::adapter::{message_to_inbound, message_to_inbound_with_config};
+use omon_gateway::discord::adapter::{
+    message_to_inbound, message_to_inbound_with_config, InboundFilterConfig,
+};
 use omon_gateway::discord::commands::is_user_allowed;
 use omon_gateway::{
     approval_buttons, chunk_markdown, compose_reply_context, derive_auto_thread_name,
@@ -462,10 +464,11 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         &thread,
         primary,
         Some(ChannelType::PublicThread),
-        &[],
-        &[],
-        &[7],
-        Some(primary.get()),
+        &InboundFilterConfig {
+            active_threads: &[7],
+            primary_bot_id: Some(primary.get()),
+            ..Default::default()
+        },
     )
     .is_some());
     // Secondary bot ignores unmentioned thread even if active
@@ -473,10 +476,11 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         &thread,
         secondary,
         Some(ChannelType::PublicThread),
-        &[],
-        &[],
-        &[7],
-        Some(primary.get()),
+        &InboundFilterConfig {
+            active_threads: &[7],
+            primary_bot_id: Some(primary.get()),
+            ..Default::default()
+        },
     )
     .is_none());
     // If thread is NOT in active_threads, even primary bot ignores it (stops thread spam!)
@@ -484,10 +488,10 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         &thread,
         primary,
         Some(ChannelType::PublicThread),
-        &[],
-        &[],
-        &[],
-        Some(primary.get()),
+        &InboundFilterConfig {
+            primary_bot_id: Some(primary.get()),
+            ..Default::default()
+        },
     )
     .is_none());
 
@@ -496,20 +500,22 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         &free,
         primary,
         Some(ChannelType::Text),
-        &[7],
-        &[],
-        &[],
-        Some(primary.get()),
+        &InboundFilterConfig {
+            free_response_channels: &[7],
+            primary_bot_id: Some(primary.get()),
+            ..Default::default()
+        },
     )
     .is_some());
     assert!(message_to_inbound_with_config(
         &free,
         secondary,
         Some(ChannelType::Text),
-        &[7],
-        &[],
-        &[],
-        Some(primary.get()),
+        &InboundFilterConfig {
+            free_response_channels: &[7],
+            primary_bot_id: Some(primary.get()),
+            ..Default::default()
+        },
     )
     .is_none());
 }
@@ -524,10 +530,10 @@ fn every_bot_answers_its_own_direct_messages_regardless_of_primary_bot() {
         &dm,
         secondary,
         Some(ChannelType::Private),
-        &[],
-        &[],
-        &[],
-        Some(primary.get()),
+        &InboundFilterConfig {
+            primary_bot_id: Some(primary.get()),
+            ..Default::default()
+        },
     );
     assert!(non_primary_event.is_some());
     assert_eq!(
@@ -544,10 +550,10 @@ fn every_bot_answers_its_own_direct_messages_regardless_of_primary_bot() {
         &dm,
         primary,
         Some(ChannelType::Private),
-        &[],
-        &[],
-        &[],
-        Some(primary.get()),
+        &InboundFilterConfig {
+            primary_bot_id: Some(primary.get()),
+            ..Default::default()
+        },
     );
     assert!(primary_event.is_some());
     assert_eq!(
@@ -564,30 +570,30 @@ fn every_explicitly_mentioned_bot_owns_exactly_its_target() {
         &message,
         UserId::new(42),
         Some(ChannelType::Text),
-        &[],
-        &[],
-        &[],
-        Some(42),
+        &InboundFilterConfig {
+            primary_bot_id: Some(42),
+            ..Default::default()
+        },
     )
     .is_some());
     assert!(message_to_inbound_with_config(
         &message,
         UserId::new(84),
         Some(ChannelType::Text),
-        &[],
-        &[],
-        &[],
-        Some(42),
+        &InboundFilterConfig {
+            primary_bot_id: Some(42),
+            ..Default::default()
+        },
     )
     .is_some());
     assert!(message_to_inbound_with_config(
         &message,
         UserId::new(126),
         Some(ChannelType::Text),
-        &[],
-        &[],
-        &[],
-        Some(42),
+        &InboundFilterConfig {
+            primary_bot_id: Some(42),
+            ..Default::default()
+        },
     )
     .is_none());
 }
@@ -604,10 +610,10 @@ fn scoped_thread_participation_gates_unmentioned_and_allows_mentioned() {
         &thread_msg_unmentioned,
         bot_id,
         Some(ChannelType::PublicThread),
-        &[],
-        &[],
-        &[],
-        Some(42),
+        &InboundFilterConfig {
+            primary_bot_id: Some(42),
+            ..Default::default()
+        },
     )
     .is_none());
 
@@ -616,10 +622,10 @@ fn scoped_thread_participation_gates_unmentioned_and_allows_mentioned() {
         &thread_msg_mentioned,
         bot_id,
         Some(ChannelType::PublicThread),
-        &[],
-        &[],
-        &[],
-        Some(42),
+        &InboundFilterConfig {
+            primary_bot_id: Some(42),
+            ..Default::default()
+        },
     )
     .is_some());
 
@@ -628,10 +634,70 @@ fn scoped_thread_participation_gates_unmentioned_and_allows_mentioned() {
         &thread_msg_unmentioned,
         bot_id,
         Some(ChannelType::PublicThread),
-        &[],
-        &[],
-        &[7],
-        Some(42),
+        &InboundFilterConfig {
+            active_threads: &[7],
+            primary_bot_id: Some(42),
+            ..Default::default()
+        },
+    )
+    .is_some());
+}
+
+#[test]
+fn channel_allow_and_ignore_lists() {
+    let bot_id = UserId::new(42);
+    let mentioned_msg = message_fixture(Some(9), "<@42> do something", vec![42]);
+    let dm_msg = message_fixture(None, "hello in dm", Vec::new());
+
+    // Channel 7 is ignored -> blocked even with explicit mention
+    assert!(message_to_inbound_with_config(
+        &mentioned_msg,
+        bot_id,
+        Some(ChannelType::Text),
+        &InboundFilterConfig {
+            ignored_channels: &[7],
+            primary_bot_id: Some(42),
+            ..Default::default()
+        },
+    )
+    .is_none());
+
+    // Whitelist active with channel 7 permitted -> allowed
+    assert!(message_to_inbound_with_config(
+        &mentioned_msg,
+        bot_id,
+        Some(ChannelType::Text),
+        &InboundFilterConfig {
+            allowed_channels: &[7],
+            primary_bot_id: Some(42),
+            ..Default::default()
+        },
+    )
+    .is_some());
+
+    // Whitelist active with channel 99 permitted (channel 7 not in whitelist) -> blocked
+    assert!(message_to_inbound_with_config(
+        &mentioned_msg,
+        bot_id,
+        Some(ChannelType::Text),
+        &InboundFilterConfig {
+            allowed_channels: &[99],
+            primary_bot_id: Some(42),
+            ..Default::default()
+        },
+    )
+    .is_none());
+
+    // DMs are exempt from channel whitelist
+    assert!(message_to_inbound_with_config(
+        &dm_msg,
+        bot_id,
+        Some(ChannelType::Private),
+        &InboundFilterConfig {
+            allowed_channels: &[99],
+            primary_bot_id: Some(42),
+            ..Default::default()
+        },
     )
     .is_some());
 }

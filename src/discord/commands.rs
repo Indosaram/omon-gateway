@@ -22,6 +22,8 @@ pub struct PoiseData {
     pub approvals: SmartApprovalGuard,
     pub free_response_channels: Vec<u64>,
     pub allowed_users: Vec<u64>,
+    pub allowed_channels: Vec<u64>,
+    pub ignored_channels: Vec<u64>,
     /// Thread IDs the bot is actively participating in (created or @mentioned).
     /// Kept in-memory: fast, zero-overhead, sufficient for active gateway runtime lifecycle.
     pub active_threads: Arc<RwLock<HashSet<u64>>>,
@@ -50,6 +52,8 @@ impl PoiseData {
             approvals: SmartApprovalGuard::new(),
             free_response_channels: Vec::new(),
             allowed_users: Vec::new(),
+            allowed_channels: Vec::new(),
+            ignored_channels: Vec::new(),
             active_threads: Arc::new(RwLock::new(HashSet::new())),
             auto_thread: false,
             primary_bot_id: None,

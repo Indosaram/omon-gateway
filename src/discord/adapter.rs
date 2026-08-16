@@ -51,6 +51,17 @@ pub fn derive_auto_thread_name(content: &str, bot_user_id: serenity::UserId) -> 
     }
 }
 
+/// Configuration options for filtering and routing inbound Discord messages.
+#[derive(Clone, Debug, Default)]
+pub struct InboundFilterConfig<'a> {
+    pub free_response_channels: &'a [u64],
+    pub allowed_users: &'a [u64],
+    pub active_threads: &'a [u64],
+    pub allowed_channels: &'a [u64],
+    pub ignored_channels: &'a [u64],
+    pub primary_bot_id: Option<u64>,
+}
+
 /// Composes reply context prefixing the user body with a quote block of the referenced message.
 pub fn compose_reply_context(
     referenced_author: &str,
@@ -293,15 +304,17 @@ impl DiscordAdapter {
             .read()
             .map(|set| set.iter().copied().collect())
             .unwrap_or_default();
-        let Some(event) = message_to_inbound_with_config(
-            message,
-            bot_user_id,
-            channel_type,
-            &self.data.free_response_channels,
-            &self.data.allowed_users,
-            &active_threads,
-            self.data.primary_bot_id,
-        ) else {
+        let config = InboundFilterConfig {
+            free_response_channels: &self.data.free_response_channels,
+            allowed_users: &self.data.allowed_users,
+            active_threads: &active_threads,
+            allowed_channels: &self.data.allowed_channels,
+            ignored_channels: &self.data.ignored_channels,
+            primary_bot_id: self.data.primary_bot_id,
+        };
+        let Some(event) =
+            message_to_inbound_with_config(message, bot_user_id, channel_type, &config)
+        else {
             return Ok(false);
         };
         if channel_type.is_some_and(is_thread) {
@@ -353,15 +366,17 @@ async fn handle_event(
                 .read()
                 .map(|set| set.iter().copied().collect())
                 .unwrap_or_default();
-            if let Some(mut event) = message_to_inbound_with_config(
-                new_message,
-                bot_user_id,
-                channel_type,
-                &data.free_response_channels,
-                &data.allowed_users,
-                &active_threads,
-                data.primary_bot_id,
-            ) {
+            let config = InboundFilterConfig {
+                free_response_channels: &data.free_response_channels,
+                allowed_users: &data.allowed_users,
+                active_threads: &active_threads,
+                allowed_channels: &data.allowed_channels,
+                ignored_channels: &data.ignored_channels,
+                primary_bot_id: data.primary_bot_id,
+            };
+            if let Some(mut event) =
+                message_to_inbound_with_config(new_message, bot_user_id, channel_type, &config)
+            {
                 if channel_type.is_some_and(is_thread) {
                     data.mark_thread_active(new_message.channel_id.get());
                 } else if data.auto_thread && is_guild_text && is_explicit_mention {
@@ -484,25 +499,18 @@ pub fn message_to_inbound(
     bot_user_id: serenity::UserId,
     channel_type: Option<ChannelType>,
 ) -> Option<InboundEvent> {
-    message_to_inbound_with_config(
-        message,
-        bot_user_id,
-        channel_type,
-        &[],
-        &[],
-        &[],
-        Some(bot_user_id.get()),
-    )
+    let config = InboundFilterConfig {
+        primary_bot_id: Some(bot_user_id.get()),
+        ..Default::default()
+    };
+    message_to_inbound_with_config(message, bot_user_id, channel_type, &config)
 }
 
 pub fn message_to_inbound_with_config(
     message: &Message,
     bot_user_id: serenity::UserId,
     channel_type: Option<ChannelType>,
-    free_response_channels: &[u64],
-    allowed_users: &[u64],
-    active_threads: &[u64],
-    primary_bot_id: Option<u64>,
+    config: &InboundFilterConfig<'_>,
 ) -> Option<InboundEvent> {
     if message.author.bot || message.webhook_id.is_some() {
         return None;
@@ -517,11 +525,27 @@ pub fn message_to_inbound_with_config(
         return None;
     }
 
-    if !allowed_users.is_empty() && !allowed_users.contains(&message.author.id.get()) {
+    let is_dm = message.guild_id.is_none();
+    let channel_id_u64 = message.channel_id.get();
+
+    // Channel blacklist: if ignored_channels contains the channel id -> return None
+    if config.ignored_channels.contains(&channel_id_u64) {
         return None;
     }
 
-    let is_dm = message.guild_id.is_none();
+    // Channel whitelist: if allowed_channels is non-empty, guild channels must be in allowed_channels (DMs exempt)
+    if !is_dm
+        && !config.allowed_channels.is_empty()
+        && !config.allowed_channels.contains(&channel_id_u64)
+    {
+        return None;
+    }
+
+    if !config.allowed_users.is_empty() && !config.allowed_users.contains(&message.author.id.get())
+    {
+        return None;
+    }
+
     let is_thread = channel_type.is_some_and(is_thread);
     let mentioned_bot_ids = message
         .mentions
@@ -530,14 +554,17 @@ pub fn message_to_inbound_with_config(
         .map(|user| user.id)
         .collect::<Vec<_>>();
     let is_explicit_mention = mentioned_bot_ids.contains(&bot_user_id);
-    let is_free_channel = free_response_channels.contains(&message.channel_id.get());
+    let is_free_channel = config
+        .free_response_channels
+        .contains(&message.channel_id.get());
 
     if !mentioned_bot_ids.is_empty() {
         if !is_explicit_mention {
             return None;
         }
     } else {
-        let is_active_thread = is_thread && active_threads.contains(&message.channel_id.get());
+        let is_active_thread =
+            is_thread && config.active_threads.contains(&message.channel_id.get());
         let is_implicit_response_channel = is_dm || is_active_thread || is_free_channel;
         if !is_implicit_response_channel {
             return None;
@@ -545,7 +572,7 @@ pub fn message_to_inbound_with_config(
         // Guild threads and free-response channels are visible to every bot, so only
         // the primary bot auto-responds there to avoid duplicate replies. DMs are 1:1
         // per bot, so each bot must always answer its own DMs.
-        if !is_dm && primary_bot_id != Some(bot_user_id.get()) {
+        if !is_dm && config.primary_bot_id != Some(bot_user_id.get()) {
             return None;
         }
     }

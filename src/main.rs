@@ -364,6 +364,8 @@ struct Config {
     workspace_root: PathBuf,
     free_response_channels: Vec<u64>,
     allowed_users: Vec<u64>,
+    allowed_channels: Vec<u64>,
+    ignored_channels: Vec<u64>,
     auto_thread: bool,
     approval_policy: ApprovalPolicy,
     approval_timeout_secs: u64,
@@ -396,6 +398,8 @@ impl Config {
                     .collect()
             })
             .unwrap_or_default();
+        let allowed_channels = parse_u64_list(optional_env("DISCORD_ALLOWED_CHANNELS").as_deref());
+        let ignored_channels = parse_u64_list(optional_env("DISCORD_IGNORED_CHANNELS").as_deref());
 
         let mut tokens = Vec::new();
         if let Ok(tok) = env::var("DISCORD_BOT_TOKEN") {
@@ -442,6 +446,8 @@ impl Config {
             workspace_root,
             free_response_channels,
             allowed_users,
+            allowed_channels,
+            ignored_channels,
             auto_thread: parse_bool_from(optional_env("DISCORD_AUTO_THREAD").as_deref(), false),
             approval_policy: ApprovalPolicy::parse(optional_env("APPROVAL_MODE").as_deref()),
             approval_timeout_secs: approval_timeout_secs_from(
@@ -1634,6 +1640,8 @@ async fn run_gateway() -> Result<()> {
     poise_data.tool_registry = tools.clone();
     poise_data.free_response_channels = config.free_response_channels.clone();
     poise_data.allowed_users = config.allowed_users.clone();
+    poise_data.allowed_channels = config.allowed_channels.clone();
+    poise_data.ignored_channels = config.ignored_channels.clone();
     poise_data.auto_thread = config.auto_thread;
     poise_data.attachment_downloader = Some(AttachmentDownloader::new(&config.workspace_root)?);
     poise_data.primary_bot_id = Some(default_bot_id.parse().map_err(|_| {
@@ -1708,6 +1716,15 @@ pub fn parse_bool_from(raw: Option<&str>, default: bool) -> bool {
         ),
         None => default,
     }
+}
+
+pub fn parse_u64_list(raw: Option<&str>) -> Vec<u64> {
+    raw.map(|s| {
+        s.split(',')
+            .filter_map(|p| p.trim().parse::<u64>().ok())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
