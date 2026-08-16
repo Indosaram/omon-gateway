@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,125 @@ use crate::{
 
 const LEASE_DURATION: TimeDelta = TimeDelta::minutes(30);
 const LEASE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+pub const MAX_CONTEXT_CHARS: usize = 8000;
+
+pub fn is_valid_context_job_id(job_id: &str) -> bool {
+    !job_id.is_empty() && !job_id.contains("..") && !job_id.contains('/') && !job_id.contains('\\')
+}
+
+pub fn parse_context_from_ids(context_from: Option<&Value>) -> Vec<String> {
+    let Some(value) = context_from else {
+        return Vec::new();
+    };
+    match value {
+        Value::String(s) => {
+            let s = s.trim();
+            if is_valid_context_job_id(s) {
+                vec![s.to_string()]
+            } else {
+                Vec::new()
+            }
+        }
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| is_valid_context_job_id(s))
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn truncate_context_output(output: &str, max_chars: usize) -> String {
+    let count = output.chars().count();
+    if count > max_chars {
+        let prefix: String = output.chars().take(max_chars).collect();
+        format!("{prefix}\n\n[... output truncated ...]")
+    } else {
+        output.to_string()
+    }
+}
+
+pub fn format_context_from_block(job_id: &str, output: &str) -> String {
+    format!(
+        "## Output from job '{job_id}'\n\
+        The following is the most recent output from a preceding cron job. Use it as context for your analysis.\n\n\
+        ```\n{output}\n```"
+    )
+}
+
+pub async fn resolve_predecessor_output(
+    pool: &SqlitePool,
+    hermes_home: Option<&Path>,
+    job_id: &str,
+) -> Option<String> {
+    if !is_valid_context_job_id(job_id) {
+        return None;
+    }
+
+    // 1. Check messages DB for recent assistant output from this cron job
+    let db_result: Option<(String,)> = sqlx::query_as(
+        "SELECT content FROM messages \
+         WHERE (session_key LIKE ? OR session_key LIKE ?) \
+           AND role = 'assistant' AND TRIM(content) != '' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(format!("%cron:{job_id}"))
+    .bind(format!("%:{job_id}"))
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    if let Some((content,)) = db_result {
+        if !content.trim().is_empty() {
+            return Some(content);
+        }
+    }
+
+    // 2. Fallback: Check ~/.hermes/cron/output/<job_id>/*.md or <home>/cron/output/<job_id>/*.md
+    let output_dirs = {
+        let mut dirs = Vec::new();
+        if let Some(home) = hermes_home {
+            dirs.push(home.join("cron").join("output").join(job_id));
+        }
+        if let Some(env_home) = std::env::var_os("HERMES_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".hermes")))
+        {
+            dirs.push(env_home.join("cron").join("output").join(job_id));
+        }
+        dirs
+    };
+
+    for output_dir in output_dirs {
+        if output_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&output_dir) {
+                let mut files: Vec<(PathBuf, std::time::SystemTime)> = entries
+                    .filter_map(std::result::Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
+                    .filter_map(|p| {
+                        let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
+                        Some((p, mtime))
+                    })
+                    .collect();
+                files.sort_by(|a, b| b.1.cmp(&a.1));
+                if let Some((latest_file, _)) = files.first() {
+                    if let Ok(content) = std::fs::read_to_string(latest_file) {
+                        if !content.trim().is_empty() {
+                            return Some(content);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
 
 const CRON_SILENCE_TOKENS: &[&str] = &["[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"];
 
@@ -1286,5 +1406,91 @@ mod tests {
         let (times2, comp2) = extract_repeat_info(&job_after_2.payload().unwrap());
         assert_eq!(times2, Some(2));
         assert_eq!(comp2, 2);
+    }
+
+    #[test]
+    fn test_parse_context_from_ids() {
+        assert_eq!(parse_context_from_ids(None), Vec::<String>::new());
+        assert_eq!(
+            parse_context_from_ids(Some(&serde_json::json!("job1"))),
+            vec!["job1".to_string()]
+        );
+        assert_eq!(
+            parse_context_from_ids(Some(&serde_json::json!(["job1", "job2", "invalid/../id"]))),
+            vec!["job1".to_string(), "job2".to_string()]
+        );
+        assert_eq!(
+            parse_context_from_ids(Some(&serde_json::json!({"not": "a list"}))),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_truncate_context_output() {
+        let short = "Hello world";
+        assert_eq!(truncate_context_output(short, 8000), "Hello world");
+
+        let long = "a".repeat(8005);
+        let truncated = truncate_context_output(&long, 8000);
+        assert_eq!(
+            truncated.len(),
+            8000 + "\n\n[... output truncated ...]".len()
+        );
+        assert!(truncated.starts_with(&"a".repeat(8000)));
+        assert!(truncated.ends_with("\n\n[... output truncated ...]"));
+    }
+
+    #[test]
+    fn test_format_context_from_block() {
+        let formatted = format_context_from_block("weather_job", "Temperature: 20C");
+        let expected = "## Output from job 'weather_job'\nThe following is the most recent output from a preceding cron job. Use it as context for your analysis.\n\n```\nTemperature: 20C\n```";
+        assert_eq!(formatted, expected);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_predecessor_output_from_db_and_disk() {
+        let database = crate::Database::connect("sqlite::memory:").await.unwrap();
+
+        // 1. Resolve from DB messages
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json, created_at, updated_at) \
+             VALUES ('discord:123:cron:job_alpha', 'discord', '123', 'cron:job_alpha', '{}', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, metadata_json, created_at) \
+             VALUES ('msg1', 'discord:123:cron:job_alpha', 'assistant', 'Output from alpha', '{}', ?)",
+        )
+        .bind(now)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let resolved_db = resolve_predecessor_output(database.pool(), None, "job_alpha").await;
+        assert_eq!(resolved_db.as_deref(), Some("Output from alpha"));
+
+        // 2. Resolve fallback from disk
+        let temp_dir =
+            std::env::temp_dir().join(format!("omon-test-hermes-{}", uuid::Uuid::new_v4()));
+        let job_out_dir = temp_dir.join("cron").join("output").join("job_beta");
+        tokio::fs::create_dir_all(&job_out_dir).await.unwrap();
+        tokio::fs::write(
+            job_out_dir.join("2026-08-16T10-00-00.md"),
+            "Disk output from beta",
+        )
+        .await
+        .unwrap();
+
+        let resolved_disk =
+            resolve_predecessor_output(database.pool(), Some(&temp_dir), "job_beta").await;
+        assert_eq!(resolved_disk.as_deref(), Some("Disk output from beta"));
+
+        let _ = tokio::fs::remove_dir_all(temp_dir).await;
     }
 }

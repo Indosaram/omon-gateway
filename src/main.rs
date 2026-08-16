@@ -10,13 +10,15 @@ use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
     augmented_path_from_environment, cron_runs_retention_days_from_environment,
-    parse_profile_routes, prune_terminal_cron_runs, render_user_prompt, AgentRunner,
-    ApprovalPolicy, AttachmentDownloader, ChatMessage, CronJob, CronScheduler, CronTaskExecutor,
-    CronTool, DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress,
-    FileTool, HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider,
-    McpTool, MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher,
-    PoiseData, ProfileRoute, ProfileRouter, Result, ScaleToZero, SessionContext, SessionKey,
-    SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry,
+    format_context_from_block, parse_context_from_ids, parse_profile_routes,
+    prune_terminal_cron_runs, render_user_prompt, resolve_predecessor_output,
+    truncate_context_output, AgentRunner, ApprovalPolicy, AttachmentDownloader, ChatMessage,
+    CronJob, CronScheduler, CronTaskExecutor, CronTool, DeliveryLedgerService, DiscordAdapter,
+    DiscordApprovalRequester, DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer,
+    InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore, MultiplexerConfig,
+    OmonError, OutboundAction, OutboundDispatcher, PoiseData, ProfileRoute, ProfileRouter, Result,
+    ScaleToZero, SessionContext, SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool,
+    ToolDefinition, ToolRegistry, MAX_CONTEXT_CHARS,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -1196,6 +1198,24 @@ impl CronTaskExecutor for AgentCronExecutor {
         }
         let cron_hint = "[IMPORTANT: You are running as a scheduled cron job. DELIVERY: Your final response will be automatically delivered to the user — do NOT use send_message or try to deliver the output yourself. Just produce your report/output as your final response and the system handles the rest. SILENT: If there is genuinely nothing new to report, respond with exactly \"[SILENT]\" (nothing else) to suppress delivery. Never combine [SILENT] with content — either report your findings normally, or say [SILENT] and nothing more.]\n\n";
         let mut prompt = cron_hint.to_string();
+
+        let context_ids = parse_context_from_ids(hermes.context_from.as_ref());
+        if !context_ids.is_empty() {
+            let home_path = hermes_home(&hermes).ok();
+            for source_id in &context_ids {
+                if let Some(output) =
+                    resolve_predecessor_output(&self.runner.pool, home_path.as_deref(), source_id)
+                        .await
+                {
+                    if !output.trim().is_empty() {
+                        let truncated = truncate_context_output(output.trim(), MAX_CONTEXT_CHARS);
+                        prompt.push_str(&format_context_from_block(source_id, &truncated));
+                        prompt.push_str("\n\n");
+                    }
+                }
+            }
+        }
+
         let skills = load_cron_skills(&hermes)?;
         if !skills.is_empty() {
             prompt.push_str(&skills);
