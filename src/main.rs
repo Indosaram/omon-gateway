@@ -2280,6 +2280,7 @@ async fn run_gateway() -> Result<()> {
     scheduler.start().await;
 
     let mut poise_data = PoiseData::new(multiplexer.clone(), pool.clone());
+    poise_data.pairing_store.init_cache().await?;
     poise_data.profile_router = profile_router;
     poise_data.llm = Some(llm.clone());
     poise_data.tools = tool_names;

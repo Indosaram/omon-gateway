@@ -737,6 +737,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_creates_pairing_tables_and_indexes() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+
+        let row_codes = sqlx::query(
+            "SELECT code, user_id, created_at, expires_at, attempts FROM pairing_codes LIMIT 0",
+        )
+        .fetch_optional(database.pool())
+        .await;
+        assert!(
+            row_codes.is_ok(),
+            "pairing_codes table should exist with correct columns"
+        );
+
+        let row_paired = sqlx::query("SELECT user_id, paired_at FROM paired_users LIMIT 0")
+            .fetch_optional(database.pool())
+            .await;
+        assert!(
+            row_paired.is_ok(),
+            "paired_users table should exist with correct columns"
+        );
+
+        let rows = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'pairing_codes'",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("indexes should be queryable");
+
+        let indexes: HashSet<String> = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+
+        assert!(indexes.contains("idx_pairing_codes_user_id"));
+    }
+
+    #[tokio::test]
     async fn migration_creates_resume_pending_column_and_index() {
         let database = Database::connect("sqlite::memory:")
             .await

@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod approval;
 pub mod attachments;
 pub mod commands;
+pub mod pairing;
 pub mod throttler;
 
 pub use adapter::{
@@ -25,6 +26,7 @@ pub use attachments::{
     DISCORD_ATTACHMENT_TIMEOUT, MAX_INLINED_ATTACHMENT_BYTES,
 };
 pub use commands::{is_user_authorized, GatewayStats, PoiseContext, PoiseData};
+pub use pairing::{PairingOutcome, PairingStore};
 pub use throttler::{
     chunk_markdown, chunk_markdown_paginated, is_chunk_pagination_enabled, truncate_live_preview,
     DiscordMessageTransport, LiveEditThrottler,

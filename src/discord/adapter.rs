@@ -431,6 +431,7 @@ pub struct InboundFilterConfig<'a> {
     pub primary_bot_id: Option<u64>,
     pub thread_require_mention: bool,
     pub allow_bots: AllowBotsMode,
+    pub paired_users: &'a [u64],
 }
 
 impl Default for InboundFilterConfig<'_> {
@@ -448,6 +449,7 @@ impl Default for InboundFilterConfig<'_> {
             primary_bot_id: None,
             thread_require_mention: false,
             allow_bots: AllowBotsMode::None,
+            paired_users: &[],
         }
     }
 }
@@ -694,6 +696,7 @@ impl DiscordAdapter {
             .read()
             .map(|set| set.iter().copied().collect())
             .unwrap_or_default();
+        let paired_users = self.data.pairing_store.get_paired_user_ids_sync();
         let config = InboundFilterConfig {
             free_response_channels: &self.data.free_response_channels,
             allowed_users: &self.data.allowed_users,
@@ -707,6 +710,7 @@ impl DiscordAdapter {
             primary_bot_id: self.data.primary_bot_id,
             thread_require_mention: self.data.thread_require_mention,
             allow_bots: self.data.allow_bots,
+            paired_users: &paired_users,
         };
         let Some(event) =
             message_to_inbound_with_config(message, bot_user_id, channel_type, &config)
@@ -772,6 +776,7 @@ async fn handle_event(
             } else {
                 Vec::new()
             };
+            let paired_users = data.pairing_store.get_paired_user_ids().await;
             let config = InboundFilterConfig {
                 free_response_channels: &data.free_response_channels,
                 allowed_users: &data.allowed_users,
@@ -785,6 +790,7 @@ async fn handle_event(
                 primary_bot_id: data.primary_bot_id,
                 thread_require_mention: data.thread_require_mention,
                 allow_bots: data.allow_bots,
+                paired_users: &paired_users,
             };
             if let Some(mut event) =
                 message_to_inbound_with_config(new_message, bot_user_id, channel_type, &config)
@@ -915,6 +921,27 @@ async fn handle_event(
                     global_debouncer().enqueue(event, data.clone()).await;
                 }
             } else {
+                let is_dm = channel_type == Some(ChannelType::Private);
+                if is_dm
+                    && !data.allow_all_users
+                    && (!data.allowed_users.is_empty() || !data.allowed_roles.is_empty())
+                    && !new_message.author.bot
+                    && !data
+                        .pairing_store
+                        .is_user_paired(new_message.author.id.get())
+                        .await
+                {
+                    if let Ok(code) = data
+                        .pairing_store
+                        .request_pairing_code(new_message.author.id.get())
+                        .await
+                    {
+                        let prompt = format!(
+                            "🔒 **Authorization Required**\nThis bot requires operator pairing. Your pairing code is `{code}`.\nAsk an administrator or operator to approve your access with `/pair {code}`."
+                        );
+                        let _ = new_message.channel_id.say(&ctx.http, prompt).await;
+                    }
+                }
                 tracing::info!("Message ignored by filter (not DM, not thread, not mentioned, not in free channels)");
             }
         }
@@ -927,13 +954,17 @@ async fn handle_event(
                     .as_ref()
                     .map(|m| m.roles.iter().map(|r| r.get()).collect())
                     .unwrap_or_default();
-                if !is_user_authorized(
-                    component.user.id.get(),
-                    &component_roles,
-                    &data.allowed_users,
-                    &data.allowed_roles,
-                    data.allow_all_users,
-                ) {
+                let user_id = component.user.id.get();
+                let is_paired = data.pairing_store.is_user_paired_sync(user_id);
+                if !is_paired
+                    && !is_user_authorized(
+                        user_id,
+                        &component_roles,
+                        &data.allowed_users,
+                        &data.allowed_roles,
+                        data.allow_all_users,
+                    )
+                {
                     let refusal = CreateInteractionResponse::Message(
                         CreateInteractionResponseMessage::new()
                             .ephemeral(true)
@@ -1095,13 +1126,17 @@ pub fn message_to_inbound_with_config(
         return None;
     }
 
-    if !is_user_authorized(
-        message.author.id.get(),
-        config.user_roles,
-        config.allowed_users,
-        config.allowed_roles,
-        config.allow_all_users,
-    ) {
+    let author_id = message.author.id.get();
+    let is_paired = config.paired_users.contains(&author_id);
+    if !is_paired
+        && !is_user_authorized(
+            author_id,
+            config.user_roles,
+            config.allowed_users,
+            config.allowed_roles,
+            config.allow_all_users,
+        )
+    {
         return None;
     }
 

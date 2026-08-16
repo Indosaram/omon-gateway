@@ -46,6 +46,7 @@ pub struct PoiseData {
     pub tool_registry: crate::ToolRegistry,
     pub llm: Option<LlmClient>,
     pub profile_router: ProfileRouter,
+    pub pairing_store: super::PairingStore,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +60,7 @@ pub struct GatewayStats {
 impl PoiseData {
     pub fn new(multiplexer: SessionMultiplexer, pool: SqlitePool) -> Self {
         let profile_router = multiplexer.profile_router().clone();
+        let pairing_store = super::PairingStore::new(pool.clone());
         Self {
             multiplexer,
             pool,
@@ -89,6 +91,7 @@ impl PoiseData {
             tool_registry: crate::ToolRegistry::new(),
             llm: None,
             profile_router,
+            pairing_store,
         }
     }
 
@@ -140,6 +143,7 @@ pub fn all() -> Vec<poise::Command<PoiseData, CommandError>> {
         thread(),
         deny(),
         yolo(),
+        pair(),
     ]
 }
 
@@ -172,17 +176,21 @@ pub fn is_user_authorized(
 
 pub async fn command_check(ctx: PoiseContext<'_>) -> Result<bool, CommandError> {
     let data = ctx.data();
+    let user_id = ctx.author().id.get();
+    let is_paired = data.pairing_store.is_user_paired(user_id).await;
     let user_roles: Vec<u64> = match ctx.author_member().await {
         Some(member) => member.roles.iter().map(|r| r.get()).collect(),
         None => Vec::new(),
     };
-    if is_user_authorized(
-        ctx.author().id.get(),
-        &user_roles,
-        &data.allowed_users,
-        &data.allowed_roles,
-        data.allow_all_users,
-    ) {
+    if is_paired
+        || is_user_authorized(
+            user_id,
+            &user_roles,
+            &data.allowed_users,
+            &data.allowed_roles,
+            data.allow_all_users,
+        )
+    {
         return Ok(true);
     }
 
@@ -1028,6 +1036,72 @@ pub async fn yolo(
     Ok(())
 }
 
+#[poise::command(slash_command, prefix_command)]
+/// Authorize a new user via their one-time pairing code.
+pub async fn pair(
+    ctx: PoiseContext<'_>,
+    #[description = "8-character pairing code (e.g. ABCD-EFGH)"] code: String,
+) -> Result<(), CommandError> {
+    let data = ctx.data();
+    let user_roles: Vec<u64> = match ctx.author_member().await {
+        Some(member) => member.roles.iter().map(|r| r.get()).collect(),
+        None => Vec::new(),
+    };
+    if !is_user_authorized(
+        ctx.author().id.get(),
+        &user_roles,
+        &data.allowed_users,
+        &data.allowed_roles,
+        data.allow_all_users,
+    ) {
+        ctx.send(
+            poise::CreateReply::default()
+                .content("❌ You are not authorized to approve pairing codes.")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    match data
+        .pairing_store
+        .approve_code(&code, ctx.author().id.get())
+        .await?
+    {
+        super::PairingOutcome::Success { user_id } => {
+            ctx.say(format!(
+                "✅ Successfully paired and authorized user <@{user_id}>!"
+            ))
+            .await?;
+        }
+        super::PairingOutcome::InvalidCode => {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content("❌ Invalid pairing code.")
+                    .ephemeral(true),
+            )
+            .await?;
+        }
+        super::PairingOutcome::Expired => {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content("❌ That pairing code has expired.")
+                    .ephemeral(true),
+            )
+            .await?;
+        }
+        super::PairingOutcome::LockedOut => {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content("❌ Pairing locked out due to too many failed attempts (5+).")
+                    .ephemeral(true),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 pub fn format_steer_prompt(text: &str) -> String {
     format!("[Steering] {}", text.trim())
 }
@@ -1136,11 +1210,11 @@ mod tests {
     #[test]
     fn test_all_commands_count() {
         let commands = all();
-        assert_eq!(commands.len(), 17);
+        assert_eq!(commands.len(), 18);
         let names: HashSet<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         for expected in &[
             "model", "reset", "stop", "status", "tools", "skill", "skills", "memory", "cron",
-            "steer", "undo", "retry", "compress", "title", "thread", "deny", "yolo",
+            "steer", "undo", "retry", "compress", "title", "thread", "deny", "yolo", "pair",
         ] {
             assert!(names.contains(expected), "missing command {expected}");
         }
