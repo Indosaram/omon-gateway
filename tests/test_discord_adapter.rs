@@ -720,6 +720,91 @@ fn user_authorization_allow_all_and_roles() {
     assert!(!is_user_authorized(99, &[500], &[20], &[300], false));
 }
 
+#[test]
+fn test_shared_vs_per_user_thread_sessions() {
+    let bot_id = UserId::new(42);
+    let mut msg_alice = message_fixture(Some(9), "<@42> msg from alice", vec![42]);
+    msg_alice.author.id = UserId::new(100);
+    let mut msg_bob = message_fixture(Some(9), "<@42> msg from bob", vec![42]);
+    msg_bob.author.id = UserId::new(200);
+
+    // Mode 1: DISCORD_THREAD_SESSIONS_PER_USER = false -> shared session in threads
+    let shared_thread_config = InboundFilterConfig {
+        thread_sessions_per_user: false,
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+    let event_alice_shared = message_to_inbound_with_config(
+        &msg_alice,
+        bot_id,
+        Some(ChannelType::PublicThread),
+        &shared_thread_config,
+    )
+    .unwrap();
+    let event_bob_shared = message_to_inbound_with_config(
+        &msg_bob,
+        bot_id,
+        Some(ChannelType::PublicThread),
+        &shared_thread_config,
+    )
+    .unwrap();
+    assert_eq!(event_alice_shared.session.user_id, "shared");
+    assert_eq!(event_bob_shared.session.user_id, "shared");
+    assert_eq!(
+        event_alice_shared.session.storage_key(),
+        event_bob_shared.session.storage_key()
+    );
+
+    // Mode 2: DISCORD_THREAD_SESSIONS_PER_USER = true (default) -> per-user session in threads
+    let per_user_thread_config = InboundFilterConfig {
+        thread_sessions_per_user: true,
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+    let event_alice_isolated = message_to_inbound_with_config(
+        &msg_alice,
+        bot_id,
+        Some(ChannelType::PublicThread),
+        &per_user_thread_config,
+    )
+    .unwrap();
+    let event_bob_isolated = message_to_inbound_with_config(
+        &msg_bob,
+        bot_id,
+        Some(ChannelType::PublicThread),
+        &per_user_thread_config,
+    )
+    .unwrap();
+    assert_eq!(event_alice_isolated.session.user_id, "100");
+    assert_eq!(event_bob_isolated.session.user_id, "200");
+    assert_ne!(
+        event_alice_isolated.session.storage_key(),
+        event_bob_isolated.session.storage_key()
+    );
+
+    // Text channels remain per-user even when thread_sessions_per_user = false
+    let event_alice_text = message_to_inbound_with_config(
+        &msg_alice,
+        bot_id,
+        Some(ChannelType::Text),
+        &shared_thread_config,
+    )
+    .unwrap();
+    let event_bob_text = message_to_inbound_with_config(
+        &msg_bob,
+        bot_id,
+        Some(ChannelType::Text),
+        &shared_thread_config,
+    )
+    .unwrap();
+    assert_eq!(event_alice_text.session.user_id, "100");
+    assert_eq!(event_bob_text.session.user_id, "200");
+    assert_ne!(
+        event_alice_text.session.storage_key(),
+        event_bob_text.session.storage_key()
+    );
+}
+
 #[tokio::test]
 async fn discord_delivery_claims_deduplicate_per_target_bot() {
     let database = Database::connect("sqlite::memory:").await.unwrap();

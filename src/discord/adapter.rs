@@ -52,17 +52,35 @@ pub fn derive_auto_thread_name(content: &str, bot_user_id: serenity::UserId) -> 
 }
 
 /// Configuration options for filtering and routing inbound Discord messages.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct InboundFilterConfig<'a> {
     pub free_response_channels: &'a [u64],
     pub allowed_users: &'a [u64],
     pub allowed_roles: &'a [u64],
     pub user_roles: &'a [u64],
     pub allow_all_users: bool,
+    pub thread_sessions_per_user: bool,
     pub active_threads: &'a [u64],
     pub allowed_channels: &'a [u64],
     pub ignored_channels: &'a [u64],
     pub primary_bot_id: Option<u64>,
+}
+
+impl Default for InboundFilterConfig<'_> {
+    fn default() -> Self {
+        Self {
+            free_response_channels: &[],
+            allowed_users: &[],
+            allowed_roles: &[],
+            user_roles: &[],
+            allow_all_users: false,
+            thread_sessions_per_user: true,
+            active_threads: &[],
+            allowed_channels: &[],
+            ignored_channels: &[],
+            primary_bot_id: None,
+        }
+    }
 }
 
 /// Composes reply context prefixing the user body with a quote block of the referenced message.
@@ -313,6 +331,7 @@ impl DiscordAdapter {
             allowed_roles: &self.data.allowed_roles,
             user_roles: &[],
             allow_all_users: self.data.allow_all_users,
+            thread_sessions_per_user: self.data.thread_sessions_per_user,
             active_threads: &active_threads,
             allowed_channels: &self.data.allowed_channels,
             ignored_channels: &self.data.ignored_channels,
@@ -388,6 +407,7 @@ async fn handle_event(
                 allowed_roles: &data.allowed_roles,
                 user_roles: &user_roles,
                 allow_all_users: data.allow_all_users,
+                thread_sessions_per_user: data.thread_sessions_per_user,
                 active_threads: &active_threads,
                 allowed_channels: &data.allowed_channels,
                 ignored_channels: &data.ignored_channels,
@@ -414,6 +434,9 @@ async fn handle_event(
                                 parent_channel = %new_message.channel_id,
                                 "Auto-created thread on channel mention"
                             );
+                            if !data.thread_sessions_per_user {
+                                event.session.user_id = "shared".to_string();
+                            }
                             event.session.thread_id = Some(thread_channel.id.to_string());
                             event.session.channel_id = thread_channel.id.to_string();
                         }
@@ -639,13 +662,18 @@ pub fn message_to_inbound_with_config(
     } else {
         raw_content
     };
+    let user_id = if is_thread && !config.thread_sessions_per_user {
+        "shared".to_string()
+    } else {
+        message.author.id.to_string()
+    };
     let channel_id = message.channel_id.to_string();
     let session = SessionKey::new(
         "discord",
         message.guild_id.map(|id| id.to_string()),
         channel_id.clone(),
         is_thread.then_some(channel_id),
-        message.author.id.to_string(),
+        user_id,
     )
     .with_bot_id(bot_user_id.to_string());
     let attachments = message

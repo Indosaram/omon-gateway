@@ -24,6 +24,7 @@ pub struct PoiseData {
     pub allowed_users: Vec<u64>,
     pub allowed_roles: Vec<u64>,
     pub allow_all_users: bool,
+    pub thread_sessions_per_user: bool,
     pub allowed_channels: Vec<u64>,
     pub ignored_channels: Vec<u64>,
     /// Thread IDs the bot is actively participating in (created or @mentioned).
@@ -56,6 +57,7 @@ impl PoiseData {
             allowed_users: Vec::new(),
             allowed_roles: Vec::new(),
             allow_all_users: false,
+            thread_sessions_per_user: true,
             allowed_channels: Vec::new(),
             ignored_channels: Vec::new(),
             active_threads: Arc::new(RwLock::new(HashSet::new())),
@@ -431,12 +433,17 @@ async fn session_key(ctx: PoiseContext<'_>) -> Result<SessionKey, CommandError> 
     } else {
         None
     };
+    let user_id = if thread_id.is_some() && !ctx.data().thread_sessions_per_user {
+        "shared".to_string()
+    } else {
+        ctx.author().id.to_string()
+    };
     Ok(SessionKey::new(
         "discord",
         guild_id,
         channel_id.to_string(),
         thread_id,
-        ctx.author().id.to_string(),
+        user_id,
     )
     .with_bot_id(ctx.serenity_context().cache.current_user().id.to_string()))
 }
