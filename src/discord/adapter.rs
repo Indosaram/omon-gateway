@@ -5,9 +5,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use poise::serenity_prelude as serenity;
 use serenity::all::{
-    ChannelId, ChannelType, CreateAttachment, CreateInteractionResponse,
+    ChannelId, ChannelType, CreateAllowedMentions, CreateAttachment, CreateInteractionResponse,
     CreateInteractionResponseMessage, CreateMessage, EditMessage, FullEvent, GatewayIntents,
-    Interaction, Message, MessageId, Typing,
+    HttpBuilder, Interaction, Message, MessageId, Typing,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -22,6 +22,16 @@ use crate::{
     DeliveryLedgerService, InboundEvent, MessageAttachment, OmonError, OutboundAction,
     OutboundDispatcher, Result, SessionKey,
 };
+
+/// Returns safe Discord `AllowedMentions` settings that permit user pings and
+/// reply mentions, but deny server-wide `@everyone`/`@here` and role pings by default.
+pub fn safe_allowed_mentions() -> CreateAllowedMentions {
+    CreateAllowedMentions::new()
+        .all_users(true)
+        .everyone(false)
+        .all_roles(false)
+        .replied_user(true)
+}
 
 /// Default debounce window for coalescing rapid client-split messages (~600ms).
 pub const DEFAULT_DEBOUNCE_DURATION: std::time::Duration = std::time::Duration::from_millis(600);
@@ -210,7 +220,10 @@ impl DiscordAdapter {
             | GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::DIRECT_MESSAGES
             | GatewayIntents::MESSAGE_CONTENT;
-        Ok(serenity::ClientBuilder::new(token.as_ref(), intents)
+        let http = HttpBuilder::new(token.as_ref())
+            .default_allowed_mentions(safe_allowed_mentions())
+            .build();
+        Ok(serenity::ClientBuilder::new_with_http(http, intents)
             .framework(framework)
             .await?)
     }
@@ -523,7 +536,11 @@ impl DiscordFileUploader for SerenityFileUploader {
         })?;
         let attachment = CreateAttachment::bytes(bytes, filename);
         channel
-            .send_files(&http, vec![attachment], CreateMessage::new())
+            .send_files(
+                &http,
+                vec![attachment],
+                CreateMessage::new().allowed_mentions(safe_allowed_mentions()),
+            )
             .await?;
         Ok(())
     }
@@ -665,7 +682,12 @@ impl OutboundDispatcher for DiscordEgress {
                 let channel = Self::target(&session)?;
                 for chunk in chunk_markdown(&content, DISCORD_MESSAGE_LIMIT) {
                     channel
-                        .send_message(&http, CreateMessage::new().content(chunk))
+                        .send_message(
+                            &http,
+                            CreateMessage::new()
+                                .content(chunk)
+                                .allowed_mentions(safe_allowed_mentions()),
+                        )
                         .await?;
                 }
             }
@@ -684,7 +706,13 @@ impl OutboundDispatcher for DiscordEgress {
                         ))
                     })?;
                 Self::target(&session)?
-                    .edit_message(&http, message_id, EditMessage::new().content(content))
+                    .edit_message(
+                        &http,
+                        message_id,
+                        EditMessage::new()
+                            .content(content)
+                            .allowed_mentions(safe_allowed_mentions()),
+                    )
                     .await?;
             }
             OutboundAction::DeleteMessage {
@@ -741,7 +769,8 @@ impl OutboundDispatcher for DiscordEgress {
                         &http,
                         CreateMessage::new()
                             .content(content)
-                            .components(approval_buttons(request_id)),
+                            .components(approval_buttons(request_id))
+                            .allowed_mentions(safe_allowed_mentions()),
                     )
                     .await?;
             }

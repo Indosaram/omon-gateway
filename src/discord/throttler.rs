@@ -7,6 +7,7 @@ use serenity::all::{ChannelId, CreateMessage, EditMessage, Http, MessageId};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+use super::adapter::safe_allowed_mentions;
 use crate::Result;
 
 pub const DISCORD_MESSAGE_LIMIT: usize = 2_000;
@@ -50,14 +51,25 @@ impl DiscordMessageTransport for SerenityMessageTransport {
         content: String,
     ) -> Result<()> {
         channel_id
-            .edit_message(&self.http, message_id, EditMessage::new().content(content))
+            .edit_message(
+                &self.http,
+                message_id,
+                EditMessage::new()
+                    .content(content)
+                    .allowed_mentions(safe_allowed_mentions()),
+            )
             .await?;
         Ok(())
     }
 
     async fn send_message(&self, channel_id: ChannelId, content: String) -> Result<MessageId> {
         let message = channel_id
-            .send_message(&self.http, CreateMessage::new().content(content))
+            .send_message(
+                &self.http,
+                CreateMessage::new()
+                    .content(content)
+                    .allowed_mentions(safe_allowed_mentions()),
+            )
             .await?;
         Ok(message.id)
     }

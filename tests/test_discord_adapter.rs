@@ -11,8 +11,8 @@ use omon_gateway::discord::adapter::{message_to_inbound, message_to_inbound_with
 use omon_gateway::discord::commands::is_user_allowed;
 use omon_gateway::{
     approval_buttons, chunk_markdown, is_authorized_clicker, parse_custom_id, render_user_prompt,
-    ApprovalDecision, ApprovalError, AttachmentDownloader, ChatMessage, Database,
-    DeliveryLedgerService, DiscordEgress, DiscordFileUploader, DiscordMessageTransport,
+    safe_allowed_mentions, ApprovalDecision, ApprovalError, AttachmentDownloader, ChatMessage,
+    Database, DeliveryLedgerService, DiscordEgress, DiscordFileUploader, DiscordMessageTransport,
     InboundEvent, LiveEditThrottler, LlmClient, LlmConfig, LlmProvider, MessageAttachment,
     OutboundAction, OutboundDispatcher, Result, SessionKey, SmartApprovalGuard,
     DISCORD_ATTACHMENT_MAX_BYTES,
@@ -200,6 +200,18 @@ async fn final_live_edit_deletes_surplus_chunk_messages() {
     let calls = transport.calls.lock().await;
     assert!(calls.iter().any(|call| matches!(call, Call::Send(_))));
     assert!(calls.contains(&Call::Delete(MessageId::new(99))));
+}
+
+#[test]
+fn test_safe_allowed_mentions() {
+    let mentions = safe_allowed_mentions();
+    let json = serde_json::to_value(&mentions).unwrap();
+
+    // Verify users allowed and replied_user enabled, but everyone and roles denied
+    assert_eq!(json["parse"], serde_json::json!(["users"]));
+    assert_eq!(json["replied_user"], serde_json::json!(true));
+    assert_eq!(json["roles"], serde_json::json!([]));
+    assert_eq!(json["users"], serde_json::json!([]));
 }
 
 #[test]
