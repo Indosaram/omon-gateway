@@ -6,6 +6,7 @@ pub mod error;
 pub mod ledger;
 pub mod memory;
 pub mod migrate;
+pub mod mirror;
 pub mod models;
 pub mod multiplexer;
 pub mod readiness;
@@ -21,6 +22,7 @@ pub use drain_control::*;
 pub use error::{OmonError, Result};
 pub use ledger::{DeliveryLedgerEntry, DeliveryLedgerService};
 pub use memory::{Memory, MemoryStore};
+pub use mirror::*;
 pub use models::*;
 pub use multiplexer::{
     parse_channel_prompts, parse_profile_routes, AgentRunner, ChannelPromptConfig,

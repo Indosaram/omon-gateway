@@ -1115,91 +1115,42 @@ pub async fn mirror_cron_delivery_to_session(
     destination: &crate::HermesOrigin,
     content: &str,
 ) -> Result<bool> {
-    let text = content.trim();
-    if text.is_empty() {
-        return Ok(false);
-    }
-
-    let session_key: Option<String> = if let Some(key) = job_session_key {
+    let target_session_key = if let Some(key) = job_session_key {
         let exists: Option<(String,)> =
             sqlx::query_as("SELECT session_key FROM sessions WHERE session_key = ? LIMIT 1")
                 .bind(key)
                 .fetch_optional(pool)
                 .await?;
-        exists.map(|(k,)| k)
-    } else {
-        None
-    };
-
-    let session_key = match session_key {
-        Some(k) => Some(k),
-        None => {
-            if destination.platform.eq_ignore_ascii_case("discord") {
-                if let Some(thread_id) = &destination.thread_id {
-                    let row: Option<(String,)> = sqlx::query_as(
-                        "SELECT session_key FROM sessions WHERE platform = 'discord' AND channel_id = ? AND thread_id = ? ORDER BY updated_at DESC LIMIT 1",
-                    )
-                    .bind(&destination.chat_id)
-                    .bind(thread_id)
-                    .fetch_optional(pool)
-                    .await?;
-                    if row.is_some() {
-                        row.map(|(k,)| k)
-                    } else {
-                        let row: Option<(String,)> = sqlx::query_as(
-                            "SELECT session_key FROM sessions WHERE platform = 'discord' AND channel_id = ? ORDER BY updated_at DESC LIMIT 1",
-                        )
-                        .bind(&destination.chat_id)
-                        .fetch_optional(pool)
-                        .await?;
-                        row.map(|(k,)| k)
-                    }
-                } else {
-                    let row: Option<(String,)> = sqlx::query_as(
-                        "SELECT session_key FROM sessions WHERE platform = 'discord' AND channel_id = ? ORDER BY updated_at DESC LIMIT 1",
-                    )
-                    .bind(&destination.chat_id)
-                    .fetch_optional(pool)
-                    .await?;
-                    row.map(|(k,)| k)
-                }
-            } else {
-                None
+        match exists {
+            Some((k,)) => Some(k),
+            None => {
+                crate::mirror::find_session_by_origin(
+                    pool,
+                    &destination.platform,
+                    &destination.chat_id,
+                    destination.thread_id.as_deref(),
+                    destination.user_id.as_deref(),
+                )
+                .await?
             }
         }
+    } else {
+        crate::mirror::find_session_by_origin(
+            pool,
+            &destination.platform,
+            &destination.chat_id,
+            destination.thread_id.as_deref(),
+            destination.user_id.as_deref(),
+        )
+        .await?
     };
 
-    let Some(target_session_key) = session_key else {
+    let Some(key) = target_session_key else {
         return Ok(false);
     };
 
-    let message_id = Uuid::new_v4().to_string();
-    let metadata = serde_json::json!({
-        "source": "cron",
-        "cron_job_id": job_id,
-    });
-    let metadata_str =
-        serde_json::to_string(&metadata).map_err(|e| OmonError::Database(e.to_string()))?;
-
-    let now = chrono::Utc::now();
-    sqlx::query(
-        "INSERT INTO messages (id, session_key, role, content, metadata_json, created_at) VALUES (?, ?, 'assistant', ?, ?, ?)",
-    )
-    .bind(&message_id)
-    .bind(&target_session_key)
-    .bind(text)
-    .bind(&metadata_str)
-    .bind(now)
-    .execute(pool)
-    .await?;
-
-    sqlx::query("UPDATE sessions SET updated_at = ? WHERE session_key = ?")
-        .bind(now)
-        .bind(&target_session_key)
-        .execute(pool)
-        .await?;
-
-    Ok(true)
+    let label = format!("cron:{job_id}");
+    crate::mirror::mirror_to_session(pool, &key, "assistant", content, Some(&label)).await
 }
 
 pub fn delivery_destinations(payload: &Value) -> Result<Vec<crate::HermesOrigin>> {
