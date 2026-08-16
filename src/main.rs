@@ -707,6 +707,7 @@ impl LiveAgentRunner {
         enabled_tools: Option<&[String]>,
         execution_tools: Option<&ToolRegistry>,
         stream_output: bool,
+        execution_llm: Option<&LlmClient>,
     ) -> Result<String> {
         if stream_output {
             self.streams.lock().remove(&session.key.storage_key());
@@ -756,13 +757,17 @@ impl LiveAgentRunner {
             let tools = execution_tools.unwrap_or(&self.tools);
             let tool_filter = enabled_tools.or(session.state.enabled_toolsets.as_deref());
             let definitions = Self::tool_definitions(tools, tool_filter);
-            let llm = match session.state.active_model.as_deref() {
-                Some(model) if model != self.llm.config().model => {
-                    let mut config = self.llm.config().clone();
-                    config.model = model.to_owned();
-                    LlmClient::new(config)?
+            let llm = if let Some(custom) = execution_llm {
+                custom.clone()
+            } else {
+                match session.state.active_model.as_deref() {
+                    Some(model) if model != self.llm.config().model => {
+                        let mut config = self.llm.config().clone();
+                        config.model = model.to_owned();
+                        LlmClient::new(config)?
+                    }
+                    _ => self.llm.clone(),
                 }
-                _ => self.llm.clone(),
             };
 
             loop {
@@ -1108,7 +1113,7 @@ impl AgentRunner for LiveAgentRunner {
                 .get("enabled_toolsets")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
         });
-        self.execute(session, event, enabled_tools.as_deref(), None, true)
+        self.execute(session, event, enabled_tools.as_deref(), None, true, None)
             .await
             .map(|_| ())
     }
@@ -1480,6 +1485,18 @@ impl CronTaskExecutor for AgentCronExecutor {
         let event = InboundEvent::message(session_key, format!("cron:{}", job.id), prompt);
         let execution_tools =
             build_cron_tools(&hermes, &self.runner.tools, &self.runner.workspace_root)?;
+        let cron_llm =
+            if hermes.provider.is_some() || hermes.base_url.is_some() || hermes.model.is_some() {
+                let config = build_cron_llm_config(
+                    self.runner.llm.config(),
+                    hermes.provider.as_deref(),
+                    hermes.base_url.as_deref(),
+                    hermes.model.as_deref(),
+                );
+                Some(LlmClient::new(config)?)
+            } else {
+                None
+            };
         let response = self
             .runner
             .execute(
@@ -1488,6 +1505,7 @@ impl CronTaskExecutor for AgentCronExecutor {
                 hermes.enabled_toolsets.as_deref(),
                 execution_tools.as_ref(),
                 false,
+                cron_llm.as_ref(),
             )
             .await?;
         if response.trim().is_empty() || omon_gateway::is_cron_silence_response(&response) {
@@ -1582,7 +1600,7 @@ async fn execute_native_cron(
                 .collect::<Vec<_>>()
         });
     let response = runner
-        .execute(&mut session, event, enabled.as_deref(), None, false)
+        .execute(&mut session, event, enabled.as_deref(), None, false, None)
         .await?;
     if response.trim().is_empty() || omon_gateway::is_cron_silence_response(&response) {
         Ok(None)
@@ -1842,6 +1860,44 @@ fn build_cron_tools(
     tools.register(TerminalTool::new(&workdir));
     tools.register(FileTool::new(&workdir));
     Ok(Some(tools))
+}
+
+fn parse_llm_provider(name: &str) -> Option<LlmProvider> {
+    let lower = name.trim().to_lowercase();
+    match lower.as_str() {
+        "openai" | "gpt" => Some(LlmProvider::OpenAi),
+        "anthropic" | "claude" => Some(LlmProvider::Anthropic),
+        "deepseek" => Some(LlmProvider::DeepSeek),
+        "ollama" => Some(LlmProvider::Ollama),
+        _ => None,
+    }
+}
+
+pub fn build_cron_llm_config(
+    base: &LlmConfig,
+    provider: Option<&str>,
+    base_url: Option<&str>,
+    model: Option<&str>,
+) -> LlmConfig {
+    let mut config = base.clone();
+
+    if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
+        config.model = m.trim().to_string();
+    }
+
+    if let Some(p) = provider.filter(|p| !p.trim().is_empty()) {
+        if let Some(parsed) = parse_llm_provider(p) {
+            config.provider = parsed;
+        } else {
+            warn!(provider = %p, "Unknown LLM provider override, keeping base provider");
+        }
+    }
+
+    if let Some(b) = base_url.filter(|b| !b.trim().is_empty()) {
+        config.base_url = Some(b.trim().to_string());
+    }
+
+    config
 }
 
 async fn run_cron_script(job: &HermesJob, script: &str, workspace_root: &Path) -> Result<String> {
@@ -2479,7 +2535,7 @@ mod runner_tests {
             omon_gateway::InboundEvent::message(session_key.clone(), "msg-silence", "Hello");
 
         let response = runner
-            .execute(&mut session, event, None, None, true)
+            .execute(&mut session, event, None, None, true, None)
             .await
             .unwrap();
         assert_eq!(response, "[SILENT]");
@@ -2527,7 +2583,7 @@ mod runner_tests {
         let event = omon_gateway::InboundEvent::message(session_key, "msg-1", "Run a tool");
 
         let response = runner
-            .execute(&mut session, event, None, None, false)
+            .execute(&mut session, event, None, None, false, None)
             .await
             .unwrap();
         assert_eq!(response, "Final result content");
@@ -2572,7 +2628,7 @@ mod runner_tests {
         let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-1", "Run a tool");
 
         let response = runner
-            .execute(&mut session, event, None, None, true)
+            .execute(&mut session, event, None, None, true, None)
             .await
             .unwrap();
         assert_eq!(response, "Final result content");
@@ -2658,7 +2714,7 @@ mod runner_tests {
         let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-1", "Run a tool");
 
         let response = runner
-            .execute(&mut session, event, None, None, true)
+            .execute(&mut session, event, None, None, true, None)
             .await
             .unwrap();
         assert_eq!(response, "Final result content");
@@ -2732,7 +2788,14 @@ mod runner_tests {
             omon_gateway::InboundEvent::message(session_key.clone(), "msg-2", "Run a tool");
 
         let response_non_stream = runner_non_stream
-            .execute(&mut session_non_stream, event_non_stream, None, None, false)
+            .execute(
+                &mut session_non_stream,
+                event_non_stream,
+                None,
+                None,
+                false,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(response_non_stream, "Final result content");
@@ -2818,7 +2881,7 @@ mod runner_tests {
             omon_gateway::InboundEvent::message(session_key.clone(), "msg-media", "Draw a chart");
 
         let response = runner
-            .execute(&mut session, event, None, None, true)
+            .execute(&mut session, event, None, None, true, None)
             .await
             .unwrap();
         assert!(response.contains("MEDIA:"));
@@ -2879,7 +2942,7 @@ mod runner_tests {
         );
 
         let response = runner
-            .execute(&mut session, event, None, None, true)
+            .execute(&mut session, event, None, None, true, None)
             .await
             .unwrap();
         assert!(response.contains("MEDIA:"));
@@ -2927,7 +2990,7 @@ mod runner_tests {
         let event = omon_gateway::InboundEvent::message(session_key, "msg-1", "Run a tool");
 
         let response = runner
-            .execute(&mut session, event, None, None, true)
+            .execute(&mut session, event, None, None, true, None)
             .await
             .unwrap();
         assert_eq!(response, "Final result content");
@@ -2975,7 +3038,9 @@ mod runner_tests {
         let mut session = omon_gateway::SessionContext::new(session_key.clone());
         let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-err", "Hello");
 
-        let result = runner.execute(&mut session, event, None, None, true).await;
+        let result = runner
+            .execute(&mut session, event, None, None, true, None)
+            .await;
         assert!(result.is_err(), "Expected error from 500 response");
 
         let actions = dispatcher.actions.lock().await.clone();
@@ -3112,7 +3177,7 @@ mod runner_tests {
             omon_gateway::InboundEvent::message(session_key.clone(), "msg-emit", "Hello obl");
 
         let response = runner
-            .execute(&mut session, event, None, None, true)
+            .execute(&mut session, event, None, None, true, None)
             .await
             .unwrap();
         assert_eq!(response, "Final result content");
@@ -3523,7 +3588,7 @@ mod runner_tests {
         let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-think", "Hello!");
 
         let response = runner
-            .execute(&mut session, event, None, None, true)
+            .execute(&mut session, event, None, None, true, None)
             .await
             .unwrap();
 
@@ -3609,7 +3674,7 @@ mod runner_tests {
         );
 
         let response = runner
-            .execute(&mut session, event, None, None, true)
+            .execute(&mut session, event, None, None, true, None)
             .await
             .unwrap();
 
@@ -3859,5 +3924,47 @@ mod runner_tests {
         );
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_build_cron_llm_config_overrides() {
+        let base = omon_gateway::LlmConfig::new(omon_gateway::LlmProvider::OpenAi, "gpt-4o-mini");
+
+        // 1. Override model only
+        let cfg1 = super::build_cron_llm_config(&base, None, None, Some("gpt-4o"));
+        assert_eq!(cfg1.model, "gpt-4o");
+        assert_eq!(cfg1.provider, omon_gateway::LlmProvider::OpenAi);
+        assert_eq!(cfg1.base_url, None);
+
+        // 2. Override provider only
+        let cfg2 = super::build_cron_llm_config(&base, Some("anthropic"), None, None);
+        assert_eq!(cfg2.provider, omon_gateway::LlmProvider::Anthropic);
+        assert_eq!(cfg2.model, "gpt-4o-mini");
+
+        // 3. Override base_url only
+        let cfg3 =
+            super::build_cron_llm_config(&base, None, Some("http://127.0.0.1:11434/api"), None);
+        assert_eq!(cfg3.base_url.as_deref(), Some("http://127.0.0.1:11434/api"));
+        assert_eq!(cfg3.model, "gpt-4o-mini");
+
+        // 4. Override all three
+        let cfg4 = super::build_cron_llm_config(
+            &base,
+            Some("deepseek"),
+            Some("https://api.deepseek.com/v1"),
+            Some("deepseek-chat"),
+        );
+        assert_eq!(cfg4.provider, omon_gateway::LlmProvider::DeepSeek);
+        assert_eq!(
+            cfg4.base_url.as_deref(),
+            Some("https://api.deepseek.com/v1")
+        );
+        assert_eq!(cfg4.model, "deepseek-chat");
+
+        // 5. Empty / whitespace overrides preserve base
+        let cfg5 = super::build_cron_llm_config(&base, Some("  "), Some(""), Some(" "));
+        assert_eq!(cfg5.model, "gpt-4o-mini");
+        assert_eq!(cfg5.provider, omon_gateway::LlmProvider::OpenAi);
+        assert_eq!(cfg5.base_url, None);
     }
 }
