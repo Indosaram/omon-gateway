@@ -90,10 +90,35 @@ mod tests {
             "delivery_ledger",
             "cron_jobs",
             "memories",
+            "cron_runs",
         ] {
             assert!(tables.contains(expected), "missing table {expected}");
         }
         assert!(tables.contains("_sqlx_migrations"));
+    }
+
+    #[tokio::test]
+    async fn migration_creates_cron_runs_indexes() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+
+        let rows = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'cron_runs'",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("indexes should be queryable");
+
+        let indexes: HashSet<String> = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+
+        assert!(indexes.contains("idx_cron_runs_job_status"));
+        assert!(indexes.contains("idx_cron_runs_job_attempt"));
+        assert!(indexes.contains("idx_cron_runs_job_started"));
+        assert!(indexes.contains("idx_cron_runs_active_lease"));
     }
 
     #[tokio::test]

@@ -1,0 +1,58 @@
+================================================================================
+Task Evidence: Cron Hardening (task-cron-hardening)
+Date: 2026-08-16
+Branch: main (omon-gateway)
+================================================================================
+
+1. Problem Diagnosis & Fix Summary:
+--------------------------------------------------------------------------------
+- Fix 1 (Next Run Advancement & Failure Backoff):
+  Implemented next_run advancement and exponential backoff on consecutive failures in CronScheduler::complete_failure.
+  - One-shot jobs (once:) are marked completed/disabled (enabled = 0, next_run_at = NULL).
+  - Recurring interval and cron jobs compute next_run_after_failure using exponential backoff (10s * 2^(failures-1), clamped between 10s and 3600s).
+  - next_run_at is strictly in the future: max(scheduled_next, now + backoff), preventing tight loop re-firings.
+  - Consecutive failures are queried atomically from recent cron_runs within the transaction.
+
+- Fix 2 (Database Indexing on cron_runs):
+  Added migration `migrations/0005_cron_runs_indexes.sql`:
+  - `idx_cron_runs_job_status ON cron_runs(job_id, status)`
+  - `idx_cron_runs_job_attempt ON cron_runs(job_id, attempt DESC)`
+  Accelerates MAX(attempt) subquery, lease active checks, and status filtering per schedule evaluation.
+
+- Fix 3 (Execution PATH Augmentation):
+  Implemented `build_augmented_path` and `augmented_path_from_environment` defaulting to prepend `/opt/homebrew/bin:/usr/local/bin` (configurable via OMON_EXTRA_PATH / EXTRA_PATH) while preserving inherited PATH.
+  Applied to:
+  - TerminalTool execution (src/tools/terminal.rs)
+  - McpTool stdio child process execution (src/tools/mcp.rs)
+  - Cron shell task executor (src/cron/scheduler.rs)
+  - Native cron script execution (src/main.rs)
+  - Hermes cron script execution (src/main.rs)
+
+2. Gate Results:
+--------------------------------------------------------------------------------
+- `cargo build` -> EXIT 0
+- `cargo test` -> EXIT 0 (63 unit tests, 7 main tests, 5 agent tool tests, 16 discord tests, 3 e2e stress tests, 3 migrate tests, 9 multiplexer tests, 7 voice cron tests: 113 total passed)
+- `cargo clippy --all-targets -- -D warnings` -> EXIT 0 (zero warnings)
+- `cargo fmt --check` -> EXIT 0 (clean formatting)
+
+3. New / Hardened Test Outputs:
+--------------------------------------------------------------------------------
+cron::scheduler tests:
+- failure_backoff_scales_exponentially_and_clamps: ok
+- next_run_after_failure_advances_interval_and_applies_backoff: ok
+- next_run_after_failure_cron_expression_respects_schedule_and_backoff: ok
+
+tools::terminal PATH tests:
+- build_augmented_path_prepends_extra_and_preserves_order: ok
+- build_augmented_path_deduplicates_segments: ok
+- build_augmented_path_handles_empty_and_missing: ok
+- augmented_path_from_environment_includes_default_homebrew_path: ok
+
+storage::db migration tests:
+- migration_creates_cron_runs_indexes: ok (verified idx_cron_runs_job_status and idx_cron_runs_job_attempt in sqlite_master)
+
+test_voice_cron integration tests:
+- failed_one_shot_due_run_disables_job_and_records_failed_lease: ok
+- failed_interval_advances_next_run_and_applies_backoff: ok
+- repeated_failures_scale_backoff_deterministically: ok (verifies attempt 1, attempt 2, attempt 3 backoff and 0 claimed jobs on immediate rerun)
+================================================================================

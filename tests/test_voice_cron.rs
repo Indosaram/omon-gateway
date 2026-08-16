@@ -113,7 +113,7 @@ async fn background_scheduler_executes_due_interval_and_notifies_channel() {
 }
 
 #[tokio::test]
-async fn failed_due_run_keeps_schedule_and_records_failed_lease() {
+async fn failed_one_shot_due_run_disables_job_and_records_failed_lease() {
     let database = Database::connect("sqlite::memory:").await.unwrap();
     let scheduler = CronScheduler::new(database.pool().clone(), Arc::new(FailingExecutor));
     let job = scheduler
@@ -135,10 +135,8 @@ async fn failed_due_run_keeps_schedule_and_records_failed_lease() {
     scheduler.shutdown().await;
 
     let updated = scheduler.get(&job.id).await.unwrap().unwrap();
-    assert!(updated.enabled);
-    assert!(updated
-        .next_run_at
-        .is_some_and(|next| next <= chrono::Utc::now()));
+    assert!(!updated.enabled);
+    assert!(updated.next_run_at.is_none());
     let (status, error): (String, Option<String>) = sqlx::query_as(
         "SELECT status, error FROM cron_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 1",
     )
@@ -148,6 +146,122 @@ async fn failed_due_run_keeps_schedule_and_records_failed_lease() {
     .unwrap();
     assert_eq!(status, "failed");
     assert!(error.is_some_and(|value| value.contains("intentional failure")));
+}
+
+#[tokio::test]
+async fn failed_interval_advances_next_run_and_applies_backoff() {
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let scheduler = CronScheduler::new(database.pool().clone(), Arc::new(FailingExecutor));
+    let job = scheduler
+        .register(CronJobSpec::new("interval:1m", json!({"content": "run"})))
+        .await
+        .unwrap();
+
+    let before_run = chrono::Utc::now();
+    let due = before_run - chrono::TimeDelta::seconds(1);
+    sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+        .bind(due)
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 1);
+    scheduler.shutdown().await;
+
+    let updated = scheduler.get(&job.id).await.unwrap().unwrap();
+    assert!(updated.enabled);
+    let next_run = updated.next_run_at.expect("next_run_at should be set");
+    // Next run must be strictly in the future (at least 60s from execution time)
+    assert!(next_run >= before_run + chrono::TimeDelta::seconds(55));
+
+    // Calling run_due_jobs immediately claims nothing (no tight loop!)
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn repeated_failures_scale_backoff_deterministically() {
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let scheduler = CronScheduler::new(database.pool().clone(), Arc::new(FailingExecutor));
+    let job = scheduler
+        .register(CronJobSpec::new("interval:1s", json!({"content": "run"})))
+        .await
+        .unwrap();
+
+    let wait_for_failure = |attempt: i64| {
+        let pool = database.pool().clone();
+        let job_id = job.id.clone();
+        async move {
+            for _ in 0..200 {
+                let status: Option<String> = sqlx::query_scalar(
+                    "SELECT status FROM cron_runs WHERE job_id = ? AND attempt = ? AND status = 'failed'",
+                )
+                .bind(&job_id)
+                .bind(attempt)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+                if status.is_some() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("timed out waiting for attempt {attempt} to record failure");
+        }
+    };
+
+    // 1st failure: backoff of 10s (exceeds 1s interval)
+    let t1 = chrono::Utc::now();
+    sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+        .bind(t1 - chrono::TimeDelta::seconds(1))
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 1);
+    wait_for_failure(1).await;
+
+    let job_after_1 = scheduler.get(&job.id).await.unwrap().unwrap();
+    let next1 = job_after_1.next_run_at.unwrap();
+    assert!(next1 >= t1 + chrono::TimeDelta::seconds(9));
+    assert!(next1 <= t1 + chrono::TimeDelta::seconds(15));
+
+    // 2nd failure: backoff of 20s
+    let t2 = chrono::Utc::now();
+    sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+        .bind(t2 - chrono::TimeDelta::seconds(1))
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 1);
+    wait_for_failure(2).await;
+
+    let job_after_2 = scheduler.get(&job.id).await.unwrap().unwrap();
+    let next2 = job_after_2.next_run_at.unwrap();
+    assert!(next2 >= t2 + chrono::TimeDelta::seconds(19));
+    assert!(next2 <= t2 + chrono::TimeDelta::seconds(25));
+
+    // 3rd failure: backoff of 40s
+    let t3 = chrono::Utc::now();
+    sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+        .bind(t3 - chrono::TimeDelta::seconds(1))
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 1);
+    wait_for_failure(3).await;
+
+    let job_after_3 = scheduler.get(&job.id).await.unwrap().unwrap();
+    let next3 = job_after_3.next_run_at.unwrap();
+    assert!(next3 >= t3 + chrono::TimeDelta::seconds(39));
+    assert!(next3 <= t3 + chrono::TimeDelta::seconds(45));
+
+    // Immediate run_due_jobs claims 0 because next_run_at is far in the future
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 0);
+
+    scheduler.shutdown().await;
 }
 
 #[tokio::test]

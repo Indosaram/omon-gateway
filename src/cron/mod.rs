@@ -2,8 +2,9 @@ mod scheduler;
 mod store;
 
 pub use scheduler::{
-    next_run, CronJob, CronJobSpec, CronNotification, CronScheduler, CronTaskExecutor,
-    PayloadTaskExecutor, ShellAndPayloadTaskExecutor,
+    failure_backoff_duration, next_run, next_run_after_failure, CronJob, CronJobSpec,
+    CronNotification, CronScheduler, CronTaskExecutor, PayloadTaskExecutor,
+    ShellAndPayloadTaskExecutor, MAX_RETRY_INTERVAL, MIN_RETRY_INTERVAL,
 };
 pub use store::{
     cron_runs_retention_days_from_environment, prune_terminal_cron_runs, HermesJob, HermesOrigin,

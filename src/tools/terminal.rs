@@ -194,6 +194,10 @@ impl TerminalTool {
         let cwd = self.working_directory(args.get("cwd").and_then(Value::as_str))?;
         let executable = self.executable(program, &cwd)?;
         let mut command = Command::new(executable.as_os_str());
+        let augmented_path = augmented_path_from_environment();
+        if !augmented_path.is_empty() {
+            command.env("PATH", &augmented_path);
+        }
         command
             .args(process_args)
             .current_dir(cwd)
@@ -223,6 +227,45 @@ impl TerminalTool {
             "stderr_truncated": stderr_truncated
         }))
     }
+}
+
+pub const DEFAULT_EXTRA_PATH: &str = "/opt/homebrew/bin:/usr/local/bin";
+
+/// Builds an augmented PATH string with `extra` paths prepended ahead of `current`
+/// inherited paths, deduplicating path segments while preserving order.
+pub fn build_augmented_path(extra: Option<&str>, current: Option<&str>) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let extra_iter = extra
+        .unwrap_or("")
+        .split(':')
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let current_iter = current
+        .unwrap_or("")
+        .split(':')
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    for item in extra_iter.chain(current_iter) {
+        if seen.insert(item) {
+            parts.push(item);
+        }
+    }
+
+    parts.join(":")
+}
+
+/// Returns the augmented PATH string combining `OMON_EXTRA_PATH` / `EXTRA_PATH`
+/// (defaulting to [`DEFAULT_EXTRA_PATH`]) prepended to the system `PATH`.
+pub fn augmented_path_from_environment() -> String {
+    let extra = std::env::var("OMON_EXTRA_PATH")
+        .or_else(|_| std::env::var("EXTRA_PATH"))
+        .ok();
+    let extra_str = extra.as_deref().unwrap_or(DEFAULT_EXTRA_PATH);
+    let current = std::env::var("PATH").ok();
+    build_augmented_path(Some(extra_str), current.as_deref())
 }
 
 enum PathBufOrName {
@@ -520,5 +563,44 @@ mod approval_tests {
 
         assert!(result["success"].as_bool().unwrap());
         assert_eq!(approver.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn build_augmented_path_prepends_extra_and_preserves_order() {
+        let result = super::build_augmented_path(
+            Some("/opt/homebrew/bin:/usr/local/bin"),
+            Some("/usr/bin:/bin"),
+        );
+        assert_eq!(result, "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+    }
+
+    #[test]
+    fn build_augmented_path_deduplicates_segments() {
+        let result = super::build_augmented_path(
+            Some("/opt/homebrew/bin:/usr/local/bin"),
+            Some("/usr/bin:/opt/homebrew/bin:/bin:/usr/local/bin"),
+        );
+        assert_eq!(result, "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+    }
+
+    #[test]
+    fn build_augmented_path_handles_empty_and_missing() {
+        assert_eq!(
+            super::build_augmented_path(Some("/opt/homebrew/bin"), None),
+            "/opt/homebrew/bin"
+        );
+        assert_eq!(
+            super::build_augmented_path(None, Some("/usr/bin")),
+            "/usr/bin"
+        );
+        assert_eq!(super::build_augmented_path(None, None), "");
+        assert_eq!(super::build_augmented_path(Some(""), Some("")), "");
+    }
+
+    #[test]
+    fn augmented_path_from_environment_includes_default_homebrew_path() {
+        let path = super::augmented_path_from_environment();
+        assert!(path.contains("/opt/homebrew/bin"));
+        assert!(path.contains("/usr/local/bin"));
     }
 }

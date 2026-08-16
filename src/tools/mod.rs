@@ -19,7 +19,10 @@ pub use cron::CronTool;
 pub use file::FileTool;
 pub use mcp::{McpClientTool, McpTool, McpTransport};
 pub use skills::SkillsTool;
-pub use terminal::{ApprovalPolicy, TerminalTool};
+pub use terminal::{
+    augmented_path_from_environment, build_augmented_path, ApprovalPolicy, TerminalTool,
+    DEFAULT_EXTRA_PATH,
+};
 pub use web::{WebFetchTool, WebSearchTool};
 
 #[async_trait]

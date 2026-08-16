@@ -87,14 +87,15 @@ impl CronTaskExecutor for ShellAndPayloadTaskExecutor {
             .and_then(Value::as_str)
         {
             tracing::info!(job_id = %job.id, command = %cmd, "Executing cron shell command");
-            let output = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .output()
-                .await
-                .map_err(|e| {
-                    OmonError::ToolExecution(format!("failed to execute cron command: {e}"))
-                })?;
+            let mut command = tokio::process::Command::new("sh");
+            command.arg("-c").arg(cmd);
+            let augmented_path = crate::tools::augmented_path_from_environment();
+            if !augmented_path.is_empty() {
+                command.env("PATH", augmented_path);
+            }
+            let output = command.output().await.map_err(|e| {
+                OmonError::ToolExecution(format!("failed to execute cron command: {e}"))
+            })?;
 
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -621,7 +622,8 @@ impl CronScheduler {
 
     async fn complete_failure(&self, claim: &CronClaim, error: &OmonError) -> Result<()> {
         let now = Utc::now();
-        sqlx::query(
+        let mut transaction = self.pool.begin().await?;
+        let completed = sqlx::query(
             "UPDATE cron_runs
              SET status = 'failed', completed_at = ?, lease_expires_at = ?, error = ?
              WHERE run_id = ? AND claim_token = ? AND status = 'running'",
@@ -631,8 +633,97 @@ impl CronScheduler {
         .bind(error.to_string())
         .bind(&claim.run_id)
         .bind(&claim.claim_token)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        if completed.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Err(OmonError::Database(format!(
+                "cron claim {} is no longer active",
+                claim.claim_token
+            )));
+        }
+
+        if claim.advance_schedule {
+            if claim.job.expression.starts_with("once:") {
+                sqlx::query(
+                    "UPDATE cron_jobs
+                     SET enabled = 0, next_run_at = NULL, updated_at = ?
+                     WHERE id = ? AND expression = ? AND payload_json = ?",
+                )
+                .bind(now)
+                .bind(&claim.job.id)
+                .bind(&claim.job.expression)
+                .bind(&claim.job.payload_json)
+                .execute(&mut *transaction)
+                .await?;
+            } else {
+                let recent_statuses: Vec<String> = sqlx::query_scalar(
+                    "SELECT status FROM cron_runs
+                     WHERE job_id = ?
+                     ORDER BY started_at DESC, run_id DESC
+                     LIMIT 50",
+                )
+                .bind(&claim.job.id)
+                .fetch_all(&mut *transaction)
+                .await?;
+
+                let consecutive_failures = recent_statuses
+                    .iter()
+                    .take_while(|status| status.as_str() == "failed")
+                    .count() as u32;
+
+                let next_result =
+                    next_run_after_failure(&claim.job.expression, now, consecutive_failures);
+                match next_result {
+                    Ok(Some(next)) => {
+                        sqlx::query(
+                            "UPDATE cron_jobs
+                             SET next_run_at = ?, updated_at = ?
+                             WHERE id = ? AND enabled = 1 AND expression = ? AND payload_json = ?",
+                        )
+                        .bind(next)
+                        .bind(now)
+                        .bind(&claim.job.id)
+                        .bind(&claim.job.expression)
+                        .bind(&claim.job.payload_json)
+                        .execute(&mut *transaction)
+                        .await?;
+                    }
+                    Ok(None) => {
+                        sqlx::query(
+                            "UPDATE cron_jobs
+                             SET enabled = 0, next_run_at = NULL, updated_at = ?
+                             WHERE id = ? AND expression = ? AND payload_json = ?",
+                        )
+                        .bind(now)
+                        .bind(&claim.job.id)
+                        .bind(&claim.job.expression)
+                        .bind(&claim.job.payload_json)
+                        .execute(&mut *transaction)
+                        .await?;
+                    }
+                    Err(calc_err) => {
+                        tracing::error!(
+                            %calc_err,
+                            job_id = %claim.job.id,
+                            "failed to compute next run after failure, disabling cron job"
+                        );
+                        sqlx::query(
+                            "UPDATE cron_jobs
+                             SET enabled = 0, next_run_at = NULL, updated_at = ?
+                             WHERE id = ? AND expression = ? AND payload_json = ?",
+                        )
+                        .bind(now)
+                        .bind(&claim.job.id)
+                        .bind(&claim.job.expression)
+                        .bind(&claim.job.payload_json)
+                        .execute(&mut *transaction)
+                        .await?;
+                    }
+                }
+            }
+        }
+        transaction.commit().await?;
         self.wake.notify_one();
         Ok(())
     }
@@ -806,4 +897,103 @@ fn parse_interval(expression: &str) -> Result<Option<Duration>> {
         }
     };
     Ok(Some(duration))
+}
+
+pub const MIN_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+pub const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(3600);
+
+pub fn failure_backoff_duration(consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return Duration::ZERO;
+    }
+    let exponent = (consecutive_failures - 1).min(10);
+    let multiplier = 1u64.checked_shl(exponent).unwrap_or(1024);
+    let seconds = (10u64.saturating_mul(multiplier)).clamp(10, 3600);
+    Duration::from_secs(seconds)
+}
+
+pub fn next_run_after_failure(
+    expression: &str,
+    now: DateTime<Utc>,
+    consecutive_failures: u32,
+) -> Result<Option<DateTime<Utc>>> {
+    if expression.starts_with("once:") {
+        return Ok(None);
+    }
+    let scheduled_next = next_run(expression, now)?;
+    let backoff = failure_backoff_duration(consecutive_failures);
+    let backoff_delta = TimeDelta::from_std(backoff)
+        .map_err(|_| OmonError::Config("backoff duration out of range".into()))?;
+    let backoff_next = now + backoff_delta;
+    Ok(Some(std::cmp::max(scheduled_next, backoff_next)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_backoff_scales_exponentially_and_clamps() {
+        assert_eq!(failure_backoff_duration(0), Duration::ZERO);
+        assert_eq!(failure_backoff_duration(1), Duration::from_secs(10));
+        assert_eq!(failure_backoff_duration(2), Duration::from_secs(20));
+        assert_eq!(failure_backoff_duration(3), Duration::from_secs(40));
+        assert_eq!(failure_backoff_duration(4), Duration::from_secs(80));
+        assert_eq!(failure_backoff_duration(5), Duration::from_secs(160));
+        assert_eq!(failure_backoff_duration(6), Duration::from_secs(320));
+        assert_eq!(failure_backoff_duration(7), Duration::from_secs(640));
+        assert_eq!(failure_backoff_duration(8), Duration::from_secs(1280));
+        assert_eq!(failure_backoff_duration(9), Duration::from_secs(2560));
+        assert_eq!(failure_backoff_duration(10), Duration::from_secs(3600));
+        assert_eq!(failure_backoff_duration(100), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn next_run_after_failure_advances_interval_and_applies_backoff() {
+        let now = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // interval:1s with 1 failure -> backoff of 10s wins over 1s schedule
+        let next1 = next_run_after_failure("interval:1s", now, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next1, now + TimeDelta::seconds(10));
+
+        // interval:1s with 2 failures -> backoff of 20s wins over 1s schedule
+        let next2 = next_run_after_failure("interval:1s", now, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next2, now + TimeDelta::seconds(20));
+
+        // interval:1h with 1 failure -> schedule (1h) wins over backoff (10s)
+        let next_1h = next_run_after_failure("interval:1h", now, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next_1h, now + TimeDelta::hours(1));
+
+        // once: expression returns None on failure (job should finish)
+        let next_once = next_run_after_failure("once:2026-08-16T12:00:00Z", now, 1).unwrap();
+        assert!(next_once.is_none());
+    }
+
+    #[test]
+    fn next_run_after_failure_cron_expression_respects_schedule_and_backoff() {
+        let now = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Cron running every minute (next schedule = 12:01:00 = 60s)
+        // Failure 1 backoff is 10s, so schedule (60s) wins
+        let next1 = next_run_after_failure("* * * * *", now, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next1, now + TimeDelta::seconds(60));
+
+        // Failure 5 backoff is 160s, so backoff (160s) wins over schedule (60s)
+        let next5 = next_run_after_failure("* * * * *", now, 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next5, now + TimeDelta::seconds(160));
+    }
 }

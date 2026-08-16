@@ -96,6 +96,10 @@ impl McpClientTool {
         request: &Value,
     ) -> Result<Value, OmonError> {
         let mut command = Command::new(program);
+        let augmented_path = crate::tools::augmented_path_from_environment();
+        if !augmented_path.is_empty() {
+            command.env("PATH", augmented_path);
+        }
         command
             .args(args)
             .stdin(Stdio::piped())

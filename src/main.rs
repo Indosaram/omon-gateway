@@ -9,13 +9,14 @@ use futures_util::StreamExt;
 use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
-    cron_runs_retention_days_from_environment, prune_terminal_cron_runs, render_user_prompt,
-    AgentRunner, ApprovalPolicy, AttachmentDownloader, ChatMessage, CronJob, CronScheduler,
-    CronTaskExecutor, CronTool, DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool,
-    HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool,
-    MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher, PoiseData,
-    Result, ScaleToZero, SessionContext, SessionKey, SessionMultiplexer, SmartApprovalGuard,
-    TerminalTool, ToolDefinition, ToolRegistry,
+    augmented_path_from_environment, cron_runs_retention_days_from_environment,
+    prune_terminal_cron_runs, render_user_prompt, AgentRunner, ApprovalPolicy,
+    AttachmentDownloader, ChatMessage, CronJob, CronScheduler, CronTaskExecutor, CronTool,
+    DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool, HermesJob,
+    HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore,
+    MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher, PoiseData, Result,
+    ScaleToZero, SessionContext, SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool,
+    ToolDefinition, ToolRegistry,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -654,20 +655,25 @@ async fn execute_native_cron(
     let script_output =
         if let Some(script) = payload.get("script").and_then(serde_json::Value::as_str) {
             let workspace = canonical_directory(&runner.workspace_root, "workspace root")?;
-            let output = tokio::time::timeout(
-                std::time::Duration::from_secs(15 * 60),
-                tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(script)
-                    .current_dir(workspace)
-                    .kill_on_drop(true)
-                    .output(),
-            )
-            .await
-            .map_err(|_| OmonError::ToolExecution(format!("cron script timed out for {}", job.id)))?
-            .map_err(|error| {
-                OmonError::ToolExecution(format!("failed to execute cron script: {error}"))
-            })?;
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(script)
+                .current_dir(workspace)
+                .kill_on_drop(true);
+            let augmented_path = augmented_path_from_environment();
+            if !augmented_path.is_empty() {
+                command.env("PATH", augmented_path);
+            }
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(15 * 60), command.output())
+                    .await
+                    .map_err(|_| {
+                        OmonError::ToolExecution(format!("cron script timed out for {}", job.id))
+                    })?
+                    .map_err(|error| {
+                        OmonError::ToolExecution(format!("failed to execute cron script: {error}"))
+                    })?;
             if !output.status.success() {
                 return Err(OmonError::ToolExecution(format!(
                     "cron script failed with {:?}: {}",
@@ -856,6 +862,10 @@ async fn run_cron_script(job: &HermesJob, script: &str, workspace_root: &Path) -
         command.arg(&path);
         command
     };
+    let augmented_path = augmented_path_from_environment();
+    if !augmented_path.is_empty() {
+        command.env("PATH", augmented_path);
+    }
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(15 * 60),
         command.current_dir(workdir).kill_on_drop(true).output(),
