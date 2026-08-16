@@ -378,6 +378,7 @@ struct Config {
     processing_reactions: bool,
     approval_policy: ApprovalPolicy,
     approval_timeout_secs: u64,
+    approval_mentions: bool,
     profile_routes: Vec<ProfileRoute>,
 }
 
@@ -484,6 +485,10 @@ impl Config {
             approval_policy: ApprovalPolicy::parse(optional_env("APPROVAL_MODE").as_deref()),
             approval_timeout_secs: approval_timeout_secs_from(
                 optional_env("APPROVAL_TIMEOUT_SECS").as_deref(),
+            ),
+            approval_mentions: parse_bool_from(
+                optional_env("DISCORD_APPROVAL_MENTIONS").as_deref(),
+                false,
             ),
             profile_routes: parse_profile_routes(
                 &optional_env("DISCORD_PROFILE_ROUTES").unwrap_or_default(),
@@ -1860,10 +1865,10 @@ async fn run_gateway() -> Result<()> {
     }
     let default_bot_id = default_bot_id
         .ok_or_else(|| OmonError::Config("no Discord bot identities were configured".into()))?;
-    let discord_egress = Arc::new(DiscordEgress::with_bot_clients(
-        default_bot_id.clone(),
-        bot_http_clients,
-    )?);
+    let discord_egress = Arc::new(
+        DiscordEgress::with_bot_clients(default_bot_id.clone(), bot_http_clients)?
+            .with_approval_mentions(config.allowed_users.clone(), config.approval_mentions),
+    );
     shared_dispatcher.set(discord_egress.clone()).await;
     approval_requester
         .set_dispatcher(discord_egress.clone())
@@ -1909,6 +1914,7 @@ async fn run_gateway() -> Result<()> {
     poise_data.channel_context = config.channel_context;
     poise_data.channel_context_limit = config.channel_context_limit;
     poise_data.processing_reactions = config.processing_reactions;
+    poise_data.approval_mentions = config.approval_mentions;
     poise_data.attachment_downloader = Some(AttachmentDownloader::new(&config.workspace_root)?);
     poise_data.primary_bot_id = Some(default_bot_id.parse().map_err(|_| {
         OmonError::Config(format!(

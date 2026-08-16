@@ -1026,6 +1026,8 @@ pub struct DiscordEgress {
     typing: Arc<Mutex<HashMap<String, Typing>>>,
     file_uploader: Arc<dyn DiscordFileUploader>,
     approval_messages: Arc<Mutex<HashMap<Uuid, ApprovalMessageTarget>>>,
+    allowed_users: Vec<u64>,
+    approval_mentions: bool,
 }
 
 impl DiscordEgress {
@@ -1042,6 +1044,8 @@ impl DiscordEgress {
             typing: Arc::new(Mutex::new(HashMap::new())),
             file_uploader: Arc::new(SerenityFileUploader),
             approval_messages: Arc::new(Mutex::new(HashMap::new())),
+            allowed_users: Vec::new(),
+            approval_mentions: false,
         }
     }
 
@@ -1062,7 +1066,15 @@ impl DiscordEgress {
             typing: Arc::new(Mutex::new(HashMap::new())),
             file_uploader: Arc::new(SerenityFileUploader),
             approval_messages: Arc::new(Mutex::new(HashMap::new())),
+            allowed_users: Vec::new(),
+            approval_mentions: false,
         })
+    }
+
+    pub fn with_approval_mentions(mut self, allowed_users: Vec<u64>, enabled: bool) -> Self {
+        self.allowed_users = allowed_users;
+        self.approval_mentions = enabled;
+        self
     }
 
     pub async fn record_approval_message(
@@ -1336,7 +1348,12 @@ impl OutboundDispatcher for DiscordEgress {
             } => {
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
-                let content = build_approval_content(&command, &reason);
+                let content = build_approval_content_with_mentions(
+                    &command,
+                    &reason,
+                    &self.allowed_users,
+                    self.approval_mentions,
+                );
                 let embed = build_approval_embed(&command, &reason);
                 let msg = channel
                     .send_message(
@@ -1420,6 +1437,33 @@ pub fn build_approval_content(command: &str, reason: &str) -> String {
     let budget = APPROVAL_CONTENT_LIMIT.saturating_sub(prefix.len() + suffix.len());
     let cmd_display = truncate_approval_command(command, budget);
     format!("{prefix}{cmd_display}{suffix}")
+}
+
+pub fn build_approval_mentions(allowed_users: &[u64], enabled: bool) -> Option<String> {
+    if !enabled || allowed_users.is_empty() {
+        return None;
+    }
+    let mut sorted_users = allowed_users.to_vec();
+    sorted_users.sort_unstable();
+    let mentions: Vec<String> = sorted_users
+        .into_iter()
+        .map(|uid| format!("<@{uid}>"))
+        .collect();
+    Some(mentions.join(" "))
+}
+
+pub fn build_approval_content_with_mentions(
+    command: &str,
+    reason: &str,
+    allowed_users: &[u64],
+    mentions_enabled: bool,
+) -> String {
+    let plain_content = build_approval_content(command, reason);
+    if let Some(mentions) = build_approval_mentions(allowed_users, mentions_enabled) {
+        format!("{mentions}\n\n{plain_content}")
+    } else {
+        plain_content
+    }
 }
 
 pub fn is_authorized_clicker(user_id: u64, allowed: &[u64]) -> bool {
@@ -1880,5 +1924,47 @@ mod tests {
 
         assert_eq!(egress.approval_message_count().await, 0);
         assert!(egress.get_approval_message(&req_id).await.is_none());
+    }
+
+    #[test]
+    fn test_build_approval_mentions() {
+        // Disabled -> None
+        assert_eq!(build_approval_mentions(&[12345, 67890], false), None);
+
+        // Enabled but empty allowed users -> None
+        assert_eq!(build_approval_mentions(&[], true), None);
+
+        // Single user
+        assert_eq!(
+            build_approval_mentions(&[12345], true),
+            Some("<@12345>".to_string())
+        );
+
+        // Multiple users sorted
+        assert_eq!(
+            build_approval_mentions(&[99999, 11111, 55555], true),
+            Some("<@11111> <@55555> <@99999>".to_string())
+        );
+
+        // Content with mentions
+        let content = build_approval_content_with_mentions(
+            "rm -rf /tmp/test",
+            "recursive delete",
+            &[12345, 67890],
+            true,
+        );
+        assert!(content.starts_with("<@12345> <@67890>\n\n"));
+        assert!(content.contains("⚠️ **Approval Required**"));
+        assert!(content.contains("rm -rf /tmp/test"));
+
+        // Content without mentions
+        let content_no_mentions = build_approval_content_with_mentions(
+            "rm -rf /tmp/test",
+            "recursive delete",
+            &[12345, 67890],
+            false,
+        );
+        assert!(!content_no_mentions.starts_with("<@"));
+        assert!(content_no_mentions.starts_with("⚠️ **Approval Required**"));
     }
 }
