@@ -265,7 +265,13 @@ pub fn message_to_inbound_with_config(
         }
     } else {
         let is_implicit_response_channel = is_dm || is_thread || is_free_channel;
-        if !is_implicit_response_channel || primary_bot_id != Some(bot_user_id.get()) {
+        if !is_implicit_response_channel {
+            return None;
+        }
+        // Guild threads and free-response channels are visible to every bot, so only
+        // the primary bot auto-responds there to avoid duplicate replies. DMs are 1:1
+        // per bot, so each bot must always answer its own DMs.
+        if !is_dm && primary_bot_id != Some(bot_user_id.get()) {
             return None;
         }
     }

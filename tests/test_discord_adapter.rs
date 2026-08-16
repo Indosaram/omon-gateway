@@ -263,7 +263,7 @@ fn converts_serenity_dm_mentions_threads_and_attachments() {
 }
 
 #[test]
-fn only_primary_bot_owns_unmentioned_threads_dms_and_free_channels() {
+fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
     let primary = UserId::new(42);
     let secondary = UserId::new(84);
     let thread = message_fixture(Some(9), "continue", Vec::new());
@@ -287,18 +287,16 @@ fn only_primary_bot_owns_unmentioned_threads_dms_and_free_channels() {
     )
     .is_none());
 
-    let dm = message_fixture(None, "hello", Vec::new());
+    let free = message_fixture(Some(9), "hello", Vec::new());
     assert!(message_to_inbound_with_config(
-        &dm,
-        secondary,
-        Some(ChannelType::Private),
-        &[],
+        &free,
+        primary,
+        Some(ChannelType::Text),
+        &[7],
         &[],
         Some(primary.get()),
     )
-    .is_none());
-
-    let free = message_fixture(Some(9), "hello", Vec::new());
+    .is_some());
     assert!(message_to_inbound_with_config(
         &free,
         secondary,
@@ -308,6 +306,46 @@ fn only_primary_bot_owns_unmentioned_threads_dms_and_free_channels() {
         Some(primary.get()),
     )
     .is_none());
+}
+
+#[test]
+fn every_bot_answers_its_own_direct_messages_regardless_of_primary_bot() {
+    let primary = UserId::new(42);
+    let secondary = UserId::new(84);
+    let dm = message_fixture(None, "hello", Vec::new());
+
+    let non_primary_event = message_to_inbound_with_config(
+        &dm,
+        secondary,
+        Some(ChannelType::Private),
+        &[],
+        &[],
+        Some(primary.get()),
+    );
+    assert!(non_primary_event.is_some());
+    assert_eq!(
+        non_primary_event
+            .as_ref()
+            .unwrap()
+            .session
+            .bot_id
+            .as_deref(),
+        Some("84")
+    );
+
+    let primary_event = message_to_inbound_with_config(
+        &dm,
+        primary,
+        Some(ChannelType::Private),
+        &[],
+        &[],
+        Some(primary.get()),
+    );
+    assert!(primary_event.is_some());
+    assert_eq!(
+        primary_event.as_ref().unwrap().session.bot_id.as_deref(),
+        Some("42")
+    );
 }
 
 #[test]
