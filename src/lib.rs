@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod cron;
 pub mod discord;
+pub mod drain_control;
 pub mod error;
 pub mod ledger;
 pub mod memory;
@@ -15,6 +16,7 @@ pub mod voice;
 pub use agent::*;
 pub use cron::*;
 pub use discord::*;
+pub use drain_control::*;
 pub use error::{OmonError, Result};
 pub use ledger::{DeliveryLedgerEntry, DeliveryLedgerService};
 pub use memory::{Memory, MemoryStore};

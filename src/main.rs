@@ -2328,6 +2328,13 @@ async fn run_gateway() -> Result<()> {
         join_set.spawn(async move { client.start().await });
     }
 
+    let drain_watcher = omon_gateway::DrainWatcher::new(
+        config.workspace_root.clone(),
+        std::time::Duration::from_secs(3),
+    );
+    let mut drain_rx = drain_watcher.receiver();
+    let _drain_handle = drain_watcher.spawn();
+
     tokio::select! {
         Some(res) = join_set.join_next() => {
             if let Ok(Err(err)) = res {
@@ -2340,6 +2347,15 @@ async fn run_gateway() -> Result<()> {
             let _ = multiplexer.mark_in_flight_resume_pending().await;
             for sm in shard_managers {
                 sm.shutdown_all().await;
+            }
+        }
+        changed = drain_rx.changed() => {
+            if changed.is_ok() && *drain_rx.borrow() {
+                warn!("drain request detected via .drain_request.json marker; shutting down gracefully");
+                let _ = multiplexer.mark_in_flight_resume_pending().await;
+                for sm in shard_managers {
+                    sm.shutdown_all().await;
+                }
             }
         }
     }
