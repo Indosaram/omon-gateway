@@ -1,10 +1,41 @@
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::SessionKey;
+
+static TIMESTAMP_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:\[(?:[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?: [A-Za-z0-9_+\-/: ]+)?|\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*)+").unwrap()
+});
+
+pub fn format_message_timestamp(dt: DateTime<Utc>) -> String {
+    format!("[{}]", dt.format("%a %Y-%m-%d %H:%M:%S UTC"))
+}
+
+pub fn strip_leading_message_timestamps(s: &str) -> String {
+    if let Some(mat) = TIMESTAMP_PREFIX_RE.find(s) {
+        if mat.start() == 0 {
+            return s[mat.end()..].to_string();
+        }
+    }
+    s.to_string()
+}
+
+pub fn message_timestamps_enabled() -> bool {
+    std::env::var("DISCORD_MESSAGE_TIMESTAMPS")
+        .ok()
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageAttachment {
@@ -51,8 +82,20 @@ pub struct InboundEvent {
 }
 
 pub fn render_user_prompt(event: &InboundEvent) -> String {
+    let clean_content = strip_leading_message_timestamps(&event.content);
+    let prompt_body = if message_timestamps_enabled() {
+        let ts = format_message_timestamp(event.received_at);
+        if clean_content.is_empty() {
+            String::new()
+        } else {
+            format!("{ts} {clean_content}")
+        }
+    } else {
+        clean_content
+    };
+
     if event.attachments.is_empty() {
-        return event.content.clone();
+        return prompt_body;
     }
 
     let attachments = event
@@ -81,10 +124,10 @@ pub fn render_user_prompt(event: &InboundEvent) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    if event.content.trim().is_empty() {
+    if prompt_body.trim().is_empty() {
         attachments
     } else {
-        format!("{}\n\n{attachments}", event.content)
+        format!("{prompt_body}\n\n{attachments}")
     }
 }
 
@@ -177,9 +220,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        format_inlined_text, reaction_emoji_for_outcome, render_user_prompt, InboundEvent,
-        MessageAttachment, OutboundAction, StreamChunk, PROCESSING_FAILURE_EMOJI,
-        PROCESSING_START_EMOJI, PROCESSING_SUCCESS_EMOJI,
+        format_inlined_text, format_message_timestamp, reaction_emoji_for_outcome,
+        render_user_prompt, strip_leading_message_timestamps, InboundEvent, MessageAttachment,
+        OutboundAction, StreamChunk, Utc, PROCESSING_FAILURE_EMOJI, PROCESSING_START_EMOJI,
+        PROCESSING_SUCCESS_EMOJI,
     };
     use crate::models::SessionKey;
 
@@ -285,6 +329,65 @@ mod tests {
     }
 
     #[test]
+    fn test_format_message_timestamp() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2026, 4, 28, 13, 40, 53).unwrap();
+        assert_eq!(
+            format_message_timestamp(dt),
+            "[Tue 2026-04-28 13:40:53 UTC]"
+        );
+    }
+
+    #[test]
+    fn test_strip_leading_message_timestamps() {
+        assert_eq!(
+            strip_leading_message_timestamps("[Tue 2026-04-28 13:40:53 UTC] hello world"),
+            "hello world"
+        );
+        assert_eq!(
+            strip_leading_message_timestamps("[Tue 2026-04-28 13:40:53 CEST] hello world"),
+            "hello world"
+        );
+        assert_eq!(
+            strip_leading_message_timestamps("[2026-04-13T17:02:06+02:00] hello world"),
+            "hello world"
+        );
+        assert_eq!(
+            strip_leading_message_timestamps("[2026-04-13T17:02:06Z] hello world"),
+            "hello world"
+        );
+        // Multiple stacked timestamps
+        assert_eq!(
+            strip_leading_message_timestamps(
+                "[Tue 2026-04-28 13:40:53 UTC] [2026-04-13T17:02:06+0200]  actual message"
+            ),
+            "actual message"
+        );
+        // Plain text without timestamps
+        assert_eq!(
+            strip_leading_message_timestamps("hello [Tue 2026-04-28 13:40:53 UTC]"),
+            "hello [Tue 2026-04-28 13:40:53 UTC]"
+        );
+        assert_eq!(strip_leading_message_timestamps(""), "");
+    }
+
+    #[test]
+    fn test_timestamp_strip_format_idempotency() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2026, 4, 28, 13, 40, 53).unwrap();
+        let formatted = format_message_timestamp(dt);
+        let raw = "user query";
+        let turn1 = format!("{formatted} {raw}");
+        let clean1 = strip_leading_message_timestamps(&turn1);
+        assert_eq!(clean1, raw);
+
+        // Turn 2 re-injected
+        let turn2 = format!("{formatted} {clean1}");
+        let clean2 = strip_leading_message_timestamps(&turn2);
+        assert_eq!(clean2, raw);
+    }
+
+    #[test]
     fn render_user_prompt_inlines_text_content() {
         let attachment = MessageAttachment {
             id: "attachment-1".into(),
@@ -299,10 +402,7 @@ mod tests {
             .with_attachments(vec![attachment]);
 
         let rendered = render_user_prompt(&event);
-        assert_eq!(
-            rendered,
-            "review this code\n\n[Attachment: main.rs (text/x-rust, 21 bytes) - https://cdn.example/main.rs | local path: /workspace/main.rs]\n\n[Content of main.rs]:\n\nfn main() {\n}\n"
-        );
+        assert!(rendered.contains("review this code\n\n[Attachment: main.rs (text/x-rust, 21 bytes) - https://cdn.example/main.rs | local path: /workspace/main.rs]\n\n[Content of main.rs]:\n\nfn main() {\n}\n"));
     }
 
     #[test]

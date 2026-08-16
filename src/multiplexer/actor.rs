@@ -9,8 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    render_user_prompt, DeliveryLedgerService, InboundEvent, OmonError, OutboundAction,
-    ProfileRouter, Result, SessionContext, SessionKey, SessionState,
+    render_user_prompt, strip_leading_message_timestamps, DeliveryLedgerService, InboundEvent,
+    OmonError, OutboundAction, ProfileRouter, Result, SessionContext, SessionKey, SessionState,
 };
 
 /// Sensible maximum number of pending events queued per session actor.
@@ -372,7 +372,7 @@ impl SessionActor {
         )
         .bind(event.id.to_string())
         .bind(self.context.key.storage_key())
-        .bind(render_user_prompt(event))
+        .bind(strip_leading_message_timestamps(&render_user_prompt(event)))
         .bind(serde_json::to_string(&event.attachments).map_err(serialization_error)?)
         .bind(event.received_at)
         .bind(if event.platform_message_id.is_empty() {

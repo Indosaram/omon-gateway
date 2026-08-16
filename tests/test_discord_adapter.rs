@@ -945,7 +945,7 @@ fn renders_downloaded_attachment_local_path() {
     }]);
 
     let prompt = render_user_prompt(&event);
-    assert!(prompt.starts_with("inspect\n\n[Attachment: main.png"));
+    assert!(prompt.contains("inspect\n\n[Attachment: main.png"));
     assert!(prompt.contains(&format!("local path: {}", local_path.display())));
 }
 
