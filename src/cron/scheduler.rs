@@ -1079,8 +1079,127 @@ impl CronScheduler {
                 })
                 .await?;
         }
+
+        let attach_to_session = job
+            .payload()
+            .ok()
+            .and_then(|p| p.get("attach_to_session").and_then(Value::as_bool))
+            .unwrap_or(true);
+
+        if attach_to_session {
+            if let Err(error) = mirror_cron_delivery_to_session(
+                &self.pool,
+                &job.id,
+                job.session_key.as_deref(),
+                destination,
+                content,
+            )
+            .await
+            {
+                tracing::warn!(
+                    job_id = %job.id,
+                    %error,
+                    "failed to mirror cron delivery into session transcript"
+                );
+            }
+        }
+
         Ok(())
     }
+}
+
+pub async fn mirror_cron_delivery_to_session(
+    pool: &SqlitePool,
+    job_id: &str,
+    job_session_key: Option<&str>,
+    destination: &crate::HermesOrigin,
+    content: &str,
+) -> Result<bool> {
+    let text = content.trim();
+    if text.is_empty() {
+        return Ok(false);
+    }
+
+    let session_key: Option<String> = if let Some(key) = job_session_key {
+        let exists: Option<(String,)> =
+            sqlx::query_as("SELECT session_key FROM sessions WHERE session_key = ? LIMIT 1")
+                .bind(key)
+                .fetch_optional(pool)
+                .await?;
+        exists.map(|(k,)| k)
+    } else {
+        None
+    };
+
+    let session_key = match session_key {
+        Some(k) => Some(k),
+        None => {
+            if destination.platform.eq_ignore_ascii_case("discord") {
+                if let Some(thread_id) = &destination.thread_id {
+                    let row: Option<(String,)> = sqlx::query_as(
+                        "SELECT session_key FROM sessions WHERE platform = 'discord' AND channel_id = ? AND thread_id = ? ORDER BY updated_at DESC LIMIT 1",
+                    )
+                    .bind(&destination.chat_id)
+                    .bind(thread_id)
+                    .fetch_optional(pool)
+                    .await?;
+                    if row.is_some() {
+                        row.map(|(k,)| k)
+                    } else {
+                        let row: Option<(String,)> = sqlx::query_as(
+                            "SELECT session_key FROM sessions WHERE platform = 'discord' AND channel_id = ? ORDER BY updated_at DESC LIMIT 1",
+                        )
+                        .bind(&destination.chat_id)
+                        .fetch_optional(pool)
+                        .await?;
+                        row.map(|(k,)| k)
+                    }
+                } else {
+                    let row: Option<(String,)> = sqlx::query_as(
+                        "SELECT session_key FROM sessions WHERE platform = 'discord' AND channel_id = ? ORDER BY updated_at DESC LIMIT 1",
+                    )
+                    .bind(&destination.chat_id)
+                    .fetch_optional(pool)
+                    .await?;
+                    row.map(|(k,)| k)
+                }
+            } else {
+                None
+            }
+        }
+    };
+
+    let Some(target_session_key) = session_key else {
+        return Ok(false);
+    };
+
+    let message_id = Uuid::new_v4().to_string();
+    let metadata = serde_json::json!({
+        "source": "cron",
+        "cron_job_id": job_id,
+    });
+    let metadata_str =
+        serde_json::to_string(&metadata).map_err(|e| OmonError::Database(e.to_string()))?;
+
+    let now = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO messages (id, session_key, role, content, metadata_json, created_at) VALUES (?, ?, 'assistant', ?, ?, ?)",
+    )
+    .bind(&message_id)
+    .bind(&target_session_key)
+    .bind(text)
+    .bind(&metadata_str)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    sqlx::query("UPDATE sessions SET updated_at = ? WHERE session_key = ?")
+        .bind(now)
+        .bind(&target_session_key)
+        .execute(pool)
+        .await?;
+
+    Ok(true)
 }
 
 pub fn delivery_destinations(payload: &Value) -> Result<Vec<crate::HermesOrigin>> {
@@ -1729,5 +1848,71 @@ mod tests {
             res.is_err(),
             "200s past one-shot must be rejected outside grace window"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mirror_cron_delivery_to_session() {
+        let database = crate::Database::connect("sqlite::memory:").await.unwrap();
+        let pool = database.pool();
+        let now = Utc::now();
+
+        // 1. Create a session for discord channel "chan_999"
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json, created_at, updated_at) \
+             VALUES ('discord:chan_999:user1', 'discord', 'chan_999', 'user1', '{}', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let destination = crate::HermesOrigin {
+            platform: "discord".into(),
+            chat_id: "chan_999".into(),
+            ..crate::HermesOrigin::default()
+        };
+
+        // 2. Mirror a cron delivery into that session
+        let mirrored = mirror_cron_delivery_to_session(
+            pool,
+            "job_daily_report",
+            None,
+            &destination,
+            "Daily system report: all systems green.",
+        )
+        .await
+        .unwrap();
+        assert!(mirrored, "Must successfully mirror delivery into session");
+
+        // 3. Verify message is persisted in messages table as assistant role
+        let row: (String, String, String, String) = sqlx::query_as(
+            "SELECT session_key, role, content, metadata_json FROM messages WHERE session_key = 'discord:chan_999:user1'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.0, "discord:chan_999:user1");
+        assert_eq!(row.1, "assistant");
+        assert_eq!(row.2, "Daily system report: all systems green.");
+        assert!(row.3.contains("job_daily_report"));
+
+        // 4. Delivery to non-existent session channel -> returns Ok(false)
+        let unknown_dest = crate::HermesOrigin {
+            platform: "discord".into(),
+            chat_id: "chan_nonexistent".into(),
+            ..crate::HermesOrigin::default()
+        };
+        let not_mirrored = mirror_cron_delivery_to_session(
+            pool,
+            "job_daily_report",
+            None,
+            &unknown_dest,
+            "Some content",
+        )
+        .await
+        .unwrap();
+        assert!(!not_mirrored, "Must return false for unknown channel");
     }
 }
