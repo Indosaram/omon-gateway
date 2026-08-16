@@ -7,9 +7,9 @@ use poise::serenity_prelude as serenity;
 use regex::Regex;
 use serenity::all::{
     ChannelId, ChannelType, Color, CreateAllowedMentions, CreateAttachment, CreateEmbed,
-    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateThread,
-    EditMessage, FullEvent, GatewayIntents, GetMessages, HttpBuilder, Interaction, Message,
-    MessageId, Typing,
+    CreateForumPost, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
+    CreateThread, EditMessage, FullEvent, GatewayIntents, GetMessages, HttpBuilder, Interaction,
+    Message, MessageId, Typing,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -201,6 +201,49 @@ pub fn derive_auto_thread_name(content: &str, bot_user_id: serenity::UserId) -> 
     } else if trimmed.chars().count() > 80 {
         let capped: String = trimmed.chars().take(77).collect();
         format!("{capped}...")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+static MENTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<@!?[0-9]+>|<#[0-9]+>|<@&[0-9]+>").expect("valid mention regex")
+});
+
+/// Derives a clean forum thread post title from the message or its first line.
+///
+/// Discord requires thread/post names to be 1 to 100 characters.
+pub fn derive_forum_post_title(content: &str) -> String {
+    let first_line = content
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("New Discussion");
+
+    let no_mentions = MENTION_RE.replace_all(first_line, "");
+    let stripped = no_mentions
+        .trim_start_matches(|c: char| {
+            c == '#'
+                || c == '>'
+                || c == '*'
+                || c == '_'
+                || c == '`'
+                || c == '~'
+                || c.is_whitespace()
+        })
+        .trim_end_matches(|c: char| {
+            c == '*' || c == '_' || c == '`' || c == '~' || c.is_whitespace()
+        });
+
+    let collapsed: String = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        "New Discussion".to_string()
+    } else if trimmed.chars().count() > 100 {
+        let capped: String = trimmed.chars().take(97).collect();
+        format!("{capped}...")
+    } else if trimmed.chars().count() < 2 {
+        format!("{trimmed} Discussion")
     } else {
         trimmed.to_string()
     }
@@ -987,6 +1030,27 @@ impl DiscordFileUploader for SerenityFileUploader {
                 path.display()
             ))
         })?;
+
+        let is_forum = match channel.to_channel(&http).await {
+            Ok(serenity::Channel::Guild(guild_channel)) => {
+                guild_channel.kind == ChannelType::Forum
+            }
+            _ => false,
+        };
+
+        if is_forum {
+            let title = format!("Upload: {filename}");
+            let attachment = CreateAttachment::bytes(bytes, filename);
+            let builder = CreateForumPost::new(
+                title,
+                CreateMessage::new()
+                    .add_file(attachment)
+                    .allowed_mentions(safe_allowed_mentions()),
+            );
+            channel.create_forum_post(&http, builder).await?;
+            return Ok(());
+        }
+
         let attachment = CreateAttachment::bytes(bytes, filename);
         channel
             .send_files(
@@ -1314,6 +1378,61 @@ impl OutboundDispatcher for DiscordEgress {
                     .map(MessageId::new);
 
                 let chunks = chunk_markdown(&content, DISCORD_MESSAGE_LIMIT);
+
+                let is_forum = match channel.to_channel(&http).await {
+                    Ok(serenity::Channel::Guild(guild_channel)) => {
+                        guild_channel.kind == ChannelType::Forum
+                    }
+                    _ => false,
+                };
+
+                if is_forum {
+                    let title = derive_forum_post_title(&content);
+                    let first_chunk = chunks
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "\u{200b}".to_string());
+                    let builder = CreateForumPost::new(
+                        title,
+                        CreateMessage::new()
+                            .content(first_chunk)
+                            .allowed_mentions(safe_allowed_mentions()),
+                    );
+                    match channel.create_forum_post(&http, builder).await {
+                        Ok(post_channel) => {
+                            self.dead_targets.clear(channel_id);
+                            for chunk in chunks.into_iter().skip(1) {
+                                if let Err(error) = post_channel
+                                    .id
+                                    .send_message(
+                                        &http,
+                                        CreateMessage::new()
+                                            .content(chunk)
+                                            .allowed_mentions(safe_allowed_mentions()),
+                                    )
+                                    .await
+                                {
+                                    if let Some((code, reason)) =
+                                        is_discord_dead_target_error(&error)
+                                    {
+                                        self.dead_targets
+                                            .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                                    }
+                                    return Err(error.into());
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            if let Some((code, reason)) = is_discord_dead_target_error(&error) {
+                                self.dead_targets
+                                    .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                            }
+                            return Err(error.into());
+                        }
+                    }
+                }
+
                 for (i, chunk) in chunks.into_iter().enumerate() {
                     let reference = should_chunk_reference(i, reply_id);
                     let send_result = if let Some(target_msg_id) = reference {
@@ -1737,6 +1856,40 @@ mod tests {
 
     fn test_session(name: &str) -> SessionKey {
         SessionKey::new("discord", Some("guild"), "channel", None::<String>, name)
+    }
+
+    #[test]
+    fn test_derive_forum_post_title() {
+        // Plain single line
+        assert_eq!(
+            derive_forum_post_title("How do we optimize SQLite queries?"),
+            "How do we optimize SQLite queries?"
+        );
+
+        // Markdown header prefix
+        assert_eq!(
+            derive_forum_post_title("### Architecture Review for Q3\n\nSome body text here"),
+            "Architecture Review for Q3"
+        );
+
+        // Mentions stripped
+        assert_eq!(
+            derive_forum_post_title("<@123456789> <@!987654321> Discussion about deployment"),
+            "Discussion about deployment"
+        );
+
+        // Long title truncated to <= 100 chars
+        let long_input = "a".repeat(150);
+        let derived = derive_forum_post_title(&long_input);
+        assert_eq!(derived.chars().count(), 100);
+        assert!(derived.ends_with("..."));
+
+        // Empty / whitespace
+        assert_eq!(derive_forum_post_title(""), "New Discussion");
+        assert_eq!(derive_forum_post_title("   \n\n  "), "New Discussion");
+
+        // Single character padded to >= 2 chars
+        assert_eq!(derive_forum_post_title("x"), "x Discussion");
     }
 
     #[test]
