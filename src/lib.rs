@@ -26,8 +26,8 @@ pub use multiplexer::{
 pub use security::*;
 pub use storage::Database;
 pub use tools::{
-    augmented_path_from_environment, build_augmented_path, ApprovalPolicy, BrowserTool, CronTool,
-    FileTool, McpClientTool, McpTool, McpTransport, SkillsTool, TerminalTool, Tool, ToolRegistry,
-    WebFetchTool, WebSearchTool, DEFAULT_EXTRA_PATH,
+    augmented_path_from_environment, build_augmented_path, build_session_environment,
+    ApprovalPolicy, BrowserTool, CronTool, FileTool, McpClientTool, McpTool, McpTransport,
+    SkillsTool, TerminalTool, Tool, ToolRegistry, WebFetchTool, WebSearchTool, DEFAULT_EXTRA_PATH,
 };
 pub use voice::*;

@@ -240,6 +240,13 @@ impl TerminalTool {
             .args(process_args)
             .current_dir(cwd)
             .kill_on_drop(true);
+
+        if let Some(session) = session {
+            for (key, value) in build_session_environment(session) {
+                command.env(key, value);
+            }
+        }
+
         if let Some(env) = args.get("env").and_then(Value::as_object) {
             for (key, value) in env {
                 let value = value.as_str().ok_or_else(|| {
@@ -268,6 +275,59 @@ impl TerminalTool {
 }
 
 pub const DEFAULT_EXTRA_PATH: &str = "/opt/homebrew/bin:/usr/local/bin";
+
+/// Builds an isolated per-session environment variable map from a SessionKey,
+/// scoped to a subprocess execution rather than written process-globally.
+pub fn build_session_environment(
+    session: &SessionKey,
+) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    let storage_key = session.storage_key();
+
+    // Primary OMON session variables
+    env.insert("OMON_SESSION_ID".to_string(), storage_key.clone());
+    env.insert("OMON_SESSION_KEY".to_string(), storage_key.clone());
+    env.insert(
+        "OMON_SESSION_PLATFORM".to_string(),
+        session.platform.clone(),
+    );
+    env.insert(
+        "OMON_SESSION_CHANNEL".to_string(),
+        session.channel_id.clone(),
+    );
+    env.insert(
+        "OMON_SESSION_CHANNEL_ID".to_string(),
+        session.channel_id.clone(),
+    );
+    env.insert("OMON_SESSION_USER_ID".to_string(), session.user_id.clone());
+
+    // Hermes compatibility variables
+    env.insert("HERMES_SESSION_ID".to_string(), storage_key.clone());
+    env.insert("HERMES_SESSION_KEY".to_string(), storage_key);
+    env.insert(
+        "HERMES_SESSION_PLATFORM".to_string(),
+        session.platform.clone(),
+    );
+    env.insert(
+        "HERMES_SESSION_CHAT_ID".to_string(),
+        session.channel_id.clone(),
+    );
+    env.insert(
+        "HERMES_SESSION_USER_ID".to_string(),
+        session.user_id.clone(),
+    );
+
+    if let Some(guild_id) = &session.guild_id {
+        env.insert("OMON_SESSION_GUILD_ID".to_string(), guild_id.clone());
+        env.insert("HERMES_SESSION_GUILD_ID".to_string(), guild_id.clone());
+    }
+    if let Some(thread_id) = &session.thread_id {
+        env.insert("OMON_SESSION_THREAD_ID".to_string(), thread_id.clone());
+        env.insert("HERMES_SESSION_THREAD_ID".to_string(), thread_id.clone());
+    }
+
+    env
+}
 
 /// Builds an augmented PATH string with `extra` paths prepended ahead of `current`
 /// inherited paths, deduplicating path segments while preserving order.
@@ -403,7 +463,7 @@ mod approval_tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use super::{is_dangerous, ApprovalPolicy, TerminalTool};
+    use super::{build_session_environment, is_dangerous, ApprovalPolicy, TerminalTool};
     use crate::{ApprovalDecision, ApprovalError, ApprovalRequester, OmonError, SessionKey, Tool};
 
     struct StubApprover {
@@ -740,5 +800,87 @@ mod approval_tests {
             error_never,
             OmonError::Approval(msg) if msg.contains("BLOCKED: this command matches the user-defined deny rule 'kubectl delete *'")
         ));
+    }
+
+    #[test]
+    fn test_build_session_environment_mapping() {
+        let session_full = SessionKey::new(
+            "discord",
+            Some("guild-123"),
+            "channel-456",
+            Some("thread-789"),
+            "user-999",
+        );
+        let env_full = build_session_environment(&session_full);
+
+        assert_eq!(env_full.get("OMON_SESSION_PLATFORM").unwrap(), "discord");
+        assert_eq!(env_full.get("OMON_SESSION_CHANNEL").unwrap(), "channel-456");
+        assert_eq!(
+            env_full.get("OMON_SESSION_CHANNEL_ID").unwrap(),
+            "channel-456"
+        );
+        assert_eq!(env_full.get("OMON_SESSION_USER_ID").unwrap(), "user-999");
+        assert_eq!(env_full.get("OMON_SESSION_GUILD_ID").unwrap(), "guild-123");
+        assert_eq!(
+            env_full.get("OMON_SESSION_THREAD_ID").unwrap(),
+            "thread-789"
+        );
+        assert_eq!(
+            env_full.get("OMON_SESSION_ID").unwrap(),
+            &session_full.storage_key()
+        );
+
+        // Hermes compat
+        assert_eq!(env_full.get("HERMES_SESSION_PLATFORM").unwrap(), "discord");
+        assert_eq!(
+            env_full.get("HERMES_SESSION_CHAT_ID").unwrap(),
+            "channel-456"
+        );
+        assert_eq!(env_full.get("HERMES_SESSION_USER_ID").unwrap(), "user-999");
+        assert_eq!(
+            env_full.get("HERMES_SESSION_GUILD_ID").unwrap(),
+            "guild-123"
+        );
+        assert_eq!(
+            env_full.get("HERMES_SESSION_THREAD_ID").unwrap(),
+            "thread-789"
+        );
+
+        // Minimal session without guild/thread
+        let session_min =
+            SessionKey::new("discord", None::<String>, "chan-1", None::<String>, "usr-1");
+        let env_min = build_session_environment(&session_min);
+        assert_eq!(env_min.get("OMON_SESSION_CHANNEL").unwrap(), "chan-1");
+        assert_eq!(env_min.get("OMON_SESSION_USER_ID").unwrap(), "usr-1");
+        assert!(!env_min.contains_key("OMON_SESSION_GUILD_ID"));
+        assert!(!env_min.contains_key("OMON_SESSION_THREAD_ID"));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_subprocess_inherits_session_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = TerminalTool::new(dir.path()).with_approval_policy(ApprovalPolicy::Never);
+        let session = SessionKey::new(
+            "discord",
+            Some("guild-abc"),
+            "channel-xyz",
+            None::<String>,
+            "user-42",
+        );
+
+        let output = tool
+            .execute_with_context(
+                json!({
+                    "program": "sh",
+                    "args": ["-c", "echo $OMON_SESSION_PLATFORM $OMON_SESSION_CHANNEL $OMON_SESSION_USER_ID"]
+                }),
+                Some(&session),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output["success"], true);
+        let stdout = output["stdout"].as_str().unwrap().trim();
+        assert_eq!(stdout, "discord channel-xyz user-42");
     }
 }
