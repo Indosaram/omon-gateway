@@ -147,6 +147,16 @@ async fn handle_event(
             interaction: Interaction::Component(component),
         } => {
             if is_approval_custom_id(&component.data.custom_id) {
+                if !is_authorized_clicker(component.user.id.get(), &data.allowed_users) {
+                    let refusal = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .ephemeral(true)
+                            .content("You are not authorized to approve commands."),
+                    );
+                    component.create_response(ctx, refusal).await?;
+                    return Ok(());
+                }
+
                 let response = if data
                     .approvals
                     .resolve_custom_id(&component.data.custom_id)
@@ -591,4 +601,8 @@ impl OutboundDispatcher for DiscordEgress {
         }
         Ok(())
     }
+}
+
+pub fn is_authorized_clicker(user_id: u64, allowed: &[u64]) -> bool {
+    allowed.is_empty() || allowed.contains(&user_id)
 }

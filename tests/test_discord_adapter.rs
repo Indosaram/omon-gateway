@@ -10,10 +10,11 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use omon_gateway::discord::adapter::{message_to_inbound, message_to_inbound_with_config};
 use omon_gateway::discord::commands::is_user_allowed;
 use omon_gateway::{
-    chunk_markdown, render_user_prompt, ApprovalDecision, ApprovalError, AttachmentDownloader,
-    ChatMessage, Database, DeliveryLedgerService, DiscordEgress, DiscordFileUploader,
-    DiscordMessageTransport, InboundEvent, LiveEditThrottler, LlmClient, LlmConfig, LlmProvider,
-    MessageAttachment, OutboundAction, OutboundDispatcher, Result, SessionKey, SmartApprovalGuard,
+    approval_buttons, chunk_markdown, is_authorized_clicker, parse_custom_id, render_user_prompt,
+    ApprovalDecision, ApprovalError, AttachmentDownloader, ChatMessage, Database,
+    DeliveryLedgerService, DiscordEgress, DiscordFileUploader, DiscordMessageTransport,
+    InboundEvent, LiveEditThrottler, LlmClient, LlmConfig, LlmProvider, MessageAttachment,
+    OutboundAction, OutboundDispatcher, Result, SessionKey, SmartApprovalGuard,
     DISCORD_ATTACHMENT_MAX_BYTES,
 };
 use serenity::all::{ChannelId, ChannelType, Message, MessageId, UserId};
@@ -201,34 +202,128 @@ async fn final_live_edit_deletes_surplus_chunk_messages() {
     assert!(calls.contains(&Call::Delete(MessageId::new(99))));
 }
 
+#[test]
+fn test_approval_buttons_and_parse_custom_id() {
+    let request_id = uuid::Uuid::new_v4();
+    let buttons = approval_buttons(request_id);
+    assert_eq!(buttons.len(), 1);
+
+    // Round-trip parse_custom_id
+    assert_eq!(
+        parse_custom_id(&format!("omon:approval:{request_id}:once")),
+        Some((request_id, ApprovalDecision::Once))
+    );
+    assert_eq!(
+        parse_custom_id(&format!("omon:approval:{request_id}:session")),
+        Some((request_id, ApprovalDecision::Session))
+    );
+    assert_eq!(
+        parse_custom_id(&format!("omon:approval:{request_id}:always")),
+        Some((request_id, ApprovalDecision::Always))
+    );
+    assert_eq!(
+        parse_custom_id(&format!("omon:approval:{request_id}:deny")),
+        Some((request_id, ApprovalDecision::Deny))
+    );
+}
+
+#[test]
+fn test_is_authorized_clicker() {
+    // Open when allowlist is empty
+    assert!(is_authorized_clicker(12345, &[]));
+    assert!(is_authorized_clicker(99999, &[]));
+
+    // Enforced when allowlist is non-empty
+    let allowed = vec![111, 222, 333];
+    assert!(is_authorized_clicker(111, &allowed));
+    assert!(is_authorized_clicker(222, &allowed));
+    assert!(is_authorized_clicker(333, &allowed));
+    assert!(!is_authorized_clicker(444, &allowed));
+    assert!(!is_authorized_clicker(99999, &allowed));
+}
+
 #[tokio::test(start_paused = true)]
-async fn approval_guard_resolves_both_buttons_and_times_out() {
+async fn approval_guard_resolves_all_four_buttons_and_times_out() {
     let guard = SmartApprovalGuard::new();
 
-    let approved = guard.request().await;
-    let approved_id = approved.request_id;
+    // 1. Once
+    let once_prompt = guard.request().await;
+    let once_id = once_prompt.request_id;
     assert!(
         guard
-            .resolve_custom_id(&format!("omon:approval:{approved_id}:approve"))
+            .resolve_custom_id(&format!("omon:approval:{once_id}:once"))
             .await
     );
     assert_eq!(
-        approved.wait(Duration::from_secs(60)).await,
+        once_prompt.wait(Duration::from_secs(60)).await,
         Ok(ApprovalDecision::Once)
     );
 
-    let rejected = guard.request().await;
-    let rejected_id = rejected.request_id;
+    // 2. Session
+    let session_prompt = guard.request().await;
+    let session_id = session_prompt.request_id;
     assert!(
         guard
-            .resolve_custom_id(&format!("omon:approval:{rejected_id}:reject"))
+            .resolve_custom_id(&format!("omon:approval:{session_id}:session"))
             .await
     );
     assert_eq!(
-        rejected.wait(Duration::from_secs(60)).await,
+        session_prompt.wait(Duration::from_secs(60)).await,
+        Ok(ApprovalDecision::Session)
+    );
+
+    // 3. Always
+    let always_prompt = guard.request().await;
+    let always_id = always_prompt.request_id;
+    assert!(
+        guard
+            .resolve_custom_id(&format!("omon:approval:{always_id}:always"))
+            .await
+    );
+    assert_eq!(
+        always_prompt.wait(Duration::from_secs(60)).await,
+        Ok(ApprovalDecision::Always)
+    );
+
+    // 4. Deny
+    let deny_prompt = guard.request().await;
+    let deny_id = deny_prompt.request_id;
+    assert!(
+        guard
+            .resolve_custom_id(&format!("omon:approval:{deny_id}:deny"))
+            .await
+    );
+    assert_eq!(
+        deny_prompt.wait(Duration::from_secs(60)).await,
         Ok(ApprovalDecision::Deny)
     );
 
+    // 5. Legacy aliases
+    let legacy_app = guard.request().await;
+    let legacy_app_id = legacy_app.request_id;
+    assert!(
+        guard
+            .resolve_custom_id(&format!("omon:approval:{legacy_app_id}:approve"))
+            .await
+    );
+    assert_eq!(
+        legacy_app.wait(Duration::from_secs(60)).await,
+        Ok(ApprovalDecision::Once)
+    );
+
+    let legacy_rej = guard.request().await;
+    let legacy_rej_id = legacy_rej.request_id;
+    assert!(
+        guard
+            .resolve_custom_id(&format!("omon:approval:{legacy_rej_id}:reject"))
+            .await
+    );
+    assert_eq!(
+        legacy_rej.wait(Duration::from_secs(60)).await,
+        Ok(ApprovalDecision::Deny)
+    );
+
+    // 6. Timeout
     let pending = guard.request().await;
     let wait = tokio::spawn(pending.wait(Duration::from_secs(60)));
     tokio::time::advance(Duration::from_secs(60)).await;
