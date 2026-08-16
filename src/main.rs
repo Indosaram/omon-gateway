@@ -1167,6 +1167,13 @@ impl AgentRunner for LiveAgentRunner {
     }
 
     async fn cancel(&self, session: &SessionContext) -> Result<()> {
+        let _ = self
+            .dispatcher
+            .dispatch(OutboundAction::Typing {
+                session: session.key.clone(),
+                active: false,
+            })
+            .await;
         let stream = self.streams.lock().remove(&session.key.storage_key());
         if let Some(stream) = stream {
             let obligation_id = format!("obl_{}", stream.stream_id);
@@ -1363,16 +1370,23 @@ pub async fn recover_resume_pending_sessions(
     let pending_keys = omon_gateway::storage::fetch_resume_pending_session_keys(pool).await?;
     let mut resumed_count = 0;
     for session_key in pending_keys {
+        let storage_key = session_key.storage_key();
+        let is_suspended = omon_gateway::storage::is_session_suspended(pool, &storage_key).await?;
         let cleared =
-            omon_gateway::storage::clear_session_resume_pending(pool, &session_key.storage_key())
-                .await?;
+            omon_gateway::storage::clear_session_resume_pending(pool, &storage_key).await?;
         if !cleared {
+            continue;
+        }
+        if is_suspended {
+            info!(
+                session = %session_key,
+                "skipping restart recovery for suspended session"
+            );
             continue;
         }
 
         if let Some(unfinished) =
-            omon_gateway::storage::find_last_unfinished_user_turn(pool, &session_key.storage_key())
-                .await?
+            omon_gateway::storage::find_last_unfinished_user_turn(pool, &storage_key).await?
         {
             let attachments: Vec<omon_gateway::MessageAttachment> =
                 serde_json::from_str(&unfinished.metadata_json).unwrap_or_default();
@@ -3458,6 +3472,69 @@ mod runner_tests {
             .await
             .unwrap();
         assert_eq!(recovered_second, 0);
+    }
+
+    #[tokio::test]
+    async fn test_suspended_session_suppresses_auto_resume() {
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            Some("guild-1"),
+            "chan-suspended",
+            None::<String>,
+            "user-suspended",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        session.state.suspended = true;
+        super::ensure_agent_session(&pool, &session).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, metadata_json)
+             VALUES ('msg-suspended', ?, 'user', 'should not be resumed', '[]')",
+        )
+        .bind(session_key.storage_key())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Mark session as resume_pending
+        omon_gateway::storage::mark_session_resume_pending(&pool, &session_key.storage_key())
+            .await
+            .unwrap();
+
+        struct PanicRunner;
+        #[async_trait::async_trait]
+        impl omon_gateway::AgentRunner for PanicRunner {
+            async fn run(
+                &self,
+                _session: &mut omon_gateway::SessionContext,
+                _event: omon_gateway::InboundEvent,
+            ) -> omon_gateway::Result<()> {
+                panic!("Suspended session must not be auto-resumed!");
+            }
+        }
+
+        let multiplexer = omon_gateway::SessionMultiplexer::new(
+            pool.clone(),
+            std::sync::Arc::new(PanicRunner),
+            omon_gateway::MultiplexerConfig::default(),
+        );
+
+        let recovered = super::recover_resume_pending_sessions(&pool, &multiplexer)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered, 0,
+            "Suspended session must be skipped by recovery"
+        );
+
+        // The resume_pending flag should be cleared so it won't repeatedly re-attempt
+        let pending = omon_gateway::storage::fetch_resume_pending_session_keys(&pool)
+            .await
+            .unwrap();
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]

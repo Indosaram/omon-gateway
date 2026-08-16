@@ -83,6 +83,46 @@ pub async fn clear_session_resume_pending(pool: &SqlitePool, session_key: &str) 
     Ok(result.rows_affected() > 0)
 }
 
+/// Marks a session as suspended (or unsuspended) in SQLite state_json.
+pub async fn mark_session_suspended(
+    pool: &SqlitePool,
+    session_key: &str,
+    suspended: bool,
+) -> Result<()> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT state_json FROM sessions WHERE session_key = ?")
+            .bind(session_key)
+            .fetch_optional(pool)
+            .await?;
+    if let Some((state_json,)) = row {
+        let mut state: crate::SessionState = serde_json::from_str(&state_json).unwrap_or_default();
+        state.suspended = suspended;
+        let new_json = serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string());
+        sqlx::query(
+            "UPDATE sessions SET state_json = ?, updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) WHERE session_key = ?",
+        )
+        .bind(new_json)
+        .bind(session_key)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Checks if a session is currently marked suspended.
+pub async fn is_session_suspended(pool: &SqlitePool, session_key: &str) -> Result<bool> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT state_json FROM sessions WHERE session_key = ?")
+            .bind(session_key)
+            .fetch_optional(pool)
+            .await?;
+    if let Some((state_json,)) = row {
+        let state: crate::SessionState = serde_json::from_str(&state_json).unwrap_or_default();
+        return Ok(state.suspended);
+    }
+    Ok(false)
+}
+
 /// Counts the number of sessions currently marked resume_pending.
 pub async fn count_resume_pending_sessions(pool: &SqlitePool) -> Result<i64> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE resume_pending = 1")

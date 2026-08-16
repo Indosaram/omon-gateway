@@ -88,6 +88,8 @@ pub struct SessionState {
     #[serde(default)]
     pub yolo: bool,
     #[serde(default)]
+    pub suspended: bool,
+    #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
 }
 

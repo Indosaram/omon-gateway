@@ -251,8 +251,18 @@ impl SessionMultiplexer {
     /// Cancels the active turn for an existing session. Returns `false` when
     /// the session has no active execution (or no actor at all).
     pub async fn stop(&self, key: &SessionKey) -> Result<bool> {
+        if let Some(dispatcher) = &self.dispatcher {
+            let _ = dispatcher
+                .dispatch(crate::OutboundAction::Typing {
+                    session: key.clone(),
+                    active: false,
+                })
+                .await;
+        }
         loop {
             let Some(handle) = self.sessions.get(key).map(|entry| entry.clone()) else {
+                crate::storage::mark_session_suspended(&self.pool, &key.storage_key(), true)
+                    .await?;
                 return Ok(false);
             };
             match handle.stop().await? {

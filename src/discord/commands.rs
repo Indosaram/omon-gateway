@@ -581,15 +581,21 @@ pub async fn reset(ctx: PoiseContext<'_>) -> Result<(), CommandError> {
 }
 
 #[poise::command(slash_command, prefix_command)]
-/// Stop the active agent turn for this Discord session.
+/// Stop the active agent turn for this Discord session and mark it suspended.
 pub async fn stop(ctx: PoiseContext<'_>) -> Result<(), CommandError> {
     let key = session_key(ctx).await?;
-    let message = if ctx.data().multiplexer.stop(&key).await? {
-        "Stopped the active turn."
+    let interrupted = ctx.data().multiplexer.stop(&key).await?;
+    let message = if interrupted {
+        "🛑 Stopped active turn and marked session suspended."
     } else {
-        "No active turn to stop."
+        "🛑 No active turn running; session marked suspended."
     };
-    ctx.say(message).await?;
+    ctx.send(
+        poise::CreateReply::default()
+            .content(message)
+            .ephemeral(true),
+    )
+    .await?;
     Ok(())
 }
 

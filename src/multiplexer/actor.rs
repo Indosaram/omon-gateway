@@ -109,6 +109,7 @@ impl SessionActor {
                 ActorCommand::Event(event) => {
                     self.last_active_at = tokio::time::Instant::now();
                     self.context.updated_at = Utc::now();
+                    self.context.state.suspended = false;
                     self.dirty = true;
 
                     if !event.platform_message_id.is_empty() {
@@ -238,12 +239,15 @@ impl SessionActor {
                             }
                         }
                         TurnOutcome::Stopped(reply) => {
+                            self.context.state.suspended = true;
+                            self.dirty = true;
                             self.interrupt_turn(
                                 event_id,
                                 delivery_id.as_deref(),
                                 "stopped by user",
                             )
                             .await;
+                            let _ = self.flush_if_dirty().await;
                             let _ = reply.send(Ok(true));
                         }
                         TurnOutcome::Shutdown => {
@@ -267,6 +271,8 @@ impl SessionActor {
                 }
                 ActorCommand::Stop { reply } => {
                     self.last_active_at = tokio::time::Instant::now();
+                    self.context.state.suspended = true;
+                    self.dirty = true;
                     while let Some(pending) = pending_events.pop_front() {
                         self.complete_delivery(
                             pending.delivery_id.as_deref(),
@@ -274,6 +280,7 @@ impl SessionActor {
                         )
                         .await;
                     }
+                    let _ = self.flush_if_dirty().await;
                     let _ = reply.send(Ok(false));
                 }
                 ActorCommand::TouchActivity => {
