@@ -1400,3 +1400,48 @@ fn test_format_channel_context_empty_and_skip_empty_lines() {
         "[Recent channel context]\nbob: valid message"
     );
 }
+
+#[tokio::test]
+async fn test_dead_target_short_circuit_in_egress() {
+    use omon_gateway::{
+        DeadTargetRegistry, DiscordEgress, OutboundAction, OutboundDispatcher, SessionKey,
+    };
+
+    let dead_targets = std::sync::Arc::new(DeadTargetRegistry::new());
+    // Pre-mark channel 98765 as dead (simulating a prior 404/403)
+    dead_targets.mark_dead(98765, "HTTP 404: Unknown Channel");
+
+    let client = std::sync::Arc::new(serenity::all::Http::new("fake-token"));
+    let egress = DiscordEgress::new(client).with_dead_targets(dead_targets.clone());
+
+    let session = SessionKey::new("discord", None::<String>, "98765", None::<String>, "user-1");
+
+    // Attempt to dispatch a message to the dead channel
+    // It should short-circuit and return Ok(()) without attempting network calls
+    let result = egress
+        .dispatch(OutboundAction::SendMessage {
+            session: session.clone(),
+            content: "hello dead channel".into(),
+            reply_to: None,
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "Short-circuited dead target should return Ok"
+    );
+
+    // Also verify EditMessage short-circuits
+    let edit_result = egress
+        .dispatch(OutboundAction::EditMessage {
+            session: session.clone(),
+            platform_message_id: "123".into(),
+            content: "edited content".into(),
+        })
+        .await;
+    assert!(edit_result.is_ok());
+
+    // Once cleared (e.g. self-healed or user re-adds bot), is_dead returns false
+    dead_targets.clear(98765);
+    assert!(!dead_targets.is_dead(98765));
+}

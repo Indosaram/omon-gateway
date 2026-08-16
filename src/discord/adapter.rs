@@ -1028,6 +1028,110 @@ pub struct DiscordEgress {
     approval_messages: Arc<Mutex<HashMap<Uuid, ApprovalMessageTarget>>>,
     allowed_users: Vec<u64>,
     approval_mentions: bool,
+    dead_targets: Arc<DeadTargetRegistry>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeadTargetEntry {
+    pub channel_id: u64,
+    pub reason: String,
+    pub marked_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// In-memory registry of confirmed-dead Discord channels (403 Forbidden / 404 Not Found).
+///
+/// Prevents repeated API errors, wasted delivery attempts, and rate-limit burn
+/// when a channel is deleted or the bot is kicked/lacks permissions.
+/// Self-healing: a successful send or explicit clear removes the channel from the registry.
+#[derive(Clone, Debug)]
+pub struct DeadTargetRegistry {
+    inner: Arc<parking_lot::Mutex<HashMap<u64, DeadTargetEntry>>>,
+    ttl: Option<std::time::Duration>,
+}
+
+impl Default for DeadTargetRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeadTargetRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            ttl: None,
+        }
+    }
+
+    pub fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            ttl: Some(ttl),
+        }
+    }
+
+    pub fn is_dead(&self, channel_id: u64) -> bool {
+        let mut map = self.inner.lock();
+        if let Some(entry) = map.get(&channel_id) {
+            if let Some(ttl) = self.ttl {
+                let elapsed = (chrono::Utc::now() - entry.marked_at)
+                    .to_std()
+                    .unwrap_or(std::time::Duration::ZERO);
+                if elapsed > ttl {
+                    map.remove(&channel_id);
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn mark_dead(&self, channel_id: u64, reason: impl Into<String>) -> bool {
+        let mut map = self.inner.lock();
+        let existed = map.contains_key(&channel_id);
+        map.insert(
+            channel_id,
+            DeadTargetEntry {
+                channel_id,
+                reason: reason.into(),
+                marked_at: chrono::Utc::now(),
+            },
+        );
+        !existed
+    }
+
+    pub fn clear(&self, channel_id: u64) -> bool {
+        let mut map = self.inner.lock();
+        map.remove(&channel_id).is_some()
+    }
+
+    pub fn clear_all(&self) {
+        let mut map = self.inner.lock();
+        map.clear();
+    }
+
+    pub fn count(&self) -> usize {
+        let map = self.inner.lock();
+        map.len()
+    }
+
+    pub fn get(&self, channel_id: u64) -> Option<DeadTargetEntry> {
+        let map = self.inner.lock();
+        map.get(&channel_id).cloned()
+    }
+}
+
+/// Identifies whether a Serenity HTTP error is a confirmed whole-target 403 Forbidden
+/// or 404 Not Found error.
+pub fn is_discord_dead_target_error(error: &serenity::Error) -> Option<(u16, String)> {
+    if let serenity::Error::Http(serenity::all::HttpError::UnsuccessfulRequest(resp)) = error {
+        let code = resp.status_code.as_u16();
+        if code == 403 || code == 404 {
+            return Some((code, resp.error.message.clone()));
+        }
+    }
+    None
 }
 
 impl DiscordEgress {
@@ -1046,6 +1150,7 @@ impl DiscordEgress {
             approval_messages: Arc::new(Mutex::new(HashMap::new())),
             allowed_users: Vec::new(),
             approval_mentions: false,
+            dead_targets: Arc::new(DeadTargetRegistry::new()),
         }
     }
 
@@ -1068,7 +1173,17 @@ impl DiscordEgress {
             approval_messages: Arc::new(Mutex::new(HashMap::new())),
             allowed_users: Vec::new(),
             approval_mentions: false,
+            dead_targets: Arc::new(DeadTargetRegistry::new()),
         })
+    }
+
+    pub fn dead_targets(&self) -> Arc<DeadTargetRegistry> {
+        self.dead_targets.clone()
+    }
+
+    pub fn with_dead_targets(mut self, dead_targets: Arc<DeadTargetRegistry>) -> Self {
+        self.dead_targets = dead_targets;
+        self
     }
 
     pub fn with_approval_mentions(mut self, allowed_users: Vec<u64>, enabled: bool) -> Self {
@@ -1194,6 +1309,16 @@ impl OutboundDispatcher for DiscordEgress {
             } => {
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
+                let channel_id = channel.get();
+
+                if self.dead_targets.is_dead(channel_id) {
+                    tracing::warn!(
+                        channel_id,
+                        "skipping message send to dead target (403/404 short-circuit)"
+                    );
+                    return Ok(());
+                }
+
                 let reply_id = reply_to
                     .as_deref()
                     .and_then(|id| id.parse::<u64>().ok())
@@ -1202,14 +1327,25 @@ impl OutboundDispatcher for DiscordEgress {
                 let chunks = chunk_markdown(&content, DISCORD_MESSAGE_LIMIT);
                 for (i, chunk) in chunks.into_iter().enumerate() {
                     let reference = should_chunk_reference(i, reply_id);
-                    if let Some(target_msg_id) = reference {
+                    let send_result = if let Some(target_msg_id) = reference {
                         let builder = CreateMessage::new()
                             .content(chunk.clone())
                             .reference_message((channel, target_msg_id))
                             .allowed_mentions(safe_allowed_mentions());
                         match channel.send_message(&http, builder).await {
-                            Ok(_) => {}
+                            Ok(msg) => Ok(msg),
                             Err(error) => {
+                                if let Some((code, reason)) = is_discord_dead_target_error(&error) {
+                                    self.dead_targets
+                                        .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                                    tracing::warn!(
+                                        channel_id,
+                                        code,
+                                        %reason,
+                                        "marked target channel dead due to 403/404"
+                                    );
+                                    return Err(error.into());
+                                }
                                 tracing::warn!(
                                     %error,
                                     target_msg_id = %target_msg_id,
@@ -1222,7 +1358,7 @@ impl OutboundDispatcher for DiscordEgress {
                                             .content(chunk)
                                             .allowed_mentions(safe_allowed_mentions()),
                                     )
-                                    .await?;
+                                    .await
                             }
                         }
                     } else {
@@ -1233,7 +1369,26 @@ impl OutboundDispatcher for DiscordEgress {
                                     .content(chunk)
                                     .allowed_mentions(safe_allowed_mentions()),
                             )
-                            .await?;
+                            .await
+                    };
+
+                    match send_result {
+                        Ok(_) => {
+                            self.dead_targets.clear(channel_id);
+                        }
+                        Err(error) => {
+                            if let Some((code, reason)) = is_discord_dead_target_error(&error) {
+                                self.dead_targets
+                                    .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                                tracing::warn!(
+                                    channel_id,
+                                    code,
+                                    %reason,
+                                    "marked target channel dead due to 403/404"
+                                );
+                            }
+                            return Err(error.into());
+                        }
                     }
                 }
             }
@@ -1243,6 +1398,17 @@ impl OutboundDispatcher for DiscordEgress {
                 content,
             } => {
                 let http = self.http_for(&session)?;
+                let channel = Self::target(&session)?;
+                let channel_id = channel.get();
+
+                if self.dead_targets.is_dead(channel_id) {
+                    tracing::warn!(
+                        channel_id,
+                        "skipping message edit to dead target (403/404 short-circuit)"
+                    );
+                    return Ok(());
+                }
+
                 let message_id = platform_message_id
                     .parse::<u64>()
                     .map(MessageId::new)
@@ -1251,7 +1417,7 @@ impl OutboundDispatcher for DiscordEgress {
                             "invalid Discord message ID: {platform_message_id}"
                         ))
                     })?;
-                Self::target(&session)?
+                match channel
                     .edit_message(
                         &http,
                         message_id,
@@ -1259,13 +1425,38 @@ impl OutboundDispatcher for DiscordEgress {
                             .content(content)
                             .allowed_mentions(safe_allowed_mentions()),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(_) => {
+                        self.dead_targets.clear(channel_id);
+                    }
+                    Err(error) => {
+                        if let Some((code, reason)) = is_discord_dead_target_error(&error) {
+                            self.dead_targets
+                                .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                            tracing::warn!(
+                                channel_id,
+                                code,
+                                %reason,
+                                "marked target channel dead due to 403/404"
+                            );
+                        }
+                        return Err(error.into());
+                    }
+                }
             }
             OutboundAction::DeleteMessage {
                 session,
                 platform_message_id,
             } => {
                 let http = self.http_for(&session)?;
+                let channel = Self::target(&session)?;
+                let channel_id = channel.get();
+
+                if self.dead_targets.is_dead(channel_id) {
+                    return Ok(());
+                }
+
                 let message_id = platform_message_id
                     .parse::<u64>()
                     .map(MessageId::new)
@@ -1274,22 +1465,65 @@ impl OutboundDispatcher for DiscordEgress {
                             "invalid Discord message ID: {platform_message_id}"
                         ))
                     })?;
-                Self::target(&session)?
-                    .delete_message(&http, message_id)
-                    .await?;
+                match channel.delete_message(&http, message_id).await {
+                    Ok(_) => {
+                        self.dead_targets.clear(channel_id);
+                    }
+                    Err(error) => {
+                        if let Some((code, reason)) = is_discord_dead_target_error(&error) {
+                            self.dead_targets
+                                .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                        }
+                        return Err(error.into());
+                    }
+                }
             }
             OutboundAction::UploadFile { session, path } => {
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
-                self.file_uploader.upload(http, channel, &path).await?;
+                let channel_id = channel.get();
+
+                if self.dead_targets.is_dead(channel_id) {
+                    tracing::warn!(
+                        channel_id,
+                        "skipping file upload to dead target (403/404 short-circuit)"
+                    );
+                    return Ok(());
+                }
+
+                match self.file_uploader.upload(http, channel, &path).await {
+                    Ok(()) => {
+                        self.dead_targets.clear(channel_id);
+                    }
+                    Err(err) => {
+                        if let OmonError::Discord(boxed) = &err {
+                            if let Some((code, reason)) = is_discord_dead_target_error(boxed) {
+                                self.dead_targets
+                                    .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                                tracing::warn!(
+                                    channel_id,
+                                    code,
+                                    %reason,
+                                    "marked target channel dead during upload"
+                                );
+                            }
+                        }
+                        return Err(err);
+                    }
+                }
             }
             OutboundAction::Stream { session, chunk } => {
                 self.stream(session, chunk).await?;
             }
             OutboundAction::Typing { session, active } => {
+                let channel = Self::target(&session)?;
+                let channel_id = channel.get();
+                if self.dead_targets.is_dead(channel_id) {
+                    return Ok(());
+                }
+
                 if active {
                     let http = self.http_for(&session)?;
-                    let channel = Self::target(&session)?;
                     let guard = http.start_typing(channel);
                     self.typing
                         .lock()
@@ -1305,8 +1539,13 @@ impl OutboundDispatcher for DiscordEgress {
                 emoji,
                 remove_others,
             } => {
-                let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
+                let channel_id = channel.get();
+                if self.dead_targets.is_dead(channel_id) {
+                    return Ok(());
+                }
+
+                let http = self.http_for(&session)?;
                 let msg_id = message_id.parse::<u64>().map(MessageId::new).map_err(|_| {
                     OmonError::Config(format!("invalid Discord message ID: {message_id}"))
                 })?;
@@ -1348,6 +1587,16 @@ impl OutboundDispatcher for DiscordEgress {
             } => {
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
+                let channel_id = channel.get();
+
+                if self.dead_targets.is_dead(channel_id) {
+                    tracing::warn!(
+                        channel_id,
+                        "skipping approval request to dead target (403/404 short-circuit)"
+                    );
+                    return Ok(());
+                }
+
                 let content = build_approval_content_with_mentions(
                     &command,
                     &reason,
@@ -1355,7 +1604,7 @@ impl OutboundDispatcher for DiscordEgress {
                     self.approval_mentions,
                 );
                 let embed = build_approval_embed(&command, &reason);
-                let msg = channel
+                match channel
                     .send_message(
                         &http,
                         CreateMessage::new()
@@ -1364,25 +1613,46 @@ impl OutboundDispatcher for DiscordEgress {
                             .components(approval_buttons(request_id))
                             .allowed_mentions(safe_allowed_mentions()),
                     )
-                    .await?;
-                self.record_approval_message(request_id, session, channel, msg.id)
-                    .await;
+                    .await
+                {
+                    Ok(msg) => {
+                        self.dead_targets.clear(channel_id);
+                        self.record_approval_message(request_id, session, channel, msg.id)
+                            .await;
+                    }
+                    Err(error) => {
+                        if let Some((code, reason)) = is_discord_dead_target_error(&error) {
+                            self.dead_targets
+                                .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                            tracing::warn!(
+                                channel_id,
+                                code,
+                                %reason,
+                                "marked target channel dead due to 403/404 on approval request"
+                            );
+                        }
+                        return Err(error.into());
+                    }
+                }
             }
             OutboundAction::ExpireApproval { request_id } => {
                 if let Some((session, channel, message_id)) =
                     self.remove_approval_message(&request_id).await
                 {
-                    if let Ok(http) = self.http_for(&session) {
-                        let _ = channel
-                            .edit_message(
-                                &http,
-                                message_id,
-                                EditMessage::new()
-                                    .components(Vec::new())
-                                    .content("⏱ Approval request expired")
-                                    .allowed_mentions(safe_allowed_mentions()),
-                            )
-                            .await;
+                    let channel_id = channel.get();
+                    if !self.dead_targets.is_dead(channel_id) {
+                        if let Ok(http) = self.http_for(&session) {
+                            let _ = channel
+                                .edit_message(
+                                    &http,
+                                    message_id,
+                                    EditMessage::new()
+                                        .components(Vec::new())
+                                        .content("⏱ Approval request expired")
+                                        .allowed_mentions(safe_allowed_mentions()),
+                                )
+                                .await;
+                        }
                     }
                 }
             }
@@ -1966,5 +2236,58 @@ mod tests {
         );
         assert!(!content_no_mentions.starts_with("<@"));
         assert!(content_no_mentions.starts_with("⚠️ **Approval Required**"));
+    }
+
+    #[test]
+    fn test_dead_target_registry_lifecycle_and_ttl() {
+        let registry = DeadTargetRegistry::new();
+
+        assert!(!registry.is_dead(12345));
+        assert_eq!(registry.count(), 0);
+
+        // Mark channel 12345 dead
+        let newly_added = registry.mark_dead(12345, "HTTP 404: Unknown Channel");
+        assert!(newly_added);
+        assert!(registry.is_dead(12345));
+        assert_eq!(registry.count(), 1);
+
+        // Second mark is not newly added
+        assert!(!registry.mark_dead(12345, "HTTP 403: Forbidden"));
+        assert_eq!(registry.count(), 1);
+
+        let entry = registry.get(12345).unwrap();
+        assert_eq!(entry.channel_id, 12345);
+        assert_eq!(entry.reason, "HTTP 403: Forbidden");
+
+        // Clear channel 12345
+        assert!(registry.clear(12345));
+        assert!(!registry.is_dead(12345));
+        assert_eq!(registry.count(), 0);
+        assert!(!registry.clear(12345));
+
+        // Test with TTL
+        let ttl_registry = DeadTargetRegistry::with_ttl(Duration::from_millis(50));
+        ttl_registry.mark_dead(99999, "HTTP 403: Forbidden");
+        assert!(ttl_registry.is_dead(99999));
+
+        std::thread::sleep(Duration::from_millis(60));
+        // Expired after TTL -> false
+        assert!(!ttl_registry.is_dead(99999));
+        assert_eq!(ttl_registry.count(), 0);
+    }
+
+    #[test]
+    fn test_dead_target_registry_clear_all() {
+        let registry = DeadTargetRegistry::new();
+        registry.mark_dead(111, "HTTP 403");
+        registry.mark_dead(222, "HTTP 404");
+        registry.mark_dead(333, "HTTP 403");
+        assert_eq!(registry.count(), 3);
+
+        registry.clear_all();
+        assert_eq!(registry.count(), 0);
+        assert!(!registry.is_dead(111));
+        assert!(!registry.is_dead(222));
+        assert!(!registry.is_dead(333));
     }
 }
