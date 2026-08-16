@@ -6,8 +6,8 @@ pub mod throttler;
 
 pub use adapter::{DiscordAdapter, DiscordEgress, DiscordFileUploader, SerenityFileUploader};
 pub use approval::{
-    ApprovalDecision, ApprovalError, ApprovalPrompt, ApprovalRequester, DiscordApprovalRequester,
-    SmartApprovalGuard,
+    approval_buttons, is_approval_custom_id, ApprovalDecision, ApprovalError, ApprovalPrompt,
+    ApprovalRequester, DiscordApprovalRequester, SmartApprovalGuard,
 };
 pub use attachments::{
     AttachmentDownloader, DISCORD_ATTACHMENT_MAX_BYTES, DISCORD_ATTACHMENT_TIMEOUT,

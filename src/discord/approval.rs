@@ -159,6 +159,10 @@ pub fn approval_buttons(request_id: Uuid) -> Vec<CreateActionRow> {
     ])]
 }
 
+pub fn is_approval_custom_id(custom_id: &str) -> bool {
+    parse_custom_id(custom_id).is_some()
+}
+
 fn parse_custom_id(custom_id: &str) -> Option<(Uuid, ApprovalDecision)> {
     let mut parts = custom_id.split(':');
     if parts.next()? != "omon" || parts.next()? != "approval" {
@@ -174,4 +178,35 @@ fn parse_custom_id(custom_id: &str) -> Option<(Uuid, ApprovalDecision)> {
         return None;
     }
     Some((request_id, decision))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_approval_custom_id() {
+        let id = Uuid::new_v4();
+        assert!(is_approval_custom_id(&format!(
+            "omon:approval:{id}:approve"
+        )));
+        assert!(is_approval_custom_id(&format!("omon:approval:{id}:reject")));
+        assert!(!is_approval_custom_id("other:custom:id"));
+        assert!(!is_approval_custom_id("omon:approval:not-a-uuid:approve"));
+        assert!(!is_approval_custom_id("omon:approval:"));
+        assert!(!is_approval_custom_id(&format!(
+            "omon:approval:{id}:unknown"
+        )));
+        assert!(!is_approval_custom_id(&format!(
+            "omon:approval:{id}:approve:extra"
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_custom_id_unknown_uuid() {
+        let guard = SmartApprovalGuard::new();
+        let unknown_id = Uuid::new_v4();
+        let custom_id = format!("omon:approval:{unknown_id}:approve");
+        assert!(!guard.resolve_custom_id(&custom_id).await);
+    }
 }

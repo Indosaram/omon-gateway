@@ -12,7 +12,7 @@ use serenity::all::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::approval::{approval_buttons, SmartApprovalGuard};
+use super::approval::{approval_buttons, is_approval_custom_id, SmartApprovalGuard};
 use super::commands::{self, CommandError, PoiseData};
 use super::throttler::{
     chunk_markdown, DiscordMessageTransport, LiveEditThrottler, SerenityMessageTransport,
@@ -146,19 +146,23 @@ async fn handle_event(
         FullEvent::InteractionCreate {
             interaction: Interaction::Component(component),
         } => {
-            if data
-                .approvals
-                .resolve_custom_id(&component.data.custom_id)
-                .await
-            {
-                component
-                    .create_response(
-                        ctx,
-                        CreateInteractionResponse::UpdateMessage(
-                            CreateInteractionResponseMessage::new().components(Vec::new()),
-                        ),
+            if is_approval_custom_id(&component.data.custom_id) {
+                let response = if data
+                    .approvals
+                    .resolve_custom_id(&component.data.custom_id)
+                    .await
+                {
+                    CreateInteractionResponse::UpdateMessage(
+                        CreateInteractionResponseMessage::new().components(Vec::new()),
                     )
-                    .await?;
+                } else {
+                    CreateInteractionResponse::UpdateMessage(
+                        CreateInteractionResponseMessage::new()
+                            .components(Vec::new())
+                            .content("이 승인 요청은 더 이상 유효하지 않습니다 (게이트웨이 재시작 또는 만료됨). 명령을 다시 실행해 주세요."),
+                    )
+                };
+                component.create_response(ctx, response).await?;
             }
         }
         _ => {}
