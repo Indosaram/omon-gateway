@@ -386,6 +386,7 @@ struct Config {
     runtime_footer: bool,
     allow_bots: omon_gateway::AllowBotsMode,
     channel_topic_context: bool,
+    discord_missed_backfill: bool,
 }
 
 impl Config {
@@ -529,6 +530,10 @@ impl Config {
             ),
             allow_bots: omon_gateway::AllowBotsMode::parse(
                 optional_env("DISCORD_ALLOW_BOTS").as_deref(),
+            ),
+            discord_missed_backfill: parse_bool_from(
+                optional_env("DISCORD_MISSED_BACKFILL").as_deref(),
+                false,
             ),
         })
     }
@@ -2282,6 +2287,7 @@ async fn run_gateway() -> Result<()> {
     let mut poise_data = PoiseData::new(multiplexer.clone(), pool.clone());
     poise_data.pairing_store.init_cache().await?;
     poise_data.profile_router = profile_router;
+    poise_data.missed_backfill = config.discord_missed_backfill;
     poise_data.llm = Some(llm.clone());
     poise_data.tools = tool_names;
     poise_data.tool_registry = tools.clone();

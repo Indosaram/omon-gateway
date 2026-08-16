@@ -737,6 +737,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_creates_discord_channel_cursors_table() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+
+        let row = sqlx::query(
+            "SELECT channel_id, last_message_id, updated_at FROM discord_channel_cursors LIMIT 0",
+        )
+        .fetch_optional(database.pool())
+        .await;
+        assert!(
+            row.is_ok(),
+            "discord_channel_cursors table should exist with correct columns"
+        );
+    }
+
+    #[tokio::test]
     async fn migration_creates_pairing_tables_and_indexes() {
         let database = Database::connect("sqlite::memory:")
             .await

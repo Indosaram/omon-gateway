@@ -9,8 +9,9 @@ use serenity::all::{
     ChannelId, ChannelType, Color, CreateAllowedMentions, CreateAttachment, CreateEmbed,
     CreateForumPost, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
     CreateThread, EditMessage, FullEvent, GatewayIntents, GetMessages, HttpBuilder, Interaction,
-    Message, MessageFlags, MessageId, Typing,
+    Message, MessageFlags, MessageId, Typing, UserId,
 };
+use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -731,6 +732,12 @@ async fn handle_event(
 ) -> Result<(), CommandError> {
     match event {
         FullEvent::Message { new_message } => {
+            let _ = update_channel_cursor(
+                &data.pool,
+                &new_message.channel_id.to_string(),
+                &new_message.id.to_string(),
+            )
+            .await;
             tracing::info!(
                 author = %new_message.author.name,
                 author_id = %new_message.author.id,
@@ -1012,6 +1019,29 @@ async fn handle_event(
                     )
                 };
                 component.create_response(ctx, response).await?;
+            }
+        }
+        FullEvent::Ready { data_about_bot } => {
+            tracing::info!(
+                bot_name = %data_about_bot.user.name,
+                bot_id = %data_about_bot.user.id,
+                "Discord client ready"
+            );
+            if data.missed_backfill {
+                let pool = data.pool.clone();
+                let http = ctx.http.clone();
+                let poise_data = data.clone();
+                let bot_id = data_about_bot.user.id;
+                tokio::spawn(async move {
+                    match run_missed_message_backfill(&pool, &http, &poise_data, bot_id).await {
+                        Ok(count) => {
+                            tracing::info!(count, "missed-message startup backfill complete");
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, "missed-message startup backfill failed");
+                        }
+                    }
+                });
             }
         }
         _ => {}
@@ -2193,6 +2223,181 @@ pub fn is_authorized_clicker(user_id: u64, allowed: &[u64]) -> bool {
     allowed.is_empty() || allowed.contains(&user_id)
 }
 
+/// Determines if candidate_id represents a newer Discord message ID than current_cursor.
+///
+/// Discord IDs are 64-bit snowflakes: higher numeric value = newer message.
+pub fn should_advance_cursor(current_cursor: Option<&str>, candidate_id: &str) -> bool {
+    let candidate_num = match candidate_id.trim().parse::<u64>() {
+        Ok(num) => num,
+        Err(_) => return false,
+    };
+
+    let Some(current_str) = current_cursor.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+
+    match current_str.parse::<u64>() {
+        Ok(current_num) => candidate_num > current_num,
+        Err(_) => true,
+    }
+}
+
+/// Updates the durable last-seen message ID cursor for a channel if `message_id` is newer.
+pub async fn update_channel_cursor(
+    pool: &SqlitePool,
+    channel_id: &str,
+    message_id: &str,
+) -> Result<bool> {
+    if channel_id.trim().is_empty() || message_id.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT last_message_id FROM discord_channel_cursors WHERE channel_id = ?")
+            .bind(channel_id)
+            .fetch_optional(pool)
+            .await?;
+
+    let should_update = match existing {
+        Some((current_id,)) => should_advance_cursor(Some(&current_id), message_id),
+        None => true,
+    };
+
+    if should_update {
+        sqlx::query(
+            "INSERT INTO discord_channel_cursors (channel_id, last_message_id, updated_at)
+             VALUES (?, ?, (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+             ON CONFLICT(channel_id) DO UPDATE SET
+                last_message_id = excluded.last_message_id,
+                updated_at = excluded.updated_at",
+        )
+        .bind(channel_id)
+        .bind(message_id)
+        .execute(pool)
+        .await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Fetches the stored last-seen message ID for a channel.
+pub async fn get_channel_cursor(pool: &SqlitePool, channel_id: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT last_message_id FROM discord_channel_cursors WHERE channel_id = ?")
+            .bind(channel_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(id,)| id))
+}
+
+/// Scans recent channel history for messages missed while the gateway was offline.
+pub async fn run_missed_message_backfill(
+    pool: &SqlitePool,
+    http: &Arc<serenity::http::Http>,
+    data: &PoiseData,
+    bot_user_id: UserId,
+) -> Result<usize> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT channel_id, last_message_id FROM discord_channel_cursors")
+            .fetch_all(pool)
+            .await?;
+
+    let mut total_backfilled = 0;
+
+    for (channel_id_str, last_msg_id_str) in rows {
+        let Ok(channel_id_num) = channel_id_str.parse::<u64>() else {
+            continue;
+        };
+        let Ok(last_msg_id_num) = last_msg_id_str.parse::<u64>() else {
+            continue;
+        };
+
+        let channel_id = ChannelId::new(channel_id_num);
+        let after_id = MessageId::new(last_msg_id_num);
+
+        let builder = serenity::builder::GetMessages::new()
+            .after(after_id)
+            .limit(50);
+        let messages = match channel_id.messages(http, builder).await {
+            Ok(msgs) => msgs,
+            Err(err) => {
+                tracing::warn!(
+                    channel_id = %channel_id_str,
+                    %err,
+                    "failed to fetch messages for missed-message backfill"
+                );
+                continue;
+            }
+        };
+
+        let mut max_seen_id = last_msg_id_num;
+
+        let mut sorted_messages = messages;
+        sorted_messages.sort_by_key(|m| m.id.get());
+
+        for msg in sorted_messages {
+            let msg_id_num = msg.id.get();
+            if msg_id_num > max_seen_id {
+                max_seen_id = msg_id_num;
+            }
+
+            if msg.author.bot {
+                continue;
+            }
+
+            let channel_type = match msg.channel_id.to_channel(http).await {
+                Ok(serenity::Channel::Guild(channel)) => Some(channel.kind),
+                _ => Some(ChannelType::Private),
+            };
+
+            let paired_users = data.pairing_store.get_paired_user_ids().await;
+            let active_threads: Vec<u64> = data
+                .active_threads
+                .read()
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default();
+
+            let config = InboundFilterConfig {
+                free_response_channels: &data.free_response_channels,
+                allowed_users: &data.allowed_users,
+                allowed_roles: &data.allowed_roles,
+                user_roles: &[],
+                allow_all_users: data.allow_all_users,
+                thread_sessions_per_user: data.thread_sessions_per_user,
+                active_threads: &active_threads,
+                allowed_channels: &data.allowed_channels,
+                ignored_channels: &data.ignored_channels,
+                primary_bot_id: data.primary_bot_id,
+                thread_require_mention: data.thread_require_mention,
+                allow_bots: data.allow_bots,
+                paired_users: &paired_users,
+            };
+
+            if let Some(event) =
+                message_to_inbound_with_config(&msg, bot_user_id, channel_type, &config)
+            {
+                tracing::info!(
+                    message_id = %msg.id,
+                    channel = %msg.channel_id,
+                    "backfilling missed Discord message from offline window"
+                );
+                if let Ok(routed) = route_claimed_event(data, event).await {
+                    if routed {
+                        total_backfilled += 1;
+                    }
+                }
+            }
+        }
+
+        if max_seen_id > last_msg_id_num {
+            let _ = update_channel_cursor(pool, &channel_id_str, &max_seen_id.to_string()).await;
+        }
+    }
+
+    Ok(total_backfilled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2201,6 +2406,65 @@ mod tests {
 
     fn test_session(name: &str) -> SessionKey {
         SessionKey::new("discord", Some("guild"), "channel", None::<String>, name)
+    }
+
+    #[test]
+    fn test_should_advance_cursor_logic() {
+        // None current cursor -> always advances for valid snowflake
+        assert!(should_advance_cursor(None, "1000000000"));
+
+        // Newer snowflake (> current) -> advances
+        assert!(should_advance_cursor(Some("1000000000"), "1000000001"));
+        assert!(should_advance_cursor(Some("500"), "1000000000"));
+
+        // Older or equal snowflake (<= current) -> does NOT advance
+        assert!(!should_advance_cursor(Some("1000000001"), "1000000000"));
+        assert!(!should_advance_cursor(Some("1000000000"), "1000000000"));
+
+        // Invalid candidate -> does NOT advance
+        assert!(!should_advance_cursor(
+            Some("1000000000"),
+            "not-a-snowflake"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_channel_cursor_persistence_roundtrip() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+
+        // Initial check: None
+        let initial = get_channel_cursor(&pool, "chan-123").await.unwrap();
+        assert_eq!(initial, None);
+
+        // Update cursor with first message
+        let updated = update_channel_cursor(&pool, "chan-123", "1000")
+            .await
+            .unwrap();
+        assert!(updated);
+        assert_eq!(
+            get_channel_cursor(&pool, "chan-123").await.unwrap(),
+            Some("1000".to_string())
+        );
+
+        // Update with older message -> should not update
+        let older = update_channel_cursor(&pool, "chan-123", "500")
+            .await
+            .unwrap();
+        assert!(!older);
+        assert_eq!(
+            get_channel_cursor(&pool, "chan-123").await.unwrap(),
+            Some("1000".to_string())
+        );
+
+        // Update with newer message -> should update
+        let newer = update_channel_cursor(&pool, "chan-123", "2000")
+            .await
+            .unwrap();
+        assert!(newer);
+        assert_eq!(
+            get_channel_cursor(&pool, "chan-123").await.unwrap(),
+            Some("2000".to_string())
+        );
     }
 
     #[test]

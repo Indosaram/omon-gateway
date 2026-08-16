@@ -47,6 +47,7 @@ pub struct PoiseData {
     pub llm: Option<LlmClient>,
     pub profile_router: ProfileRouter,
     pub pairing_store: super::PairingStore,
+    pub missed_backfill: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,6 +93,7 @@ impl PoiseData {
             llm: None,
             profile_router,
             pairing_store,
+            missed_backfill: false,
         }
     }
 
