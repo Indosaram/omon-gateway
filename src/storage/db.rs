@@ -91,6 +91,7 @@ mod tests {
             "cron_jobs",
             "memories",
             "cron_runs",
+            "delivery_obligations",
         ] {
             assert!(tables.contains(expected), "missing table {expected}");
         }

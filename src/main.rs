@@ -12,11 +12,11 @@ use omon_gateway::{
     augmented_path_from_environment, cron_runs_retention_days_from_environment,
     prune_terminal_cron_runs, render_user_prompt, AgentRunner, ApprovalPolicy,
     AttachmentDownloader, ChatMessage, CronJob, CronScheduler, CronTaskExecutor, CronTool,
-    DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool, HermesJob,
-    HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore,
-    MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher, PoiseData, Result,
-    ScaleToZero, SessionContext, SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool,
-    ToolDefinition, ToolRegistry,
+    DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool,
+    HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool,
+    MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher, PoiseData,
+    Result, ScaleToZero, SessionContext, SessionKey, SessionMultiplexer, SmartApprovalGuard,
+    TerminalTool, ToolDefinition, ToolRegistry,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -511,6 +511,16 @@ impl LiveAgentRunner {
             chunk
         };
         let stream_id = chunk.stream_id;
+        let obligation_id = format!("obl_{stream_id}");
+        let ledger = DeliveryLedgerService::new(self.pool.clone());
+
+        if final_chunk {
+            let _ = ledger
+                .record_obligation(&obligation_id, &session.key, &chunk.content)
+                .await;
+            let _ = ledger.mark_obligation_attempting(&obligation_id).await;
+        }
+
         let result = self
             .dispatcher
             .dispatch(OutboundAction::Stream {
@@ -518,7 +528,18 @@ impl LiveAgentRunner {
                 chunk,
             })
             .await;
+
         if final_chunk {
+            match &result {
+                Ok(_) => {
+                    let _ = ledger.mark_obligation_delivered(&obligation_id).await;
+                }
+                Err(error) => {
+                    let _ = ledger
+                        .mark_obligation_failed(&obligation_id, &error.to_string())
+                        .await;
+                }
+            }
             let mut streams = self.streams.lock();
             if streams
                 .get(&session_key)
@@ -542,7 +563,14 @@ impl AgentRunner for LiveAgentRunner {
     async fn cancel(&self, session: &SessionContext) -> Result<()> {
         let stream = self.streams.lock().remove(&session.key.storage_key());
         if let Some(stream) = stream {
-            self.dispatcher
+            let obligation_id = format!("obl_{}", stream.stream_id);
+            let ledger = DeliveryLedgerService::new(self.pool.clone());
+            let _ = ledger
+                .record_obligation(&obligation_id, &session.key, &stream.content)
+                .await;
+            let _ = ledger.mark_obligation_attempting(&obligation_id).await;
+            let result = self
+                .dispatcher
                 .dispatch(OutboundAction::Stream {
                     session: session.key.clone(),
                     chunk: omon_gateway::StreamChunk {
@@ -552,7 +580,18 @@ impl AgentRunner for LiveAgentRunner {
                         is_final: true,
                     },
                 })
-                .await?;
+                .await;
+            match &result {
+                Ok(_) => {
+                    let _ = ledger.mark_obligation_delivered(&obligation_id).await;
+                }
+                Err(error) => {
+                    let _ = ledger
+                        .mark_obligation_failed(&obligation_id, &error.to_string())
+                        .await;
+                }
+            }
+            result?;
         }
         Ok(())
     }
@@ -638,6 +677,75 @@ pub fn repair_message_sequence(msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut result = leading_system;
     result.extend(merged_non_system);
     result
+}
+
+/// Startup recovery sweep: finds undelivered obligations from previous dead processes,
+/// claims them, and re-dispatches them to the platform (tagging recovered deliveries).
+pub async fn recover_pending_delivery_obligations(
+    pool: &SqlitePool,
+    dispatcher: Arc<dyn OutboundDispatcher>,
+) -> Result<usize> {
+    let ledger = DeliveryLedgerService::new(pool.clone());
+    let recoverable = ledger.sweep_recoverable(3, 86400).await?;
+    let count = recoverable.len();
+    for obligation in recoverable {
+        let session_key: SessionKey = if let Ok(Some((platform, guild_id, channel_id, thread_id, user_id))) =
+            sqlx::query_as::<_, (String, Option<String>, String, Option<String>, String)>(
+                "SELECT platform, guild_id, channel_id, thread_id, user_id FROM sessions WHERE session_key = ?",
+            )
+            .bind(&obligation.session_key)
+            .fetch_optional(pool)
+            .await
+        {
+            SessionKey::new(platform, guild_id, channel_id, thread_id, user_id)
+        } else {
+            SessionKey::new(
+                "discord",
+                None::<String>,
+                &obligation.channel_id,
+                obligation.thread_id.as_deref(),
+                "recovered-delivery",
+            )
+        };
+
+        let content = if obligation.state == "pending" {
+            obligation.content.clone()
+        } else {
+            format!(
+                "{}{}",
+                omon_gateway::ledger::RECOVERED_REPLY_MARKER,
+                obligation.content
+            )
+        };
+
+        let stream_id = Uuid::new_v4();
+        let chunk = omon_gateway::StreamChunk {
+            stream_id,
+            sequence: 0,
+            content,
+            is_final: true,
+        };
+
+        let _ = ledger.mark_obligation_attempting(&obligation.id).await;
+        let result = dispatcher
+            .dispatch(OutboundAction::Stream {
+                session: session_key,
+                chunk,
+            })
+            .await;
+
+        match result {
+            Ok(_) => {
+                let _ = ledger.mark_obligation_delivered(&obligation.id).await;
+            }
+            Err(error) => {
+                let _ = ledger
+                    .mark_obligation_failed(&obligation.id, &error.to_string())
+                    .await;
+            }
+        }
+    }
+    Ok(count)
 }
 
 fn tool_enabled(name: &str, enabled: Option<&[String]>) -> bool {
@@ -1144,6 +1252,13 @@ async fn run_gateway() -> Result<()> {
     let cron_sync = HermesStoreSynchronizer::from_environment(pool.clone())?;
     let imported = cron_sync.sync().await?;
     info!(imported, "synchronized Hermes cron stores");
+
+    let recovered = recover_pending_delivery_obligations(&pool, discord_egress.clone()).await?;
+    info!(
+        recovered,
+        "recovered pending outbound delivery obligations on boot"
+    );
+
     let scheduler = CronScheduler::with_dispatcher(
         pool.clone(),
         Arc::new(AgentCronExecutor {
@@ -1736,5 +1851,134 @@ mod runner_tests {
         assert_eq!(repaired[2].content, "unprompted greeting");
         assert_eq!(repaired[3].role, "user");
         assert_eq!(repaired[3].content, "my answer");
+    }
+
+    #[tokio::test]
+    async fn test_emit_records_and_completes_delivery_obligation() {
+        let (base_url, server_handle) = spawn_two_turn_tool_llm_server().await;
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-emit-obl",
+            None::<String>,
+            "user-1",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        let event =
+            omon_gateway::InboundEvent::message(session_key.clone(), "msg-emit", "Hello obl");
+
+        let response = runner
+            .execute(&mut session, event, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(response, "Final result content");
+
+        // Check delivery_obligations table
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT id, state, content FROM delivery_obligations WHERE channel_id = 'chan-emit-obl'",
+        )
+        .fetch_all(&runner.pool)
+        .await
+        .unwrap();
+
+        assert!(
+            !rows.is_empty(),
+            "Expected at least 1 delivery obligation recorded"
+        );
+        // All recorded obligations should be marked 'delivered' after successful dispatch
+        for (id, state, content) in rows {
+            assert_eq!(
+                state, "delivered",
+                "obligation {id} state should be delivered"
+            );
+            assert!(content.contains("Final result content"));
+        }
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_recover_pending_delivery_obligations_redispatches_dead_process_rows() {
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let dead_pid = 999_999_i64;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            Some("guild-1"),
+            "chan-recover",
+            None::<String>,
+            "user-recover",
+        );
+        super::ensure_agent_session(
+            &pool,
+            &omon_gateway::SessionContext::new(session_key.clone()),
+        )
+        .await
+        .unwrap();
+
+        let ledger = omon_gateway::ledger::DeliveryLedgerService::new(pool.clone());
+        // 1. Pending obligation from dead process
+        let _ = ledger
+            .record_obligation("obl-rec-pending", &session_key, "first dead text")
+            .await;
+        sqlx::query("UPDATE delivery_obligations SET owner_pid = ? WHERE id = 'obl-rec-pending'")
+            .bind(dead_pid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 2. Attempting obligation from dead process (crashed mid-send)
+        let _ = ledger
+            .record_obligation("obl-rec-attempting", &session_key, "second dead text")
+            .await;
+        sqlx::query("UPDATE delivery_obligations SET state = 'attempting', owner_pid = ? WHERE id = 'obl-rec-attempting'")
+            .bind(dead_pid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let recovered_count =
+            super::recover_pending_delivery_obligations(&pool, dispatcher.clone())
+                .await
+                .unwrap();
+        assert_eq!(recovered_count, 2);
+
+        // Verify actions dispatched
+        let actions = dispatcher.actions.lock().await.clone();
+        assert_eq!(actions.len(), 2);
+
+        let contents: Vec<String> = actions
+            .iter()
+            .map(|a| match a {
+                omon_gateway::OutboundAction::Stream { chunk, .. } => chunk.content.clone(),
+                _ => String::new(),
+            })
+            .collect();
+
+        // Pending obligation should NOT have duplicate marker
+        assert_eq!(contents[0], "first dead text");
+        // Attempting obligation SHOULD have the recovered duplicate marker
+        assert!(contents[1].contains("♻️ Recovered reply"));
+        assert!(contents[1].contains("second dead text"));
+
+        // Both obligations should now be marked 'delivered' in the database
+        let obl1: omon_gateway::ledger::DeliveryObligation = ledger
+            .get_obligation("obl-rec-pending")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(obl1.state, "delivered");
+        let obl2: omon_gateway::ledger::DeliveryObligation = ledger
+            .get_obligation("obl-rec-attempting")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(obl2.state, "delivered");
     }
 }
