@@ -8,7 +8,7 @@ use sqlx::SqlitePool;
 
 use super::approval::SmartApprovalGuard;
 use super::attachments::AttachmentDownloader;
-use crate::{ChatMessage, LlmClient, OmonError, SessionKey, SessionMultiplexer};
+use crate::{ChatMessage, LlmClient, OmonError, ProfileRouter, SessionKey, SessionMultiplexer};
 
 pub type CommandError = Box<dyn std::error::Error + Send + Sync>;
 pub type PoiseContext<'a> = poise::Context<'a, PoiseData, CommandError>;
@@ -38,6 +38,7 @@ pub struct PoiseData {
     pub attachment_downloader: Option<AttachmentDownloader>,
     pub tool_registry: crate::ToolRegistry,
     pub llm: Option<LlmClient>,
+    pub profile_router: ProfileRouter,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +51,7 @@ pub struct GatewayStats {
 
 impl PoiseData {
     pub fn new(multiplexer: SessionMultiplexer, pool: SqlitePool) -> Self {
+        let profile_router = multiplexer.profile_router().clone();
         Self {
             multiplexer,
             pool,
@@ -72,6 +74,7 @@ impl PoiseData {
             attachment_downloader: None,
             tool_registry: crate::ToolRegistry::new(),
             llm: None,
+            profile_router,
         }
     }
 

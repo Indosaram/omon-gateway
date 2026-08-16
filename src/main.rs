@@ -10,13 +10,13 @@ use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
     augmented_path_from_environment, cron_runs_retention_days_from_environment,
-    prune_terminal_cron_runs, render_user_prompt, AgentRunner, ApprovalPolicy,
-    AttachmentDownloader, ChatMessage, CronJob, CronScheduler, CronTaskExecutor, CronTool,
-    DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool,
-    HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool,
-    MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher, PoiseData,
-    Result, ScaleToZero, SessionContext, SessionKey, SessionMultiplexer, SmartApprovalGuard,
-    TerminalTool, ToolDefinition, ToolRegistry,
+    parse_profile_routes, prune_terminal_cron_runs, render_user_prompt, AgentRunner,
+    ApprovalPolicy, AttachmentDownloader, ChatMessage, CronJob, CronScheduler, CronTaskExecutor,
+    CronTool, DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress,
+    FileTool, HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider,
+    McpTool, MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher,
+    PoiseData, ProfileRoute, ProfileRouter, Result, ScaleToZero, SessionContext, SessionKey,
+    SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -374,6 +374,7 @@ struct Config {
     channel_context_limit: usize,
     approval_policy: ApprovalPolicy,
     approval_timeout_secs: u64,
+    profile_routes: Vec<ProfileRoute>,
 }
 
 impl Config {
@@ -475,6 +476,9 @@ impl Config {
             approval_policy: ApprovalPolicy::parse(optional_env("APPROVAL_MODE").as_deref()),
             approval_timeout_secs: approval_timeout_secs_from(
                 optional_env("APPROVAL_TIMEOUT_SECS").as_deref(),
+            ),
+            profile_routes: parse_profile_routes(
+                &optional_env("DISCORD_PROFILE_ROUTES").unwrap_or_default(),
             ),
         })
     }
@@ -715,7 +719,8 @@ impl LiveAgentRunner {
             let mut messages = repair_message_sequence(messages);
             ensure_agent_session(&self.pool, session).await?;
             let tools = execution_tools.unwrap_or(&self.tools);
-            let definitions = Self::tool_definitions(tools, enabled_tools);
+            let tool_filter = enabled_tools.or(session.state.enabled_toolsets.as_deref());
+            let definitions = Self::tool_definitions(tools, tool_filter);
             let llm = match session.state.active_model.as_deref() {
                 Some(model) if model != self.llm.config().model => {
                     let mut config = self.llm.config().clone();
@@ -930,7 +935,14 @@ impl LiveAgentRunner {
 #[async_trait]
 impl AgentRunner for LiveAgentRunner {
     async fn run(&self, session: &mut SessionContext, event: InboundEvent) -> Result<()> {
-        self.execute(session, event, None, None, true)
+        let enabled_tools = session.state.enabled_toolsets.clone().or_else(|| {
+            session
+                .state
+                .metadata
+                .get("enabled_toolsets")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+        });
+        self.execute(session, event, enabled_tools.as_deref(), None, true)
             .await
             .map(|_| ())
     }
@@ -1601,11 +1613,13 @@ async fn run_gateway() -> Result<()> {
         workspace_root: config.workspace_root.clone(),
         streams: ParkingMutex::new(HashMap::new()),
     });
-    let multiplexer = SessionMultiplexer::with_dispatcher(
+    let profile_router = ProfileRouter::new(config.profile_routes.clone());
+    let multiplexer = SessionMultiplexer::with_profile_router(
         pool.clone(),
         runner.clone(),
         Some(shared_dispatcher.clone()),
         MultiplexerConfig::default(),
+        profile_router.clone(),
     );
     let scale_to_zero = ScaleToZero::start(multiplexer.clone());
 
@@ -1659,6 +1673,7 @@ async fn run_gateway() -> Result<()> {
     scheduler.start().await;
 
     let mut poise_data = PoiseData::new(multiplexer, pool.clone());
+    poise_data.profile_router = profile_router;
     poise_data.llm = Some(llm.clone());
     poise_data.tools = tool_names;
     poise_data.tool_registry = tools.clone();
@@ -2625,6 +2640,70 @@ mod runner_tests {
         assert!(assistant_msg.is_some());
         let content = &assistant_msg.unwrap().1;
         assert_eq!(content, "Hello user!");
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_live_agent_runner_applies_session_custom_system_prompt_and_toolsets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = captured_requests.clone();
+
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]).into_owned();
+                captured.lock().await.push(req_str);
+
+                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Profile response\"}}]}\n\ndata: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let (runner, _dir) =
+            build_test_runner(format!("http://{address}/v1"), dispatcher.clone()).await;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            Some("guild-routed"),
+            "chan-profile",
+            None::<String>,
+            "user-1",
+        );
+        let mut session = omon_gateway::SessionContext::new(session_key.clone());
+        session.state.system_prompt = Some("Custom profile prompt for this channel".into());
+        session.state.enabled_toolsets = Some(vec!["terminal".into()]);
+
+        let event = omon_gateway::InboundEvent::message(
+            session_key.clone(),
+            "msg-profile",
+            "Hello profile",
+        );
+
+        let response = runner
+            .execute(&mut session, event, None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(response, "Profile response");
+
+        let reqs = captured_requests.lock().await.clone();
+        assert!(!reqs.is_empty(), "LLM must receive request");
+        let first_req = &reqs[0];
+        assert!(
+            first_req.contains("Custom profile prompt for this channel"),
+            "Payload sent to LLM must contain the profile system prompt: {first_req}"
+        );
 
         server_handle.await.unwrap();
     }

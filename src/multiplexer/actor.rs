@@ -9,8 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    render_user_prompt, DeliveryLedgerService, InboundEvent, OmonError, OutboundAction, Result,
-    SessionContext, SessionKey,
+    render_user_prompt, DeliveryLedgerService, InboundEvent, OmonError, OutboundAction,
+    ProfileRouter, Result, SessionContext, SessionKey, SessionState,
 };
 
 /// Sensible maximum number of pending events queued per session actor.
@@ -78,8 +78,9 @@ impl SessionActor {
         runner: Arc<dyn AgentRunner>,
         dispatcher: Option<Arc<dyn OutboundDispatcher>>,
         pool: SqlitePool,
+        profile_router: Option<Arc<ProfileRouter>>,
     ) -> Result<Self> {
-        let context = load_context(&pool, key).await?;
+        let context = load_context(&pool, key, profile_router.as_deref()).await?;
         Ok(Self {
             context,
             receiver,
@@ -340,7 +341,11 @@ impl SessionActor {
     }
 }
 
-async fn load_context(pool: &SqlitePool, key: SessionKey) -> Result<SessionContext> {
+async fn load_context(
+    pool: &SqlitePool,
+    key: SessionKey,
+    profile_router: Option<&ProfileRouter>,
+) -> Result<SessionContext> {
     let row: Option<(String, chrono::DateTime<Utc>, chrono::DateTime<Utc>)> = sqlx::query_as(
         "SELECT state_json, created_at, updated_at FROM sessions WHERE session_key = ?",
     )
@@ -348,13 +353,42 @@ async fn load_context(pool: &SqlitePool, key: SessionKey) -> Result<SessionConte
     .fetch_optional(pool)
     .await?;
     match row {
-        Some((state_json, created_at, updated_at)) => Ok(SessionContext {
-            key,
-            state: serde_json::from_str(&state_json).map_err(serialization_error)?,
-            created_at,
-            updated_at,
-        }),
-        None => Ok(SessionContext::new(key)),
+        Some((state_json, created_at, updated_at)) => {
+            let mut state: SessionState =
+                serde_json::from_str(&state_json).map_err(serialization_error)?;
+            if let Some(router) = profile_router {
+                if let Some(route) = router.match_session(&key) {
+                    if state.active_model.is_none() {
+                        state.active_model = route.model.clone();
+                    }
+                    if state.system_prompt.is_none() {
+                        state.system_prompt = route.system_prompt.clone();
+                    }
+                    if state.enabled_toolsets.is_none() {
+                        state.enabled_toolsets = route.enabled_toolsets.clone();
+                    }
+                    if let Some(toolsets) = &route.enabled_toolsets {
+                        state
+                            .metadata
+                            .entry("enabled_toolsets".into())
+                            .or_insert_with(|| serde_json::json!(toolsets));
+                    }
+                }
+            }
+            Ok(SessionContext {
+                key,
+                state,
+                created_at,
+                updated_at,
+            })
+        }
+        None => {
+            let mut context = SessionContext::new(key);
+            if let Some(router) = profile_router {
+                router.apply_to_session(&mut context);
+            }
+            Ok(context)
+        }
     }
 }
 
@@ -427,7 +461,7 @@ mod tests {
         });
 
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
-        let actor = SessionActor::load(key.clone(), cmd_rx, runner, None, db.pool().clone())
+        let actor = SessionActor::load(key.clone(), cmd_rx, runner, None, db.pool().clone(), None)
             .await
             .unwrap();
         let handle = tokio::spawn(actor.run());
@@ -490,7 +524,7 @@ mod tests {
         });
 
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
-        let actor = SessionActor::load(key.clone(), cmd_rx, runner, None, db.pool().clone())
+        let actor = SessionActor::load(key.clone(), cmd_rx, runner, None, db.pool().clone(), None)
             .await
             .unwrap();
         let handle = tokio::spawn(actor.run());
@@ -522,5 +556,111 @@ mod tests {
 
         drop(cmd_tx);
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_load_applies_profile_routes_to_fresh_and_preserves_explicit_model() {
+        use crate::ProfileRoute;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let route = ProfileRoute {
+            name: Some("profile-1".into()),
+            guild: Some(123),
+            channel: Some(456),
+            thread: None,
+            enabled: true,
+            model: Some("profile-model".into()),
+            system_prompt: Some("profile-prompt".into()),
+            enabled_toolsets: Some(vec!["terminal".into(), "web".into()]),
+        };
+        let router = Arc::new(ProfileRouter::new(vec![route]));
+
+        // 1. Fresh session (not in DB)
+        let key = SessionKey::new(
+            "discord",
+            Some("123"),
+            "456",
+            None::<String>,
+            "user-profile-test",
+        );
+        let (_tx1, rx1) = mpsc::channel(32);
+        let runner = Arc::new(TurnRecordingRunner {
+            started: mpsc::unbounded_channel().0,
+            barrier: Arc::new(Barrier::new(1)),
+            completed: mpsc::unbounded_channel().0,
+        });
+        let actor = SessionActor::load(
+            key.clone(),
+            rx1,
+            runner.clone(),
+            None,
+            db.pool().clone(),
+            Some(router.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            actor.context.state.active_model.as_deref(),
+            Some("profile-model")
+        );
+        assert_eq!(
+            actor.context.state.system_prompt.as_deref(),
+            Some("profile-prompt")
+        );
+        assert_eq!(
+            actor.context.state.enabled_toolsets.as_deref(),
+            Some(&["terminal".to_string(), "web".to_string()][..])
+        );
+
+        // 2. Existing session in DB with explicit model set via `/model`
+        let key2 = SessionKey::new(
+            "discord",
+            Some("123"),
+            "456",
+            None::<String>,
+            "user-explicit-model",
+        );
+        let explicit_state = SessionState {
+            active_model: Some("explicit-user-model".into()),
+            ..Default::default()
+        };
+        let explicit_json = serde_json::to_string(&explicit_state).unwrap();
+
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, guild_id, channel_id, user_id, state_json) VALUES (?, 'discord', '123', '456', 'user-explicit-model', ?)"
+        )
+        .bind(key2.storage_key())
+        .bind(&explicit_json)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let (_tx2, rx2) = mpsc::channel(32);
+        let actor2 = SessionActor::load(
+            key2.clone(),
+            rx2,
+            runner.clone(),
+            None,
+            db.pool().clone(),
+            Some(router.clone()),
+        )
+        .await
+        .unwrap();
+
+        // Explicit model must NOT be clobbered by profile
+        assert_eq!(
+            actor2.context.state.active_model.as_deref(),
+            Some("explicit-user-model")
+        );
+        // But unset prompt and toolsets are populated from profile defaults
+        assert_eq!(
+            actor2.context.state.system_prompt.as_deref(),
+            Some("profile-prompt")
+        );
+        assert_eq!(
+            actor2.context.state.enabled_toolsets.as_deref(),
+            Some(&["terminal".to_string(), "web".to_string()][..])
+        );
     }
 }

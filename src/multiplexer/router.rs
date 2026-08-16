@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, watch, Notify};
 
-use crate::{InboundEvent, OmonError, Result, SessionKey};
+use crate::{InboundEvent, OmonError, ProfileRouter, Result, SessionKey};
 
 use super::actor::{ActorCommand, AgentRunner, OutboundDispatcher, SessionActor};
 
@@ -188,6 +188,7 @@ pub struct SessionMultiplexer {
     dispatcher: Option<Arc<dyn OutboundDispatcher>>,
     pool: SqlitePool,
     config: MultiplexerConfig,
+    profile_router: Arc<ProfileRouter>,
 }
 
 impl SessionMultiplexer {
@@ -201,13 +202,33 @@ impl SessionMultiplexer {
         dispatcher: Option<Arc<dyn OutboundDispatcher>>,
         config: MultiplexerConfig,
     ) -> Self {
+        Self::with_profile_router(pool, runner, dispatcher, config, ProfileRouter::default())
+    }
+
+    pub fn with_profile_router(
+        pool: SqlitePool,
+        runner: Arc<dyn AgentRunner>,
+        dispatcher: Option<Arc<dyn OutboundDispatcher>>,
+        config: MultiplexerConfig,
+        profile_router: ProfileRouter,
+    ) -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
             runner,
             dispatcher,
             pool,
             config,
+            profile_router: Arc::new(profile_router),
         }
+    }
+
+    pub fn with_router(mut self, profile_router: ProfileRouter) -> Self {
+        self.profile_router = Arc::new(profile_router);
+        self
+    }
+
+    pub fn profile_router(&self) -> &ProfileRouter {
+        &self.profile_router
     }
 
     pub async fn route(&self, event: InboundEvent) -> Result<()> {
@@ -286,8 +307,18 @@ impl SessionMultiplexer {
         let runner = self.runner.clone();
         let dispatcher = self.dispatcher.clone();
         let pool = self.pool.clone();
+        let profile_router = self.profile_router.clone();
         tokio::spawn(async move {
-            match SessionActor::load(key.clone(), receiver, runner, dispatcher, pool).await {
+            match SessionActor::load(
+                key.clone(),
+                receiver,
+                runner,
+                dispatcher,
+                pool,
+                Some(profile_router),
+            )
+            .await
+            {
                 Ok(actor) => {
                     let _ = startup.send(ActorStartup::Ready);
                     actor.run().await;
