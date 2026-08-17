@@ -433,6 +433,7 @@ pub struct InboundFilterConfig<'a> {
     pub thread_require_mention: bool,
     pub allow_bots: AllowBotsMode,
     pub paired_users: &'a [u64],
+    pub parent_channel_id: Option<u64>,
 }
 
 impl Default for InboundFilterConfig<'_> {
@@ -451,6 +452,7 @@ impl Default for InboundFilterConfig<'_> {
             thread_require_mention: false,
             allow_bots: AllowBotsMode::None,
             paired_users: &[],
+            parent_channel_id: None,
         }
     }
 }
@@ -712,6 +714,7 @@ impl DiscordAdapter {
             thread_require_mention: self.data.thread_require_mention,
             allow_bots: self.data.allow_bots,
             paired_users: &paired_users,
+            parent_channel_id: None,
         };
         let Some(event) =
             message_to_inbound_with_config(message, bot_user_id, channel_type, &config)
@@ -746,13 +749,16 @@ async fn handle_event(
                 content = %new_message.content,
                 "Discord message event received"
             );
-            let channel_type = if new_message.guild_id.is_some() {
+            let (channel_type, parent_channel_id) = if new_message.guild_id.is_some() {
                 match new_message.channel_id.to_channel(ctx).await {
-                    Ok(serenity::Channel::Guild(channel)) => Some(channel.kind),
-                    _ => None,
+                    Ok(serenity::Channel::Guild(channel)) => {
+                        let parent_id = channel.parent_id.map(|id| id.get());
+                        (Some(channel.kind), parent_id)
+                    }
+                    _ => (None, None),
                 }
             } else {
-                Some(ChannelType::Private)
+                (Some(ChannelType::Private), None)
             };
             let bot_user_id = ctx
                 .http
@@ -798,6 +804,7 @@ async fn handle_event(
                 thread_require_mention: data.thread_require_mention,
                 allow_bots: data.allow_bots,
                 paired_users: &paired_users,
+                parent_channel_id,
             };
             if let Some(mut event) =
                 message_to_inbound_with_config(new_message, bot_user_id, channel_type, &config)
@@ -1180,16 +1187,26 @@ pub fn message_to_inbound_with_config(
     let is_explicit_mention = mentioned_bot_ids.contains(&bot_user_id);
     let is_free_channel = config
         .free_response_channels
-        .contains(&message.channel_id.get());
+        .contains(&message.channel_id.get())
+        || config
+            .parent_channel_id
+            .map(|pid| config.free_response_channels.contains(&pid))
+            .unwrap_or(false);
 
     if !mentioned_bot_ids.is_empty() {
         if !is_explicit_mention {
             return None;
         }
     } else {
+        let is_parent_free_channel = is_thread
+            && config
+                .parent_channel_id
+                .map(|pid| config.free_response_channels.contains(&pid))
+                .unwrap_or(false);
         let is_active_thread = is_thread
             && !config.thread_require_mention
-            && config.active_threads.contains(&message.channel_id.get());
+            && (is_parent_free_channel
+                || config.active_threads.contains(&message.channel_id.get()));
         let is_implicit_response_channel = is_dm || is_active_thread || is_free_channel;
         if !is_implicit_response_channel {
             return None;
@@ -2346,9 +2363,12 @@ pub async fn run_missed_message_backfill(
                 continue;
             }
 
-            let channel_type = match msg.channel_id.to_channel(http).await {
-                Ok(serenity::Channel::Guild(channel)) => Some(channel.kind),
-                _ => Some(ChannelType::Private),
+            let (channel_type, parent_channel_id) = match msg.channel_id.to_channel(http).await {
+                Ok(serenity::Channel::Guild(channel)) => {
+                    let parent_id = channel.parent_id.map(|id| id.get());
+                    (Some(channel.kind), parent_id)
+                }
+                _ => (Some(ChannelType::Private), None),
             };
 
             let paired_users = data.pairing_store.get_paired_user_ids().await;
@@ -2372,6 +2392,7 @@ pub async fn run_missed_message_backfill(
                 thread_require_mention: data.thread_require_mention,
                 allow_bots: data.allow_bots,
                 paired_users: &paired_users,
+                parent_channel_id,
             };
 
             if let Some(event) =
