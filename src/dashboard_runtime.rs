@@ -1,22 +1,22 @@
 use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
     cron_script_timeout_secs_from, ApprovalPolicy, CronScheduler, CronTool,
-    DiscordApprovalRequester, FileTool, LlmClient, LlmConfig, LlmProvider, McpTool,
-    MemoryStore, MultiplexerConfig, OutboundDispatcher, PayloadTaskExecutor, Result, ScaleToZero,
+    DiscordApprovalRequester, FileTool, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore,
+    MultiplexerConfig, OutboundDispatcher, PayloadTaskExecutor, Result, ScaleToZero,
     SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
 };
 use parking_lot::Mutex as ParkingMutex;
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::dashboard::{
-    config_view_from_environment, spawn_server, DashboardSettings, DashboardState,
-    WebDashboardDispatcher,
+    spawn_server, DashboardSettings, DashboardState, WebDashboardDispatcher,
 };
 
 pub async fn run_standalone_cli(settings: DashboardSettings) -> Result<()> {
@@ -110,9 +110,7 @@ pub async fn run_standalone(
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".hermes"));
     let skill_roots = super::hermes_skill_dirs(&hermes_root, &home);
-    tools.register(
-        omon_gateway::SkillsTool::new(skill_roots.clone()).with_pool(pool.clone()),
-    );
+    tools.register(omon_gateway::SkillsTool::new(skill_roots.clone()).with_pool(pool.clone()));
 
     let model = super::optional_env("DEFAULT_MODEL");
     let mut scale_to_zero = None;
@@ -172,6 +170,12 @@ pub async fn run_standalone(
     }
 
     let bot_connections = configured_bot_count();
+    let config_view = dashboard_config_view(
+        &settings,
+        &workspace_root,
+        &extra_tool_roots,
+        bot_connections,
+    );
     let state = DashboardState::new(
         pool.clone(),
         multiplexer,
@@ -179,7 +183,7 @@ pub async fn run_standalone(
         tools,
         approval_guard,
         events,
-        config_view_from_environment(&settings),
+        config_view,
         workspace_root,
         skill_roots,
         bot_connections,
@@ -261,6 +265,72 @@ fn configured_bot_count() -> usize {
     tokens.len()
 }
 
+fn dashboard_config_view(
+    settings: &DashboardSettings,
+    workspace_root: &Path,
+    tool_roots: &[PathBuf],
+    bot_count: usize,
+) -> Value {
+    let deny_patterns = env::var("APPROVALS_DENY")
+        .or_else(|_| env::var("OMON_APPROVALS_DENY"))
+        .ok()
+        .map(|value| split_csv(&value))
+        .unwrap_or_default();
+    json!({
+        "model": super::optional_env("DEFAULT_MODEL"),
+        "providers": {
+            "openai_base_url": super::optional_env("OPENAI_API_BASE"),
+            "openai_api_key_configured": super::optional_env("OPENAI_API_KEY").is_some_and(|value| !value.trim().is_empty()),
+            "anthropic_base_url": super::optional_env("ANTHROPIC_BASE_URL"),
+            "anthropic_api_key_configured": super::optional_env("ANTHROPIC_API_KEY").is_some_and(|value| !value.trim().is_empty()),
+        },
+        "approval": {
+            "policy": super::optional_env("APPROVAL_MODE").unwrap_or_else(|| "ask".into()),
+            "timeout_secs": super::approval_timeout_secs_from(super::optional_env("APPROVAL_TIMEOUT_SECS").as_deref()),
+            "deny_patterns": deny_patterns,
+        },
+        "workspace_root": workspace_root,
+        "tool_roots": tool_roots,
+        "discord": {
+            "configured": bot_count > 0,
+            "bot_count": bot_count,
+            "allowed_users": csv_env("DISCORD_ALLOWED_USERS"),
+            "allowed_roles": csv_env("DISCORD_ALLOWED_ROLES"),
+            "allowed_channels": csv_env("DISCORD_ALLOWED_CHANNELS"),
+            "ignored_channels": csv_env("DISCORD_IGNORED_CHANNELS"),
+            "allow_all_users": super::parse_bool_from(super::optional_env("DISCORD_ALLOW_ALL_USERS").as_deref(), false),
+            "auto_thread": super::parse_bool_from(super::optional_env("DISCORD_AUTO_THREAD").as_deref(), false),
+            "thread_sessions_per_user": super::parse_bool_from(super::optional_env("DISCORD_THREAD_SESSIONS_PER_USER").as_deref(), true),
+            "thread_require_mention": super::parse_bool_from(super::optional_env("DISCORD_THREAD_REQUIRE_MENTION").as_deref(), false),
+        },
+        "runtime": {
+            "processing_reactions": super::parse_bool_from(super::optional_env("DISCORD_PROCESSING_REACTIONS").as_deref(), true),
+            "runtime_footer": super::parse_bool_from(super::optional_env("DISCORD_RUNTIME_FOOTER").as_deref(), false),
+            "cron_script_timeout_secs": cron_script_timeout_secs_from(super::optional_env("OMON_CRON_SCRIPT_TIMEOUT_SECS").as_deref()),
+        },
+        "dashboard": {
+            "host": settings.host,
+            "port": settings.port,
+            "insecure": settings.insecure,
+        }
+    })
+}
+
+fn csv_env(name: &str) -> Vec<String> {
+    super::optional_env(name)
+        .map(|value| split_csv(&value))
+        .unwrap_or_default()
+}
+
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +341,13 @@ mod tests {
         assert_eq!(openai.provider, LlmProvider::OpenAi);
         let anthropic = llm_config_from_environment("claude-test");
         assert_eq!(anthropic.provider, LlmProvider::Anthropic);
+    }
+
+    #[test]
+    fn split_csv_trims_and_drops_empty_values() {
+        assert_eq!(
+            split_csv("one, two, ,three"),
+            vec!["one".to_owned(), "two".to_owned(), "three".to_owned()]
+        );
     }
 }
