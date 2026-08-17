@@ -159,7 +159,7 @@ Only mapped keys are written to the authoritative `.env`; unrelated values from 
 
 ### Cron stores, workspace, and skills
 
-- **Cron stores**: Hermes jobs are read from `$HERMES_HOME/cron/jobs.json` and `$HERMES_HOME/profiles/*/cron/jobs.json`. `OMON_HERMES_PROFILES` can restrict the profiles synchronized by the runtime; when unset, the default store and profile directories are discovered automatically.
+- **Cron stores**: Hermes jobs are read from `$HERMES_HOME/cron/jobs.json` and `$HERMES_HOME/profiles/*/cron/jobs.json`. `OMON_HERMES_PROFILES` can restrict the profiles synchronized by the runtime; when unset, the default store and profile directories are discovered automatically. Cron pre-run scripts default to an 1800s (30-minute) timeout, configurable globally via `OMON_CRON_SCRIPT_TIMEOUT_SECS` or per job via `timeout_seconds`/`timeout`.
 - **Workspace & Authorized Roots**: When `OMON_WORKSPACE_ROOT` is unset, OMO Gateway isolates terminal and file tools under `$HOME/.omon/workspace`. Additional authorized directory paths can be configured via `OMON_TOOL_ROOTS` (colon-separated absolute paths; defaults to `$HOME` when unset; workspace is always allowed; approval policies and hardline command guards still apply).
 - **Skills**: OMO Gateway scans `$HERMES_HOME/skills` (default: `~/.hermes/skills`) and `~/.omon/skills` for `SKILL.md` bundles.
 
@@ -235,6 +235,7 @@ launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 | `OMON_TOOL_ROOTS` | `$HOME` | Optional colon-separated absolute paths authorized for tool access (defaults to HOME; workspace always allowed; approval and hardline guards apply) |
 | `HERMES_HOME` | `$HOME/.hermes` | Hermes root used by migration, cron synchronization, and Hermes skill discovery |
 | `OMON_HERMES_PROFILES` | Auto-discover | Optional comma-separated Hermes cron profiles; when unset, synchronizes `default` plus discovered profile directories |
+| `OMON_CRON_SCRIPT_TIMEOUT_SECS` | `1800` | Timeout in seconds for cron pre-run / script executions (default 1800 / 30m; overridable per job via `timeout_seconds` or `timeout`) |
 | `APPROVAL_MODE` | `smart` | Enforced terminal approval policy: `smart` gates dangerous commands, `always` gates every command, and `never`/`yolo` bypass approval |
 | `APPROVAL_TIMEOUT_SECS` | `900` | Seconds to wait for a Discord command approval before the request expires (default 900) |
 | `APPROVALS_DENY` | Optional | Comma-separated wildcard globs (`npm publish *,kubectl delete *`) unconditionally blocked before policy, YOLO, or allowlists |

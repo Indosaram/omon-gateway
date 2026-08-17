@@ -10,17 +10,17 @@ use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
     augmented_path_from_environment, cron_runs_retention_days_from_environment,
-    extract_media_directives, format_context_from_block, is_silence_response,
-    neutralize_untrusted_inline_text, parse_context_from_ids, parse_profile_routes,
-    parse_wake_gate, prune_terminal_cron_runs, render_user_prompt, resolve_predecessor_output,
-    truncate_context_output, AgentRunner, ApprovalPolicy, AttachmentDownloader, ChatMessage,
-    CronJob, CronScheduler, CronTaskExecutor, CronTool, DeliveryLedgerService, DiscordAdapter,
-    DiscordApprovalRequester, DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer,
-    InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore, MultiplexerConfig,
-    OmonError, OutboundAction, OutboundDispatcher, PoiseData, ProfileRoute, ProfileRouter,
-    RestartLoopGuard, Result, ScaleToZero, SessionContext, SessionKey, SessionMultiplexer,
-    SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry, DISCORD_ATTACHMENT_MAX_BYTES,
-    MAX_CONTEXT_CHARS,
+    cron_script_timeout_secs_from, extract_media_directives, format_context_from_block,
+    is_silence_response, neutralize_untrusted_inline_text, parse_context_from_ids,
+    parse_profile_routes, parse_wake_gate, prune_terminal_cron_runs, render_user_prompt,
+    resolve_cron_script_timeout, resolve_predecessor_output, truncate_context_output, AgentRunner,
+    ApprovalPolicy, AttachmentDownloader, ChatMessage, CronJob, CronScheduler, CronTaskExecutor,
+    CronTool, DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress,
+    FileTool, HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider,
+    McpTool, MemoryStore, MultiplexerConfig, OmonError, OutboundAction, OutboundDispatcher,
+    PoiseData, ProfileRoute, ProfileRouter, RestartLoopGuard, Result, ScaleToZero, SessionContext,
+    SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolDefinition, ToolRegistry,
+    DISCORD_ATTACHMENT_MAX_BYTES, MAX_CONTEXT_CHARS,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
@@ -381,6 +381,7 @@ struct Config {
     processing_reactions: bool,
     approval_policy: ApprovalPolicy,
     approval_timeout_secs: u64,
+    cron_script_timeout_secs: u64,
     approval_mentions: bool,
     approvals_deny: Vec<String>,
     profile_routes: Vec<ProfileRoute>,
@@ -526,6 +527,9 @@ impl Config {
             approval_policy: ApprovalPolicy::parse(optional_env("APPROVAL_MODE").as_deref()),
             approval_timeout_secs: approval_timeout_secs_from(
                 optional_env("APPROVAL_TIMEOUT_SECS").as_deref(),
+            ),
+            cron_script_timeout_secs: cron_script_timeout_secs_from(
+                optional_env("OMON_CRON_SCRIPT_TIMEOUT_SECS").as_deref(),
             ),
             approval_mentions: parse_bool_from(
                 optional_env("DISCORD_APPROVAL_MENTIONS").as_deref(),
@@ -1473,6 +1477,7 @@ async fn ensure_agent_session(pool: &SqlitePool, session: &SessionContext) -> Re
 
 struct AgentCronExecutor {
     runner: Arc<LiveAgentRunner>,
+    cron_script_timeout_secs: u64,
 }
 
 #[async_trait]
@@ -1480,13 +1485,22 @@ impl CronTaskExecutor for AgentCronExecutor {
     async fn execute(&self, job: &CronJob) -> Result<Option<String>> {
         let payload = job.payload()?;
         if payload.get("schedule").is_none() {
-            return execute_native_cron(&self.runner, job, &payload).await;
+            return execute_native_cron(&self.runner, job, &payload, self.cron_script_timeout_secs)
+                .await;
         }
         let hermes: HermesJob = serde_json::from_value(payload).map_err(|error| {
             OmonError::Config(format!("invalid Hermes job {}: {error}", job.id))
         })?;
         let script_output = if let Some(script) = hermes.script.as_deref() {
-            Some(run_cron_script(&hermes, script, &self.runner.workspace_root).await?)
+            Some(
+                run_cron_script(
+                    &hermes,
+                    script,
+                    &self.runner.workspace_root,
+                    self.cron_script_timeout_secs,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -1622,40 +1636,47 @@ async fn execute_native_cron(
     runner: &Arc<LiveAgentRunner>,
     job: &CronJob,
     payload: &serde_json::Value,
+    global_timeout_secs: u64,
 ) -> Result<Option<String>> {
-    let script_output =
-        if let Some(script) = payload.get("script").and_then(serde_json::Value::as_str) {
-            let workspace = canonical_directory(&runner.workspace_root, "workspace root")?;
-            let mut command = tokio::process::Command::new("sh");
-            command
-                .arg("-c")
-                .arg(script)
-                .current_dir(workspace)
-                .kill_on_drop(true);
-            let augmented_path = augmented_path_from_environment();
-            if !augmented_path.is_empty() {
-                command.env("PATH", augmented_path);
-            }
-            let output =
-                tokio::time::timeout(std::time::Duration::from_secs(15 * 60), command.output())
-                    .await
-                    .map_err(|_| {
-                        OmonError::ToolExecution(format!("cron script timed out for {}", job.id))
-                    })?
-                    .map_err(|error| {
-                        OmonError::ToolExecution(format!("failed to execute cron script: {error}"))
-                    })?;
-            if !output.status.success() {
-                return Err(OmonError::ToolExecution(format!(
-                    "cron script failed with {:?}: {}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
-            Some(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            None
-        };
+    let script_output = if let Some(script) =
+        payload.get("script").and_then(serde_json::Value::as_str)
+    {
+        let workspace = canonical_directory(&runner.workspace_root, "workspace root")?;
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .current_dir(workspace)
+            .kill_on_drop(true);
+        let augmented_path = augmented_path_from_environment();
+        if !augmented_path.is_empty() {
+            command.env("PATH", augmented_path);
+        }
+        let job_timeout = payload
+            .get("timeout_secs")
+            .or_else(|| payload.get("timeout_seconds"))
+            .or_else(|| payload.get("timeout"))
+            .or_else(|| payload.get("script_timeout"))
+            .or_else(|| payload.get("script_timeout_seconds"))
+            .and_then(serde_json::Value::as_u64);
+        let timeout = resolve_cron_script_timeout(job_timeout, global_timeout_secs);
+        let output = tokio::time::timeout(timeout, command.output())
+            .await
+            .map_err(|_| OmonError::ToolExecution(format!("cron script timed out for {}", job.id)))?
+            .map_err(|error| {
+                OmonError::ToolExecution(format!("failed to execute cron script: {error}"))
+            })?;
+        if !output.status.success() {
+            return Err(OmonError::ToolExecution(format!(
+                "cron script failed with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        None
+    };
     if let Some(output) = script_output.as_deref() {
         if !parse_wake_gate(output) {
             tracing::info!(job_id = %job.id, "wakeAgent:false detected in script output, skipping agent execution");
@@ -2027,7 +2048,12 @@ pub fn resolve_workspace_instructions(workdir: &Path) -> Option<String> {
     None
 }
 
-async fn run_cron_script(job: &HermesJob, script: &str, workspace_root: &Path) -> Result<String> {
+async fn run_cron_script(
+    job: &HermesJob,
+    script: &str,
+    workspace_root: &Path,
+    global_timeout_secs: u64,
+) -> Result<String> {
     let home = hermes_home(job)?;
     let scripts_root = canonical_directory(&home.join("scripts"), "Hermes scripts root")?;
     let candidate = Path::new(script);
@@ -2079,8 +2105,9 @@ async fn run_cron_script(job: &HermesJob, script: &str, workspace_root: &Path) -
     if !augmented_path.is_empty() {
         command.env("PATH", augmented_path);
     }
+    let timeout = resolve_cron_script_timeout(job.timeout_secs, global_timeout_secs);
     let output = tokio::time::timeout(
-        std::time::Duration::from_secs(15 * 60),
+        timeout,
         command.current_dir(workdir).kill_on_drop(true).output(),
     )
     .await
@@ -2321,6 +2348,7 @@ async fn run_gateway() -> Result<()> {
         pool.clone(),
         Arc::new(AgentCronExecutor {
             runner: runner.clone(),
+            cron_script_timeout_secs: config.cron_script_timeout_secs,
         }),
         discord_egress,
     )
@@ -2476,7 +2504,48 @@ mod runner_tests {
         approval_timeout_secs_from, canonical_authorized_directory, hermes_skill_dirs,
         load_cron_skills, tool_enabled, Cli, Command,
     };
-    use omon_gateway::HermesJob;
+    use omon_gateway::{
+        cron_script_timeout_secs_from, resolve_cron_script_timeout, HermesJob,
+        DEFAULT_CRON_SCRIPT_TIMEOUT_SECS,
+    };
+
+    #[test]
+    fn parses_cron_script_timeout_secs_from_env() {
+        assert_eq!(cron_script_timeout_secs_from(Some("300")), 300);
+        assert_eq!(cron_script_timeout_secs_from(Some(" 3600 ")), 3600);
+        assert_eq!(cron_script_timeout_secs_from(None), 1800);
+        assert_eq!(cron_script_timeout_secs_from(Some("")), 1800);
+        assert_eq!(cron_script_timeout_secs_from(Some("   ")), 1800);
+        assert_eq!(cron_script_timeout_secs_from(Some("0")), 1800);
+        assert_eq!(cron_script_timeout_secs_from(Some("-10")), 1800);
+        assert_eq!(cron_script_timeout_secs_from(Some("invalid")), 1800);
+    }
+
+    #[test]
+    fn resolves_cron_script_timeout_with_overrides_and_fallbacks() {
+        use std::time::Duration;
+
+        // Job override takes precedence over global default
+        assert_eq!(
+            resolve_cron_script_timeout(Some(300), 1800),
+            Duration::from_secs(300)
+        );
+        // None falls back to global default
+        assert_eq!(
+            resolve_cron_script_timeout(None, 2400),
+            Duration::from_secs(2400)
+        );
+        // Zero override falls back to global default
+        assert_eq!(
+            resolve_cron_script_timeout(Some(0), 1800),
+            Duration::from_secs(1800)
+        );
+        // None with zero global default falls back to DEFAULT_CRON_SCRIPT_TIMEOUT_SECS
+        assert_eq!(
+            resolve_cron_script_timeout(None, 0),
+            Duration::from_secs(DEFAULT_CRON_SCRIPT_TIMEOUT_SECS)
+        );
+    }
 
     #[test]
     fn parses_approval_timeout_secs_from_env() {
@@ -4009,6 +4078,7 @@ mod runner_tests {
             enabled_toolsets: None,
             workdir: None,
             attach_to_session: None,
+            timeout_secs: None,
             extra: extra.clone(),
         };
         let loaded = load_cron_skills(&partial_job).unwrap();
@@ -4044,6 +4114,7 @@ mod runner_tests {
             enabled_toolsets: None,
             workdir: None,
             attach_to_session: None,
+            timeout_secs: None,
             extra: extra.clone(),
         };
         let loaded_warn = load_cron_skills(&missing_with_prompt_job).unwrap();
@@ -4081,6 +4152,7 @@ mod runner_tests {
             enabled_toolsets: None,
             workdir: None,
             attach_to_session: None,
+            timeout_secs: None,
             extra,
         };
         let err = load_cron_skills(&empty_prompt_missing_job).unwrap_err();
@@ -4184,6 +4256,7 @@ mod runner_tests {
             enabled_toolsets: None,
             workdir: None,
             attach_to_session: None,
+            timeout_secs: None,
             extra,
         };
 

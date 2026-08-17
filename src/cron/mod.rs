@@ -14,7 +14,8 @@ pub use scheduler::{
     MAX_RETRY_INTERVAL, MIN_RETRY_INTERVAL, ONESHOT_GRACE_DURATION,
 };
 pub use store::{
-    cron_runs_retention_days_from_environment, prune_terminal_cron_runs, HermesJob, HermesOrigin,
-    HermesRepeat, HermesSchedule, HermesStore, HermesStoreSynchronizer,
-    DEFAULT_CRON_RUNS_RETENTION_DAYS,
+    cron_runs_retention_days_from_environment, cron_script_timeout_secs_from,
+    prune_terminal_cron_runs, resolve_cron_script_timeout, HermesJob, HermesOrigin, HermesRepeat,
+    HermesSchedule, HermesStore, HermesStoreSynchronizer, DEFAULT_CRON_RUNS_RETENTION_DAYS,
+    DEFAULT_CRON_SCRIPT_TIMEOUT_SECS,
 };

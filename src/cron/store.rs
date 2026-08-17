@@ -10,6 +10,27 @@ use crate::{next_run, OmonError, Result};
 
 const SOURCE_KEY: &str = "_omon_hermes_source";
 pub const DEFAULT_CRON_RUNS_RETENTION_DAYS: i64 = 14;
+pub const DEFAULT_CRON_SCRIPT_TIMEOUT_SECS: u64 = 1800;
+
+pub fn cron_script_timeout_secs_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_CRON_SCRIPT_TIMEOUT_SECS)
+}
+
+pub fn resolve_cron_script_timeout(
+    job_override: Option<u64>,
+    global_default: u64,
+) -> std::time::Duration {
+    let secs = job_override
+        .filter(|&secs| secs > 0)
+        .unwrap_or(if global_default > 0 {
+            global_default
+        } else {
+            DEFAULT_CRON_SCRIPT_TIMEOUT_SECS
+        });
+    std::time::Duration::from_secs(secs)
+}
 
 pub fn cron_runs_retention_days_from_environment() -> Result<i64> {
     let Some(value) = std::env::var_os("CRON_RUNS_RETENTION_DAYS") else {
@@ -142,6 +163,14 @@ pub struct HermesJob {
     pub workdir: Option<PathBuf>,
     #[serde(default)]
     pub attach_to_session: Option<bool>,
+    #[serde(
+        default,
+        alias = "timeout",
+        alias = "timeout_seconds",
+        alias = "script_timeout",
+        alias = "script_timeout_seconds"
+    )]
+    pub timeout_secs: Option<u64>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -456,6 +485,76 @@ mod tests {
         assert_eq!(target.chat_id, "42");
         assert_eq!(target.thread_id.as_deref(), Some("43"));
         assert_eq!(job.enabled_toolsets.unwrap(), vec!["web", "file"]);
+        assert_eq!(job.timeout_secs, None);
+    }
+
+    #[test]
+    fn parses_job_timeout_overrides() {
+        let job_timeout = job(json!({
+            "id": "t1",
+            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+            "timeout": 600
+        }));
+        assert_eq!(job_timeout.timeout_secs, Some(600));
+
+        let job_timeout_seconds = job(json!({
+            "id": "t2",
+            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+            "timeout_seconds": 2400
+        }));
+        assert_eq!(job_timeout_seconds.timeout_secs, Some(2400));
+
+        let job_script_timeout = job(json!({
+            "id": "t3",
+            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+            "script_timeout": 1200
+        }));
+        assert_eq!(job_script_timeout.timeout_secs, Some(1200));
+
+        let job_timeout_secs = job(json!({
+            "id": "t4",
+            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+            "timeout_secs": 3600
+        }));
+        assert_eq!(job_timeout_secs.timeout_secs, Some(3600));
+    }
+
+    #[test]
+    fn parses_cron_script_timeout_secs_from_env() {
+        assert_eq!(cron_script_timeout_secs_from(Some("600")), 600);
+        assert_eq!(cron_script_timeout_secs_from(Some(" 3600 ")), 3600);
+        assert_eq!(cron_script_timeout_secs_from(None), 1800);
+        assert_eq!(cron_script_timeout_secs_from(Some("")), 1800);
+        assert_eq!(cron_script_timeout_secs_from(Some("   ")), 1800);
+        assert_eq!(cron_script_timeout_secs_from(Some("0")), 1800);
+        assert_eq!(cron_script_timeout_secs_from(Some("-10")), 1800);
+        assert_eq!(cron_script_timeout_secs_from(Some("invalid")), 1800);
+    }
+
+    #[test]
+    fn resolves_cron_script_timeout_with_overrides_and_fallbacks() {
+        use std::time::Duration;
+
+        // Job override takes precedence over global default
+        assert_eq!(
+            resolve_cron_script_timeout(Some(300), 1800),
+            Duration::from_secs(300)
+        );
+        // None falls back to global default
+        assert_eq!(
+            resolve_cron_script_timeout(None, 2400),
+            Duration::from_secs(2400)
+        );
+        // Zero override falls back to global default
+        assert_eq!(
+            resolve_cron_script_timeout(Some(0), 1800),
+            Duration::from_secs(1800)
+        );
+        // None with zero global default falls back to DEFAULT_CRON_SCRIPT_TIMEOUT_SECS
+        assert_eq!(
+            resolve_cron_script_timeout(None, 0),
+            Duration::from_secs(DEFAULT_CRON_SCRIPT_TIMEOUT_SECS)
+        );
     }
 
     #[test]
