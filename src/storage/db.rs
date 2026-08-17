@@ -587,6 +587,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_creates_cron_runs_owner_pid_column() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("database should initialize");
+
+        let row = sqlx::query("SELECT owner_pid FROM cron_runs LIMIT 0")
+            .fetch_optional(database.pool())
+            .await;
+        assert!(row.is_ok(), "owner_pid column should exist on cron_runs");
+    }
+
+    #[tokio::test]
     async fn file_database_serializes_concurrent_writers_without_lock_errors() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let path = directory.path().join("writers.db");

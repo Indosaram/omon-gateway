@@ -9,9 +9,10 @@ pub use scheduler::{
     format_context_from_block, increment_repeat_completed, is_cron_silence_response,
     is_valid_context_job_id, mirror_cron_delivery_to_session, next_run, next_run_after_failure,
     parse_context_from_ids, parse_wake_gate, resolve_predecessor_output, should_disable_after,
-    truncate_context_output, CronJob, CronJobSpec, CronNotification, CronScheduler,
-    CronTaskExecutor, PayloadTaskExecutor, ShellAndPayloadTaskExecutor, MAX_CONTEXT_CHARS,
-    MAX_RETRY_INTERVAL, MIN_RETRY_INTERVAL, ONESHOT_GRACE_DURATION,
+    should_reclaim, should_reclaim_with, truncate_context_output, CronJob, CronJobSpec,
+    CronNotification, CronScheduler, CronTaskExecutor, PayloadTaskExecutor,
+    ShellAndPayloadTaskExecutor, LEASE_DURATION, MAX_CONTEXT_CHARS, MAX_RETRY_INTERVAL,
+    MIN_RETRY_INTERVAL, ONESHOT_GRACE_DURATION, STALE_LEASE_SAFETY_NET,
 };
 pub use store::{
     cron_runs_retention_days_from_environment, cron_script_timeout_secs_from,

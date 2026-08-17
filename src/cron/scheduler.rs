@@ -18,8 +18,45 @@ use crate::{
     SessionKey,
 };
 
-const LEASE_DURATION: TimeDelta = TimeDelta::minutes(30);
-const LEASE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+pub const LEASE_DURATION: TimeDelta = TimeDelta::minutes(30);
+pub const LEASE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+pub const STALE_LEASE_SAFETY_NET: TimeDelta = TimeDelta::minutes(120);
+
+/// Decides whether a candidate expired cron run lease should be reclaimed.
+///
+/// A run is reclaimed if the lease is expired AND (the owner process is not alive,
+/// the owner_pid is NULL, or the lease is older than `STALE_LEASE_SAFETY_NET`
+/// as a safety net for wedged processes).
+pub fn should_reclaim(owner_pid: Option<u32>, lease_expired: bool, lease_age: TimeDelta) -> bool {
+    should_reclaim_with(
+        owner_pid,
+        lease_expired,
+        lease_age,
+        crate::ledger::is_process_alive,
+    )
+}
+
+/// Decides whether a candidate expired cron run lease should be reclaimed using a custom liveness check.
+pub fn should_reclaim_with<F>(
+    owner_pid: Option<u32>,
+    lease_expired: bool,
+    lease_age: TimeDelta,
+    is_alive: F,
+) -> bool
+where
+    F: Fn(u32) -> bool,
+{
+    if !lease_expired {
+        return false;
+    }
+    if lease_age >= STALE_LEASE_SAFETY_NET {
+        return true;
+    }
+    match owner_pid {
+        None => true,
+        Some(pid) => pid == 0 || !is_alive(pid),
+    }
+}
 
 pub const MAX_CONTEXT_CHARS: usize = 8000;
 
@@ -689,17 +726,32 @@ impl CronScheduler {
         let lease_expires_at = now + LEASE_DURATION;
         let run_id = Uuid::new_v4().to_string();
         let claim_token = Uuid::new_v4().to_string();
+        let current_pid = std::process::id() as i64;
 
-        sqlx::query(
-            "UPDATE cron_runs
-             SET status = 'failed', completed_at = ?, error = COALESCE(error, 'lease expired before completion')
+        let candidate_runs: Vec<(String, Option<i64>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT run_id, owner_pid, lease_expires_at FROM cron_runs
              WHERE job_id = ? AND status = 'running' AND lease_expires_at <= ?",
         )
-        .bind(now)
         .bind(id)
         .bind(now)
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
+
+        for (candidate_run_id, owner_pid_i64, candidate_lease_expires_at) in candidate_runs {
+            let lease_age = now.signed_duration_since(candidate_lease_expires_at);
+            let owner_pid = owner_pid_i64.and_then(|p| if p > 0 { Some(p as u32) } else { None });
+            if should_reclaim(owner_pid, true, lease_age) {
+                sqlx::query(
+                    "UPDATE cron_runs
+                     SET status = 'failed', completed_at = ?, error = COALESCE(error, 'lease expired before completion')
+                     WHERE run_id = ? AND status = 'running'",
+                )
+                .bind(now)
+                .bind(&candidate_run_id)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
 
         let due_clause = if require_due {
             "AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?"
@@ -708,14 +760,14 @@ impl CronScheduler {
         };
         let sql = format!(
             "INSERT INTO cron_runs
-             (run_id, job_id, claim_token, lease_expires_at, started_at, completed_at, status, attempt, error)
+             (run_id, job_id, claim_token, lease_expires_at, started_at, completed_at, status, attempt, error, owner_pid)
              SELECT ?, id, ?, ?, ?, NULL, 'running',
-                    COALESCE((SELECT MAX(attempt) + 1 FROM cron_runs WHERE job_id = ?), 1), NULL
+                    COALESCE((SELECT MAX(attempt) + 1 FROM cron_runs WHERE job_id = ?), 1), NULL, ?
              FROM cron_jobs
              WHERE id = ? {due_clause}
                AND NOT EXISTS (
                    SELECT 1 FROM cron_runs
-                   WHERE job_id = ? AND status = 'running' AND lease_expires_at > ?
+                   WHERE job_id = ? AND status = 'running'
                )"
         );
         let mut query = sqlx::query(&sql)
@@ -724,11 +776,12 @@ impl CronScheduler {
             .bind(lease_expires_at)
             .bind(now)
             .bind(id)
+            .bind(current_pid)
             .bind(id);
         if require_due {
             query = query.bind(now);
         }
-        let inserted = query.bind(id).bind(now).execute(&self.pool).await?;
+        let inserted = query.bind(id).execute(&self.pool).await?;
         if inserted.rows_affected() == 0 {
             return Ok(None);
         }
@@ -824,10 +877,38 @@ impl CronScheduler {
         .await?;
         if completed.rows_affected() == 0 {
             transaction.rollback().await?;
-            return Err(OmonError::Database(format!(
-                "cron claim {} is no longer active",
-                claim.claim_token
-            )));
+            let current_status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM cron_runs WHERE run_id = ?")
+                    .bind(&claim.run_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+
+            match current_status.as_deref() {
+                Some("succeeded" | "failed" | "abandoned") => {
+                    let status = current_status.unwrap();
+                    tracing::info!(
+                        run_id = %claim.run_id,
+                        claim_token = %claim.claim_token,
+                        status = %status,
+                        "cron run {} already finalized as {} by reclaim; skipping duplicate completion",
+                        claim.run_id,
+                        status
+                    );
+                    return Ok(());
+                }
+                Some(other) => {
+                    return Err(OmonError::Database(format!(
+                        "cron claim {} for run {} is no longer active (status: {})",
+                        claim.claim_token, claim.run_id, other
+                    )));
+                }
+                None => {
+                    return Err(OmonError::Database(format!(
+                        "cron claim {} for run {} not found",
+                        claim.claim_token, claim.run_id
+                    )));
+                }
+            }
         }
 
         let mut payload: Value =
@@ -903,10 +984,38 @@ impl CronScheduler {
         .await?;
         if completed.rows_affected() == 0 {
             transaction.rollback().await?;
-            return Err(OmonError::Database(format!(
-                "cron claim {} is no longer active",
-                claim.claim_token
-            )));
+            let current_status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM cron_runs WHERE run_id = ?")
+                    .bind(&claim.run_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+
+            match current_status.as_deref() {
+                Some("succeeded" | "failed" | "abandoned") => {
+                    let status = current_status.unwrap();
+                    tracing::info!(
+                        run_id = %claim.run_id,
+                        claim_token = %claim.claim_token,
+                        status = %status,
+                        "cron run {} already finalized as {} by reclaim; skipping duplicate completion",
+                        claim.run_id,
+                        status
+                    );
+                    return Ok(());
+                }
+                Some(other) => {
+                    return Err(OmonError::Database(format!(
+                        "cron claim {} for run {} is no longer active (status: {})",
+                        claim.claim_token, claim.run_id, other
+                    )));
+                }
+                None => {
+                    return Err(OmonError::Database(format!(
+                        "cron claim {} for run {} not found",
+                        claim.claim_token, claim.run_id
+                    )));
+                }
+            }
         }
 
         if claim.advance_schedule {
@@ -1865,5 +1974,226 @@ mod tests {
         .await
         .unwrap();
         assert!(!not_mirrored, "Must return false for unknown channel");
+    }
+
+    #[test]
+    fn test_should_reclaim_logic() {
+        let live_pid = std::process::id();
+        let dead_pid = 4_194_304; // definitely non-existent PID
+
+        // 1. Not expired -> never reclaim
+        assert!(!should_reclaim(Some(live_pid), false, TimeDelta::zero()));
+        assert!(!should_reclaim(Some(dead_pid), false, TimeDelta::zero()));
+        assert!(!should_reclaim(None, false, TimeDelta::zero()));
+        assert!(!should_reclaim(
+            Some(live_pid),
+            false,
+            TimeDelta::minutes(200)
+        ));
+
+        // 2. Expired + Alive PID (recent) -> false
+        assert!(!should_reclaim(Some(live_pid), true, TimeDelta::minutes(5)));
+        assert!(!should_reclaim(
+            Some(live_pid),
+            true,
+            TimeDelta::minutes(60)
+        ));
+
+        // 3. Expired + Dead PID -> true
+        assert!(should_reclaim(Some(dead_pid), true, TimeDelta::minutes(5)));
+
+        // 4. Expired + NULL / 0 owner_pid -> true (legacy rows)
+        assert!(should_reclaim(None, true, TimeDelta::minutes(5)));
+        assert!(should_reclaim(Some(0), true, TimeDelta::minutes(5)));
+
+        // 5. Expired + Alive PID + Stale past safety net (>= 120m) -> true
+        assert!(should_reclaim(Some(live_pid), true, STALE_LEASE_SAFETY_NET));
+        assert!(should_reclaim(
+            Some(live_pid),
+            true,
+            TimeDelta::minutes(150)
+        ));
+
+        // 6. Test with custom is_alive predicate
+        assert!(!should_reclaim_with(
+            Some(1234),
+            true,
+            TimeDelta::minutes(10),
+            |_| true
+        ));
+        assert!(should_reclaim_with(
+            Some(1234),
+            true,
+            TimeDelta::minutes(10),
+            |_| false
+        ));
+        assert!(should_reclaim_with(
+            Some(1234),
+            true,
+            STALE_LEASE_SAFETY_NET,
+            |_| true
+        ));
+        assert!(should_reclaim_with(
+            None,
+            true,
+            TimeDelta::minutes(10),
+            |_| true
+        ));
+        assert!(!should_reclaim_with(
+            Some(1234),
+            false,
+            TimeDelta::minutes(200),
+            |_| false
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_claim_job_stores_owner_pid_and_reclaim_skips_live_process() {
+        let database = crate::Database::connect("sqlite::memory:").await.unwrap();
+        let scheduler = CronScheduler::new(
+            database.pool().clone(),
+            Arc::new(SilentExecutor(Some("done".into()))),
+        );
+
+        let job = scheduler
+            .register(CronJobSpec::new(
+                "interval:1h",
+                serde_json::json!({"channel_id": "test"}),
+            ))
+            .await
+            .unwrap();
+
+        // 1. Claim job: check that owner_pid is set to current process ID
+        let claim = scheduler
+            .claim_job(&job.id, false, false)
+            .await
+            .unwrap()
+            .expect("should claim job");
+
+        let (owner_pid, status): (Option<i64>, String) =
+            sqlx::query_as("SELECT owner_pid, status FROM cron_runs WHERE run_id = ?")
+                .bind(&claim.run_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+
+        assert_eq!(owner_pid, Some(std::process::id() as i64));
+        assert_eq!(status, "running");
+
+        // 2. Expire the lease artificially (10 seconds ago)
+        let expired_at = Utc::now() - TimeDelta::seconds(10);
+        sqlx::query("UPDATE cron_runs SET lease_expires_at = ? WHERE run_id = ?")
+            .bind(expired_at)
+            .bind(&claim.run_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+
+        // 3. Attempting to claim again: owner process is still alive and lease_age < safety net,
+        // so reclaim must SKIP this row (it stays 'running'), and cannot claim a duplicate.
+        let second_claim = scheduler.claim_job(&job.id, false, false).await.unwrap();
+        assert!(
+            second_claim.is_none(),
+            "Must not claim while live process is running"
+        );
+
+        let status_after: String =
+            sqlx::query_scalar("SELECT status FROM cron_runs WHERE run_id = ?")
+                .bind(&claim.run_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            status_after, "running",
+            "Live process run must not be reclaimed as failed"
+        );
+
+        // 4. Now simulate dead owner PID
+        let dead_pid = 4_194_304i64;
+        sqlx::query("UPDATE cron_runs SET owner_pid = ? WHERE run_id = ?")
+            .bind(dead_pid)
+            .bind(&claim.run_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+
+        // 5. Attempt claim again: dead PID -> reclaim TAKES the row (marks failed) and claims a new run
+        let third_claim = scheduler
+            .claim_job(&job.id, false, false)
+            .await
+            .unwrap()
+            .expect("should reclaim dead owner run and claim new run");
+        assert_ne!(third_claim.run_id, claim.run_id);
+
+        let (old_status, old_error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM cron_runs WHERE run_id = ?")
+                .bind(&claim.run_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(old_status, "failed");
+        assert_eq!(
+            old_error.as_deref(),
+            Some("lease expired before completion")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_idempotent_completion_when_already_finalized() {
+        let database = crate::Database::connect("sqlite::memory:").await.unwrap();
+        let scheduler = CronScheduler::new(
+            database.pool().clone(),
+            Arc::new(SilentExecutor(Some("done".into()))),
+        );
+
+        let job = scheduler
+            .register(CronJobSpec::new(
+                "interval:1h",
+                serde_json::json!({"channel_id": "test"}),
+            ))
+            .await
+            .unwrap();
+
+        let claim = scheduler
+            .claim_job(&job.id, false, false)
+            .await
+            .unwrap()
+            .expect("should claim job");
+
+        // 1. Simulate that reclaimer marked this run as failed
+        sqlx::query(
+            "UPDATE cron_runs SET status = 'failed', completed_at = ?, error = 'lease expired before completion' WHERE run_id = ?",
+        )
+        .bind(Utc::now())
+        .bind(&claim.run_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        // 2. complete_failure on already finalized run returns Ok(())
+        let res_fail = scheduler
+            .complete_failure(&claim, &OmonError::ToolExecution("late error".into()))
+            .await;
+        assert!(
+            res_fail.is_ok(),
+            "complete_failure must be idempotent w.r.t reclaim"
+        );
+
+        // 3. complete_success on already finalized run also returns Ok(())
+        let res_succ = scheduler.complete_success(&claim).await;
+        assert!(
+            res_succ.is_ok(),
+            "complete_success must be idempotent w.r.t reclaim"
+        );
+
+        // 4. Genuine missing run returns Err
+        let fake_claim = CronClaim {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            claim_token: uuid::Uuid::new_v4().to_string(),
+            job: claim.job.clone(),
+            advance_schedule: false,
+        };
+        let res_missing = scheduler.complete_success(&fake_claim).await;
+        assert!(res_missing.is_err(), "missing run must return error");
     }
 }

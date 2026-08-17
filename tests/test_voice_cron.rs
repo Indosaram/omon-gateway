@@ -325,6 +325,140 @@ async fn active_lease_blocks_duplicate_claims_until_success_commits_one_shot() {
     assert!(completed_at.is_some());
 }
 
+#[tokio::test]
+async fn live_process_expired_lease_is_not_reclaimed_and_completes_successfully() {
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Notify::new());
+    let scheduler = CronScheduler::new(
+        database.pool().clone(),
+        Arc::new(BlockingExecutor {
+            started: started_tx,
+            release: release.clone(),
+        }),
+    );
+    let job = scheduler
+        .register(CronJobSpec::new(
+            "once:2999-01-01T00:00:00Z",
+            json!({"content": "run"}),
+        ))
+        .await
+        .unwrap();
+    let due = chrono::Utc::now() - chrono::TimeDelta::seconds(1);
+    sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+        .bind(due)
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 1);
+    assert_eq!(started_rx.recv().await.unwrap(), job.id);
+
+    // Verify owner_pid is set to current process
+    let (owner_pid, status): (Option<i64>, String) = sqlx::query_as(
+        "SELECT owner_pid, status FROM cron_runs WHERE job_id = ? AND status = 'running'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(owner_pid, Some(std::process::id() as i64));
+    assert_eq!(status, "running");
+
+    // Manually expire the lease
+    let expired_at = chrono::Utc::now() - chrono::TimeDelta::seconds(10);
+    sqlx::query(
+        "UPDATE cron_runs SET lease_expires_at = ? WHERE job_id = ? AND status = 'running'",
+    )
+    .bind(expired_at)
+    .bind(&job.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    // Another scheduler sweep should NOT reclaim since the owner process is alive
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 0);
+
+    let status_still_running: String =
+        sqlx::query_scalar("SELECT status FROM cron_runs WHERE job_id = ? AND status = 'running'")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(status_still_running, "running");
+
+    // Release the executor to allow it to finish and complete_success
+    release.notify_waiters();
+    scheduler.shutdown().await;
+
+    let final_status: String = sqlx::query_scalar(
+        "SELECT status FROM cron_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(final_status, "succeeded");
+}
+
+#[tokio::test]
+async fn dead_process_expired_lease_is_reclaimed_by_scheduler() {
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let (tx, mut executions) = mpsc::unbounded_channel();
+    let scheduler = CronScheduler::new(database.pool().clone(), Arc::new(RecordingExecutor(tx)));
+    let job = scheduler
+        .register(CronJobSpec::new("interval:1m", json!({"content": "run"})))
+        .await
+        .unwrap();
+
+    // Simulate an expired running run owned by a dead PID
+    let dead_pid = 4_194_304i64;
+    let old_run_id = uuid::Uuid::new_v4().to_string();
+    let old_token = uuid::Uuid::new_v4().to_string();
+    let expired_time = chrono::Utc::now() - chrono::TimeDelta::minutes(5);
+    sqlx::query(
+        "INSERT INTO cron_runs
+         (run_id, job_id, claim_token, lease_expires_at, started_at, completed_at, status, attempt, error, owner_pid)
+         VALUES (?, ?, ?, ?, ?, NULL, 'running', 1, NULL, ?)",
+    )
+    .bind(&old_run_id)
+    .bind(&job.id)
+    .bind(&old_token)
+    .bind(expired_time)
+    .bind(expired_time)
+    .bind(dead_pid)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    // Set job next_run_at to past
+    sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+        .bind(expired_time)
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    // Reclaim should happen and new run should execute
+    assert_eq!(scheduler.run_due_jobs().await.unwrap(), 1);
+    assert_eq!(executions.recv().await.unwrap(), job.id);
+    scheduler.shutdown().await;
+
+    // Check old run was marked failed with expired error
+    let (old_status, old_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error FROM cron_runs WHERE run_id = ?")
+            .bind(&old_run_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(old_status, "failed");
+    assert_eq!(
+        old_error.as_deref(),
+        Some("lease expired before completion")
+    );
+}
+
 #[test]
 fn audio_frame_buffer_serializes_without_losing_pcm_samples() {
     let first = AudioFrame::pcm(99, Some(7), 1, vec![-32_768, -1, 0, 1, 32_767]);
