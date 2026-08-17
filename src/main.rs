@@ -366,6 +366,7 @@ struct Config {
     anthropic_base_url: Option<String>,
     anthropic_api_key: Option<String>,
     workspace_root: PathBuf,
+    extra_tool_roots: Vec<PathBuf>,
     free_response_channels: Vec<u64>,
     allowed_users: Vec<u64>,
     allowed_roles: Vec<u64>,
@@ -463,6 +464,22 @@ impl Config {
             });
         let _ = std::fs::create_dir_all(&workspace_root);
 
+        let extra_tool_roots = optional_env("OMON_TOOL_ROOTS")
+            .map(|val| {
+                val.split(':')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|roots| !roots.is_empty())
+            .unwrap_or_else(|| {
+                let home = env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                vec![home]
+            });
+
         let mut profile_routes =
             parse_profile_routes(&optional_env("DISCORD_PROFILE_ROUTES").unwrap_or_default());
         let channel_prompt_routes = omon_gateway::parse_channel_prompts(
@@ -480,6 +497,7 @@ impl Config {
             anthropic_base_url: optional_env("ANTHROPIC_BASE_URL"),
             anthropic_api_key: optional_env("ANTHROPIC_API_KEY"),
             workspace_root,
+            extra_tool_roots,
             free_response_channels,
             allowed_users,
             allowed_roles,
@@ -2169,6 +2187,7 @@ async fn run_gateway() -> Result<()> {
         std::time::Duration::from_secs(config.approval_timeout_secs + 5),
     );
     let mut terminal_tool = TerminalTool::new(&config.workspace_root)
+        .with_authorized_roots(config.extra_tool_roots.clone())
         .with_approval(
             config.approval_policy,
             approval_requester.clone(),
@@ -2195,7 +2214,10 @@ async fn run_gateway() -> Result<()> {
         terminal_tool = terminal_tool.with_external_scanner(tirith_scanner);
     }
     tools.register(terminal_tool);
-    tools.register(FileTool::new(&config.workspace_root));
+    tools.register(
+        FileTool::new(&config.workspace_root)
+            .with_authorized_roots(config.extra_tool_roots.clone()),
+    );
     tools.register(McpTool::default());
     tools.register(CronTool::new(pool.clone()));
     tools.register(omon_gateway::WebSearchTool);
@@ -2498,6 +2520,29 @@ mod runner_tests {
         assert!(dirs
             .iter()
             .all(|path| !path.to_string_lossy().contains("workspace/.hermes")));
+    }
+
+    #[test]
+    fn parses_extra_tool_roots_colon_separated() {
+        let raw = Some("/Users/test/docs:/Users/test/code");
+        let parsed = raw
+            .map(|val| {
+                val.split(':')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|roots| !roots.is_empty())
+            .unwrap_or_default();
+
+        assert_eq!(
+            parsed,
+            vec![
+                std::path::PathBuf::from("/Users/test/docs"),
+                std::path::PathBuf::from("/Users/test/code")
+            ]
+        );
     }
 
     #[test]

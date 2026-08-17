@@ -160,7 +160,7 @@ Only mapped keys are written to the authoritative `.env`; unrelated values from 
 ### Cron stores, workspace, and skills
 
 - **Cron stores**: Hermes jobs are read from `$HERMES_HOME/cron/jobs.json` and `$HERMES_HOME/profiles/*/cron/jobs.json`. `OMON_HERMES_PROFILES` can restrict the profiles synchronized by the runtime; when unset, the default store and profile directories are discovered automatically.
-- **Workspace**: When `OMON_WORKSPACE_ROOT` is unset, OMO Gateway isolates terminal and file tools under `$HOME/.omon/workspace`.
+- **Workspace & Authorized Roots**: When `OMON_WORKSPACE_ROOT` is unset, OMO Gateway isolates terminal and file tools under `$HOME/.omon/workspace`. Additional authorized directory paths can be configured via `OMON_TOOL_ROOTS` (colon-separated absolute paths; defaults to `$HOME` when unset; workspace is always allowed; approval policies and hardline command guards still apply).
 - **Skills**: OMO Gateway scans `$HERMES_HOME/skills` (default: `~/.hermes/skills`) and `~/.omon/skills` for `SKILL.md` bundles.
 
 ---
@@ -232,6 +232,7 @@ launchctl load ~/Library/LaunchAgents/ai.omon.gateway.plist
 | `ANTHROPIC_API_KEY` | Optional | Anthropic API key |
 | `DATABASE_URL` | `sqlite://omon_gateway.db` | SQLite database path (WAL mode) |
 | `OMON_WORKSPACE_ROOT` | `$HOME/.omon/workspace` | Dedicated sandboxed working directory used by terminal and file tools |
+| `OMON_TOOL_ROOTS` | `$HOME` | Optional colon-separated absolute paths authorized for tool access (defaults to HOME; workspace always allowed; approval and hardline guards apply) |
 | `HERMES_HOME` | `$HOME/.hermes` | Hermes root used by migration, cron synchronization, and Hermes skill discovery |
 | `OMON_HERMES_PROFILES` | Auto-discover | Optional comma-separated Hermes cron profiles; when unset, synchronizes `default` plus discovered profile directories |
 | `APPROVAL_MODE` | `smart` | Enforced terminal approval policy: `smart` gates dangerous commands, `always` gates every command, and `never`/`yolo` bypass approval |

@@ -1,5 +1,5 @@
 use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -11,6 +11,7 @@ use crate::OmonError;
 #[derive(Clone, Debug)]
 pub struct FileTool {
     root: PathBuf,
+    extra_roots: Vec<PathBuf>,
     max_read_bytes: usize,
     max_search_results: usize,
     require_write_approval: bool,
@@ -20,10 +21,40 @@ impl FileTool {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            extra_roots: Vec::new(),
             max_read_bytes: 100 * 1024 * 1024,
             max_search_results: 1000,
             require_write_approval: false,
         }
+    }
+
+    pub fn with_authorized_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.extra_roots = roots
+            .into_iter()
+            .filter_map(|path| match std::fs::canonicalize(&path) {
+                Ok(canonical) if canonical.is_dir() => Some(canonical),
+                Ok(_) => {
+                    tracing::debug!(path = %path.display(), "authorized root is not a directory, skipping");
+                    None
+                }
+                Err(err) => {
+                    tracing::debug!(path = %path.display(), %err, "authorized root does not exist or failed to canonicalize, skipping");
+                    None
+                }
+            })
+            .collect();
+        self
+    }
+
+    pub fn is_authorized(&self, canonical_path: &Path) -> bool {
+        if let Ok(root) = self.canonical_root() {
+            if canonical_path.starts_with(&root) {
+                return true;
+            }
+        }
+        self.extra_roots
+            .iter()
+            .any(|root| canonical_path.starts_with(root))
     }
 
     pub fn with_write_approval(mut self, enabled: bool) -> Self {
@@ -33,21 +64,6 @@ impl FileTool {
 
     fn canonical_root(&self) -> Result<PathBuf, OmonError> {
         std::fs::canonicalize(&self.root).map_err(tool_error)
-    }
-
-    fn relative_path(value: &str) -> Result<&Path, OmonError> {
-        let relative = Path::new(value);
-        if relative.is_absolute()
-            || relative.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
-        {
-            return Err(OmonError::ToolExecution("path escapes tool root".into()));
-        }
-        Ok(relative)
     }
 
     async fn read(&self, args: &Value) -> Result<Value, OmonError> {
@@ -71,16 +87,25 @@ impl FileTool {
     }
 
     async fn write(&self, args: &Value) -> Result<Value, OmonError> {
-        let relative = Self::relative_path(required(args, "path")?)?;
+        let path_arg = required(args, "path")?;
         let content = required(args, "content")?;
         let root = self.canonical_root()?;
-        let path = root.join(relative);
+        let path = if Path::new(path_arg).is_absolute() {
+            PathBuf::from(path_arg)
+        } else {
+            root.join(path_arg)
+        };
         let parent = path
             .parent()
             .ok_or_else(|| OmonError::ToolExecution("invalid write path".into()))?;
-        self.create_checked_directories(&root, parent).await?;
 
-        match std::fs::symlink_metadata(&path) {
+        let created_parent = self.create_checked_directories(parent).await?;
+        let final_file_name = path
+            .file_name()
+            .ok_or_else(|| OmonError::ToolExecution("invalid write path".into()))?;
+        let target = created_parent.join(final_file_name);
+
+        match std::fs::symlink_metadata(&target) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(OmonError::ToolExecution(
                     "refusing to write through a symbolic link".into(),
@@ -92,14 +117,14 @@ impl FileTool {
                 ));
             }
             Ok(_) => {
-                self.ensure_inside_root(&path)?;
+                self.ensure_inside_root(&target)?;
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(tool_error(error)),
         }
 
-        fs::write(&path, content).await.map_err(tool_error)?;
-        let written = self.ensure_inside_root(&path)?;
+        fs::write(&target, content).await.map_err(tool_error)?;
+        let written = self.ensure_inside_root(&target)?;
         let metadata = std::fs::symlink_metadata(&written).map_err(tool_error)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(OmonError::ToolExecution(
@@ -109,23 +134,31 @@ impl FileTool {
         Ok(json!({"path": relative_string(&root, &written), "bytes_written": content.len()}))
     }
 
-    async fn create_checked_directories(
-        &self,
-        root: &Path,
-        parent: &Path,
-    ) -> Result<(), OmonError> {
-        let relative = parent
-            .strip_prefix(root)
-            .map_err(|_| OmonError::ToolExecution("path escapes tool root".into()))?;
-        let mut current = root.to_path_buf();
-        for component in relative.components() {
-            match component {
-                Component::CurDir => continue,
-                Component::Normal(name) => current.push(name),
-                _ => {
+    async fn create_checked_directories(&self, parent: &Path) -> Result<PathBuf, OmonError> {
+        let mut existing_ancestor = parent.to_path_buf();
+        let mut uncreated_components = Vec::new();
+        while !existing_ancestor.exists() {
+            if let Some(file_name) = existing_ancestor.file_name() {
+                uncreated_components.push(file_name.to_os_string());
+                if let Some(p) = existing_ancestor.parent() {
+                    existing_ancestor = p.to_path_buf();
+                } else {
                     return Err(OmonError::ToolExecution("path escapes tool root".into()));
                 }
+            } else {
+                return Err(OmonError::ToolExecution("path escapes tool root".into()));
             }
+        }
+        uncreated_components.reverse();
+
+        let canonical_ancestor = std::fs::canonicalize(&existing_ancestor).map_err(tool_error)?;
+        if !self.is_authorized(&canonical_ancestor) {
+            return Err(OmonError::ToolExecution("path escapes tool root".into()));
+        }
+
+        let mut current = canonical_ancestor;
+        for component_name in uncreated_components {
+            current.push(component_name);
             match std::fs::symlink_metadata(&current) {
                 Ok(metadata) => {
                     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -146,11 +179,11 @@ impl FileTool {
                 Err(error) => return Err(tool_error(error)),
             }
             let canonical = std::fs::canonicalize(&current).map_err(tool_error)?;
-            if !canonical.starts_with(root) {
+            if !self.is_authorized(&canonical) {
                 return Err(OmonError::ToolExecution("path escapes tool root".into()));
             }
         }
-        Ok(())
+        Ok(current)
     }
 
     async fn list(&self, args: &Value) -> Result<Value, OmonError> {
@@ -186,22 +219,26 @@ impl FileTool {
     }
 
     fn checked_existing(&self, value: &str) -> Result<PathBuf, OmonError> {
-        let relative = Self::relative_path(value)?;
-        let root = self.canonical_root()?;
-        let path = std::fs::canonicalize(root.join(relative)).map_err(tool_error)?;
-        if !path.starts_with(&root) {
+        let path = Path::new(value);
+        let target = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            let root = self.canonical_root()?;
+            root.join(path)
+        };
+        let canonical = std::fs::canonicalize(&target).map_err(tool_error)?;
+        if !self.is_authorized(&canonical) {
             return Err(OmonError::ToolExecution("path escapes tool root".into()));
         }
-        Ok(path)
+        Ok(canonical)
     }
 
     fn ensure_inside_root(&self, path: &Path) -> Result<PathBuf, OmonError> {
-        let root = self.canonical_root()?;
-        let path = std::fs::canonicalize(path).map_err(tool_error)?;
-        if !path.starts_with(&root) {
+        let canonical = std::fs::canonicalize(path).map_err(tool_error)?;
+        if !self.is_authorized(&canonical) {
             return Err(OmonError::ToolExecution("path escapes tool root".into()));
         }
-        Ok(path)
+        Ok(canonical)
     }
 }
 
@@ -267,10 +304,10 @@ fn search_files(
             continue;
         }
         if metadata.is_dir() {
-            for entry in std::fs::read_dir(path).map_err(tool_error)? {
-                let path = entry.map_err(tool_error)?.path();
-                if path.starts_with(root) {
-                    pending.push(path);
+            for entry in std::fs::read_dir(&path).map_err(tool_error)? {
+                let entry_path = entry.map_err(tool_error)?.path();
+                if entry_path.starts_with(start) {
+                    pending.push(entry_path);
                 }
             }
             continue;
@@ -318,4 +355,209 @@ fn relative_string(root: &Path, path: &Path) -> String {
 
 fn tool_error(error: impl std::fmt::Display) -> OmonError {
     OmonError::ToolExecution(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_authorized_temp_layout() {
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let primary_sub = primary.path().join("sub");
+        std::fs::create_dir(&primary_sub).unwrap();
+        let extra_sub = extra.path().join("sub");
+        std::fs::create_dir(&extra_sub).unwrap();
+
+        let tool =
+            FileTool::new(primary.path()).with_authorized_roots(vec![extra.path().to_path_buf()]);
+
+        assert!(tool.is_authorized(&std::fs::canonicalize(primary.path()).unwrap()));
+        assert!(tool.is_authorized(&std::fs::canonicalize(&primary_sub).unwrap()));
+        assert!(tool.is_authorized(&std::fs::canonicalize(extra.path()).unwrap()));
+        assert!(tool.is_authorized(&std::fs::canonicalize(&extra_sub).unwrap()));
+        assert!(!tool.is_authorized(&std::fs::canonicalize(outside.path()).unwrap()));
+    }
+
+    #[test]
+    fn test_with_authorized_roots_skips_invalid() {
+        let primary = tempfile::tempdir().unwrap();
+        let valid_extra = tempfile::tempdir().unwrap();
+        let file_path = primary.path().join("some_file.txt");
+        std::fs::write(&file_path, "test").unwrap();
+        let nonexistent = primary.path().join("does_not_exist");
+
+        let tool = FileTool::new(primary.path()).with_authorized_roots(vec![
+            valid_extra.path().to_path_buf(),
+            file_path,
+            nonexistent,
+        ]);
+
+        assert_eq!(tool.extra_roots.len(), 1);
+        assert_eq!(
+            tool.extra_roots[0],
+            std::fs::canonicalize(valid_extra.path()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_relative_and_extra_root_paths() {
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let tool =
+            FileTool::new(primary.path()).with_authorized_roots(vec![extra.path().to_path_buf()]);
+
+        // 1. Relative write/read under primary allowed
+        let write_res = tool
+            .execute(json!({
+                "operation": "write",
+                "path": "primary_dir/note.txt",
+                "content": "hello primary\nfindme here\n"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(write_res["path"], "primary_dir/note.txt");
+
+        let read_res = tool
+            .execute(json!({
+                "operation": "read",
+                "path": "primary_dir/note.txt"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(read_res["content"], "hello primary\nfindme here\n");
+
+        let list_res = tool
+            .execute(json!({
+                "operation": "list",
+                "path": "primary_dir"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(list_res["entries"][0]["name"], "note.txt");
+        assert_eq!(list_res["entries"][0]["path"], "primary_dir/note.txt");
+
+        let search_res = tool
+            .execute(json!({
+                "operation": "search",
+                "path": "primary_dir",
+                "query": "findme"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(search_res["matches"][0]["path"], "primary_dir/note.txt");
+
+        // 2. Absolute write/read under extra root allowed
+        let extra_file = extra.path().join("extra_dir").join("doc.txt");
+        let write_extra = tool
+            .execute(json!({
+                "operation": "write",
+                "path": extra_file.to_str().unwrap(),
+                "content": "hello extra\nfindme in extra\n"
+            }))
+            .await
+            .unwrap();
+        // Path returned for extra root should be absolute
+        let canonical_extra_file = std::fs::canonicalize(&extra_file).unwrap();
+        assert_eq!(write_extra["path"], canonical_extra_file.to_str().unwrap());
+
+        let read_extra = tool
+            .execute(json!({
+                "operation": "read",
+                "path": extra_file.to_str().unwrap()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(read_extra["content"], "hello extra\nfindme in extra\n");
+
+        let list_extra = tool
+            .execute(json!({
+                "operation": "list",
+                "path": extra.path().join("extra_dir").to_str().unwrap()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(list_extra["entries"][0]["name"], "doc.txt");
+        assert_eq!(
+            list_extra["entries"][0]["path"],
+            canonical_extra_file.to_str().unwrap()
+        );
+
+        let search_extra = tool
+            .execute(json!({
+                "operation": "search",
+                "path": extra.path().to_str().unwrap(),
+                "query": "findme"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            search_extra["matches"][0]["path"],
+            canonical_extra_file.to_str().unwrap()
+        );
+
+        // 3. Absolute outside all roots rejected ("escapes tool root")
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "secret").unwrap();
+
+        let err = tool
+            .execute(json!({
+                "operation": "read",
+                "path": outside_file.to_str().unwrap()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("path escapes tool root")),
+            "expected 'path escapes tool root', got {:?}",
+            err
+        );
+
+        let err = tool
+            .execute(json!({
+                "operation": "write",
+                "path": outside_file.to_str().unwrap(),
+                "content": "overwrite"
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("path escapes tool root")),
+            "expected 'path escapes tool root', got {:?}",
+            err
+        );
+
+        // 4. `..` landing outside all roots rejected
+        let err = tool
+            .execute(json!({
+                "operation": "read",
+                "path": "../../outside"
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("path escapes tool root") || msg.contains("No such file")),
+            "expected error for traversal, got {:?}",
+            err
+        );
+
+        let err = tool
+            .execute(json!({
+                "operation": "write",
+                "path": "../../outside.txt",
+                "content": "fail"
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("path escapes tool root")),
+            "expected 'path escapes tool root', got {:?}",
+            err
+        );
+    }
 }

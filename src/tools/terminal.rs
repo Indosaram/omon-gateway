@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +31,7 @@ impl ApprovalPolicy {
 #[derive(Clone)]
 pub struct TerminalTool {
     root: PathBuf,
+    extra_roots: Vec<PathBuf>,
     timeout: Duration,
     max_output_bytes: usize,
     approval_policy: ApprovalPolicy,
@@ -45,6 +46,7 @@ impl std::fmt::Debug for TerminalTool {
         formatter
             .debug_struct("TerminalTool")
             .field("root", &self.root)
+            .field("extra_roots", &self.extra_roots)
             .field("timeout", &self.timeout)
             .field("max_output_bytes", &self.max_output_bytes)
             .field("approval_policy", &self.approval_policy)
@@ -58,6 +60,7 @@ impl TerminalTool {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            extra_roots: Vec::new(),
             timeout: Duration::from_secs(600),
             max_output_bytes: 50 * 1024 * 1024,
             approval_policy: ApprovalPolicy::Smart,
@@ -66,6 +69,35 @@ impl TerminalTool {
             deny_globs: Vec::new(),
             external_scanner: None,
         }
+    }
+
+    pub fn with_authorized_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.extra_roots = roots
+            .into_iter()
+            .filter_map(|path| match std::fs::canonicalize(&path) {
+                Ok(canonical) if canonical.is_dir() => Some(canonical),
+                Ok(_) => {
+                    tracing::debug!(path = %path.display(), "authorized root is not a directory, skipping");
+                    None
+                }
+                Err(err) => {
+                    tracing::debug!(path = %path.display(), %err, "authorized root does not exist or failed to canonicalize, skipping");
+                    None
+                }
+            })
+            .collect();
+        self
+    }
+
+    pub fn is_authorized(&self, canonical_path: &Path) -> bool {
+        if let Ok(root) = self.canonical_root() {
+            if canonical_path.starts_with(&root) {
+                return true;
+            }
+        }
+        self.extra_roots
+            .iter()
+            .any(|root| canonical_path.starts_with(root))
     }
 
     pub fn with_external_scanner(mut self, scanner: crate::security::TirithScanner) -> Self {
@@ -112,11 +144,15 @@ impl TerminalTool {
     }
 
     fn working_directory(&self, requested: Option<&str>) -> Result<PathBuf, OmonError> {
-        let root = self.canonical_root()?;
         let requested = requested.map(Path::new).unwrap_or_else(|| Path::new("."));
-        ensure_safe_relative(requested, "working directory")?;
-        let path = canonical(&root.join(requested))?;
-        if !path.starts_with(&root) || !path.is_dir() {
+        let target = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            let root = self.canonical_root()?;
+            root.join(requested)
+        };
+        let path = canonical(&target)?;
+        if !self.is_authorized(&path) || !path.is_dir() {
             return Err(OmonError::ToolExecution(
                 "working directory escapes tool root".into(),
             ));
@@ -133,10 +169,13 @@ impl TerminalTool {
             return Ok(PathBufOrName::Name(program.to_owned()));
         }
 
-        ensure_safe_relative(path, "program path")?;
-        let root = self.canonical_root()?;
-        let executable = canonical(&cwd.join(path))?;
-        if !executable.starts_with(&root) || !executable.is_file() {
+        let target = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        let executable = canonical(&target)?;
+        if !self.is_authorized(&executable) || !executable.is_file() {
             return Err(OmonError::ToolExecution(
                 "program path escapes tool root".into(),
             ));
@@ -444,22 +483,6 @@ fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str, OmonError>
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| OmonError::ToolExecution(format!("missing string argument: {key}")))
-}
-
-fn ensure_safe_relative(path: &Path, kind: &str) -> Result<(), OmonError> {
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(OmonError::ToolExecution(format!(
-            "{kind} escapes tool root"
-        )));
-    }
-    Ok(())
 }
 
 fn canonical(path: &Path) -> Result<PathBuf, OmonError> {
@@ -900,5 +923,146 @@ mod approval_tests {
         assert_eq!(output["success"], true);
         let stdout = output["stdout"].as_str().unwrap().trim();
         assert_eq!(stdout, "discord channel-xyz user-42");
+    }
+
+    #[test]
+    fn test_is_authorized_layout() {
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let primary_sub = primary.path().join("sub");
+        std::fs::create_dir(&primary_sub).unwrap();
+        let extra_sub = extra.path().join("sub");
+        std::fs::create_dir(&extra_sub).unwrap();
+
+        let tool = TerminalTool::new(primary.path())
+            .with_authorized_roots(vec![extra.path().to_path_buf()]);
+
+        assert!(tool.is_authorized(&std::fs::canonicalize(primary.path()).unwrap()));
+        assert!(tool.is_authorized(&std::fs::canonicalize(&primary_sub).unwrap()));
+        assert!(tool.is_authorized(&std::fs::canonicalize(extra.path()).unwrap()));
+        assert!(tool.is_authorized(&std::fs::canonicalize(&extra_sub).unwrap()));
+        assert!(!tool.is_authorized(&std::fs::canonicalize(outside.path()).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_relative_and_extra_root_paths() {
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let primary_sub = primary.path().join("sub");
+        std::fs::create_dir(&primary_sub).unwrap();
+        let extra_sub = extra.path().join("sub");
+        std::fs::create_dir(&extra_sub).unwrap();
+
+        let tool = TerminalTool::new(primary.path())
+            .with_authorized_roots(vec![extra.path().to_path_buf()])
+            .with_approval_policy(ApprovalPolicy::Never);
+
+        // 1. Relative under primary allowed
+        let res = tool
+            .execute(json!({
+                "program": "sh",
+                "args": ["-c", "pwd"],
+                "cwd": "sub"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res["success"], true);
+
+        // 2. Absolute under extra root allowed
+        let res = tool
+            .execute(json!({
+                "program": "sh",
+                "args": ["-c", "pwd"],
+                "cwd": extra_sub.to_str().unwrap()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res["success"], true);
+
+        // 3. Absolute outside all roots rejected ("escapes tool root")
+        let err = tool
+            .execute(json!({
+                "program": "sh",
+                "args": ["-c", "pwd"],
+                "cwd": outside.path().to_str().unwrap()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("working directory escapes tool root")),
+            "expected 'working directory escapes tool root', got {:?}",
+            err
+        );
+
+        // 4. `..` landing outside all roots rejected
+        let err = tool
+            .execute(json!({
+                "program": "sh",
+                "args": ["-c", "pwd"],
+                "cwd": "../outside"
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("working directory escapes tool root") || msg.contains("No such file")),
+            "expected error for traversal outside, got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_terminal_executable_in_extra_root() {
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let extra_script = extra.path().join("hello.sh");
+        std::fs::write(&extra_script, "#!/bin/sh\necho hello from extra\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&extra_script, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let outside_script = outside.path().join("outside.sh");
+        std::fs::write(&outside_script, "#!/bin/sh\necho hello from outside\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&outside_script, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let tool = TerminalTool::new(primary.path())
+            .with_authorized_roots(vec![extra.path().to_path_buf()])
+            .with_approval_policy(ApprovalPolicy::Never);
+
+        // Executable under extra root allowed
+        let res = tool
+            .execute(json!({
+                "program": extra_script.to_str().unwrap()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res["success"], true);
+        assert_eq!(res["stdout"].as_str().unwrap().trim(), "hello from extra");
+
+        // Executable outside all roots rejected
+        let err = tool
+            .execute(json!({
+                "program": outside_script.to_str().unwrap()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("program path escapes tool root")),
+            "expected program path escapes tool root, got {:?}",
+            err
+        );
     }
 }

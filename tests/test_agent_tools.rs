@@ -128,6 +128,108 @@ async fn file_tool_reads_writes_lists_searches_and_blocks_traversal() {
 }
 
 #[tokio::test]
+async fn tools_support_multiple_authorized_roots_for_terminal_and_file() {
+    let workspace = tempfile_dir("multi-workspace");
+    let extra_root = tempfile_dir("multi-extra");
+    let outside = tempfile_dir("multi-outside");
+
+    let terminal = TerminalTool::new(&workspace)
+        .with_authorized_roots(vec![extra_root.clone()])
+        .with_approval_policy(ApprovalPolicy::Never);
+    let file = FileTool::new(&workspace).with_authorized_roots(vec![extra_root.clone()]);
+
+    // 1. Terminal: cwd in extra root allowed
+    let out = terminal
+        .execute(json!({
+            "program": "sh",
+            "args": ["-c", "pwd"],
+            "cwd": extra_root.to_str().unwrap()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(out["success"], true);
+
+    // Terminal: cwd in outside root rejected
+    assert!(terminal
+        .execute(json!({
+            "program": "sh",
+            "args": ["-c", "pwd"],
+            "cwd": outside.to_str().unwrap()
+        }))
+        .await
+        .is_err());
+
+    // 2. File: write and read in extra root with absolute paths allowed
+    let extra_file = extra_root.join("sub").join("data.txt");
+    let write_res = file
+        .execute(json!({
+            "operation": "write",
+            "path": extra_file.to_str().unwrap(),
+            "content": "multi-root test\nfindable line\n"
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        write_res["path"],
+        std::fs::canonicalize(&extra_file)
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+
+    let read_res = file
+        .execute(json!({
+            "operation": "read",
+            "path": extra_file.to_str().unwrap()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(read_res["content"], "multi-root test\nfindable line\n");
+
+    // File: search in extra root
+    let search_res = file
+        .execute(json!({
+            "operation": "search",
+            "path": extra_root.to_str().unwrap(),
+            "query": "findable"
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        search_res["matches"][0]["path"],
+        std::fs::canonicalize(&extra_file)
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+
+    // File: write outside all roots rejected
+    let outside_file = outside.join("bad.txt");
+    assert!(file
+        .execute(json!({
+            "operation": "write",
+            "path": outside_file.to_str().unwrap(),
+            "content": "bad"
+        }))
+        .await
+        .is_err());
+
+    // File: read outside all roots rejected
+    std::fs::write(&outside_file, "bad").unwrap();
+    assert!(file
+        .execute(json!({
+            "operation": "read",
+            "path": outside_file.to_str().unwrap()
+        }))
+        .await
+        .is_err());
+
+    let _ = std::fs::remove_dir_all(workspace);
+    let _ = std::fs::remove_dir_all(extra_root);
+    let _ = std::fs::remove_dir_all(outside);
+}
+
+#[tokio::test]
 async fn mcp_stdio_drains_large_stderr_without_blocking_jsonrpc_response() {
     let script = r#"
 import sys
