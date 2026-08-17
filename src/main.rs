@@ -31,6 +31,23 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const STREAM_BATCH_CHARS: usize = 1_500;
+const MAX_TOOL_CONTENT_CHARS: usize = 100_000;
+
+pub fn truncate_large_content(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let head_chars = (max_chars * 2) / 5;
+    let tail_chars = max_chars.saturating_sub(head_chars);
+    let head: String = text.chars().take(head_chars).collect();
+    let total_chars = text.chars().count();
+    let tail: String = text
+        .chars()
+        .skip(total_chars.saturating_sub(tail_chars))
+        .collect();
+    let omitted = total_chars.saturating_sub(head_chars + tail_chars);
+    format!("{head}\n\n... [content truncated: {omitted} characters omitted] ...\n\n{tail}")
+}
 
 const THINK_OPEN_TAGS: &[&str] = &[
     "<think>",
@@ -70,6 +87,7 @@ impl ThinkStripper {
         }
     }
 
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.in_block = false;
         self.buffer.clear();
@@ -352,12 +370,13 @@ enum Command {
 }
 
 impl Cli {
+    #[allow(dead_code)]
     fn into_command(self) -> Command {
         self.command.unwrap_or(Command::Run)
     }
 }
 
-struct Config {
+pub(crate) struct Config {
     discord_bot_tokens: Vec<String>,
     database_url: String,
     default_model: String,
@@ -705,11 +724,10 @@ impl LiveAgentRunner {
                 format!("Relevant persistent memory:\n{context}"),
             ));
         }
-        messages.extend(
-            history
-                .into_iter()
-                .map(|(role, content)| ChatMessage::new(role, content)),
-        );
+        messages.extend(history.into_iter().map(|(role, content)| {
+            let content = truncate_large_content(&content, MAX_TOOL_CONTENT_CHARS);
+            ChatMessage::new(role, content)
+        }));
         let messages = repair_message_sequence(messages);
         Ok(messages)
     }
@@ -987,7 +1005,10 @@ impl LiveAgentRunner {
                         .execute_with_context(&call.name, call.arguments.clone(), tool_session)
                         .await;
                     let content = match result {
-                        Ok(value) => value.to_string(),
+                        Ok(value) => {
+                            let s = value.to_string();
+                            truncate_large_content(&s, MAX_TOOL_CONTENT_CHARS)
+                        }
                         Err(error) => json!({"error": error.to_string()}).to_string(),
                     };
                     let mut message = ChatMessage::new(
@@ -2180,6 +2201,7 @@ fn hermes_skill_dirs(hermes_root: &Path, home: &Path) -> Vec<PathBuf> {
 }
 
 #[tokio::main]
+#[allow(dead_code)]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()

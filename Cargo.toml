@@ -2,6 +2,7 @@
 name = "omon-gateway"
 version = "0.1.0"
 edition = "2021"
+autobins = false
 description = "Ultra-fast, zero-GC async AI agent gateway and session multiplexer for Discord in 100% Rust"
 license = "Apache-2.0"
 readme = "README.md"
@@ -15,12 +16,15 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "omon-gateway"
-path = "src/main.rs"
+path = "src/entry.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.43", features = ["full", "test-util"] }
 tokio-util = "0.7"
+axum = { version = "0.8", features = ["json", "ws"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
 poise = "0.6"
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }

@@ -287,6 +287,34 @@ async fn memory_search_ranks_relevant_session_scoped_results() {
     assert!(results[0].score > 0.0);
 }
 
+#[tokio::test]
+async fn truncates_oversized_terminal_and_file_tool_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("large.txt");
+    let large_data = "x".repeat(300_000);
+    std::fs::write(&file_path, &large_data).unwrap();
+
+    let file_tool = FileTool::new(dir.path()).with_authorized_roots(vec![dir.path().to_path_buf()]);
+    let read_result = file_tool
+        .execute(json!({"operation": "read", "path": "large.txt"}))
+        .await
+        .unwrap();
+    let content = read_result["content"].as_str().unwrap();
+    assert!(content.len() < 250_000);
+    assert!(content.contains("file truncated:"));
+
+    let terminal_tool =
+        TerminalTool::new(dir.path()).with_authorized_roots(vec![dir.path().to_path_buf()]);
+    let term_result = terminal_tool
+        .execute(json!({"program": "cat", "args": ["large.txt"]}))
+        .await
+        .unwrap();
+    let stdout = term_result["stdout"].as_str().unwrap();
+    assert!(stdout.len() < 150_000);
+    assert!(stdout.contains("output truncated:"));
+    assert_eq!(term_result["stdout_truncated"], true);
+}
+
 fn tempfile_dir(label: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("omon-{label}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&path).unwrap();

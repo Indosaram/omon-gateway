@@ -700,8 +700,8 @@ mod tests {
         let heartbeat_sessions = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let hb_sessions = heartbeat_sessions.clone();
 
-        let requester = DiscordApprovalRequester::new(guard.clone(), Duration::from_millis(80))
-            .with_heartbeat_interval(Duration::from_millis(15))
+        let requester = DiscordApprovalRequester::new(guard.clone(), Duration::from_millis(300))
+            .with_heartbeat_interval(Duration::from_millis(20))
             .with_heartbeat(Arc::new(move |session: &SessionKey| {
                 hb_sessions.lock().push(session.clone());
             }));

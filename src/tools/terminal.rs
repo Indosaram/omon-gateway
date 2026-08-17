@@ -62,7 +62,7 @@ impl TerminalTool {
             root: root.into(),
             extra_roots: Vec::new(),
             timeout: Duration::from_secs(600),
-            max_output_bytes: 50 * 1024 * 1024,
+            max_output_bytes: 100_000,
             approval_policy: ApprovalPolicy::Smart,
             approval_requester: None,
             approval_timeout: Duration::from_secs(120),
@@ -296,6 +296,7 @@ impl TerminalTool {
         command
             .args(process_args)
             .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
 
         if let Some(session) = session {
@@ -490,9 +491,22 @@ fn canonical(path: &Path) -> Result<PathBuf, OmonError> {
 }
 
 fn capture(bytes: &[u8], limit: usize) -> (String, bool) {
-    let truncated = bytes.len() > limit;
-    let bytes = &bytes[..bytes.len().min(limit)];
-    (String::from_utf8_lossy(bytes).into_owned(), truncated)
+    if bytes.len() <= limit {
+        return (String::from_utf8_lossy(bytes).into_owned(), false);
+    }
+    let head_len = (limit * 2) / 5;
+    let tail_len = limit.saturating_sub(head_len);
+    let head_bytes = &bytes[..head_len.min(bytes.len())];
+    let tail_start = bytes.len().saturating_sub(tail_len);
+    let tail_bytes = &bytes[tail_start..];
+    let omitted = bytes.len() - head_bytes.len() - tail_bytes.len();
+    let text = format!(
+        "{}\n\n... [output truncated: {} bytes omitted] ...\n\n{}",
+        String::from_utf8_lossy(head_bytes),
+        omitted,
+        String::from_utf8_lossy(tail_bytes)
+    );
+    (text, true)
 }
 
 #[cfg(test)]

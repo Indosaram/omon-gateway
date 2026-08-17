@@ -8,3 +8,15 @@ target/
 workspace/
 .DS_Store
 omon_gateway.db*
+
+# Web & Node dependencies
+node_modules/
+web/node_modules/
+web/.vite/
+apps/*/node_modules/
+
+# Apps & packaging
+apps/
+web/node_modules/
+*.framework
+*.app

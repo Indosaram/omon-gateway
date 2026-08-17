@@ -22,7 +22,7 @@ impl FileTool {
         Self {
             root: root.into(),
             extra_roots: Vec::new(),
-            max_read_bytes: 100 * 1024 * 1024,
+            max_read_bytes: 200_000,
             max_search_results: 1000,
             require_write_approval: false,
         }
@@ -76,10 +76,21 @@ impl FileTool {
         }
         let bytes = fs::read(path).await.map_err(tool_error)?;
         if bytes.len() > self.max_read_bytes {
-            return Err(OmonError::ToolExecution(format!(
-                "file exceeds {} byte read limit",
-                self.max_read_bytes
-            )));
+            let head_len = (self.max_read_bytes * 2) / 5;
+            let tail_len = self.max_read_bytes.saturating_sub(head_len);
+            let head_bytes = &bytes[..head_len.min(bytes.len())];
+            let tail_start = bytes.len().saturating_sub(tail_len);
+            let tail_bytes = &bytes[tail_start..];
+            let omitted = bytes
+                .len()
+                .saturating_sub(head_bytes.len() + tail_bytes.len());
+            let text = format!(
+                "{}\n\n... [file truncated: {} bytes omitted] ...\n\n{}",
+                String::from_utf8_lossy(head_bytes),
+                omitted,
+                String::from_utf8_lossy(tail_bytes)
+            );
+            return Ok(json!({"content": text, "truncated": true}));
         }
         let content = String::from_utf8(bytes)
             .map_err(|_| OmonError::ToolExecution("file is not valid UTF-8".into()))?;

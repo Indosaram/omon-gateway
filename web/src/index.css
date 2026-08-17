@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+  }
+
+  * {
+    scrollbar-color: rgb(51 65 85 / 0.65) transparent;
+    scrollbar-width: thin;
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    min-height: 100vh;
+    background: #020617;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+}
+
+@layer components {
+  .input-base {
+    @apply w-full rounded-xl border border-white/10 bg-black/15 px-3 py-2.5 text-sm text-slate-200 outline-none transition placeholder:text-slate-700 focus:border-cyan-300/30 focus:ring-1 focus:ring-cyan-300/10;
+  }
+
+  .markdown {
+    @apply break-words;
+  }
+
+  .markdown p {
+    @apply my-2 first:mt-0 last:mb-0;
+  }
+
+  .markdown h1,
+  .markdown h2,
+  .markdown h3 {
+    @apply mb-2 mt-4 font-semibold text-slate-100 first:mt-0;
+  }
+
+  .markdown h1 {
+    @apply text-lg;
+  }
+
+  .markdown h2 {
+    @apply text-base;
+  }
+
+  .markdown h3 {
+    @apply text-sm;
+  }
+
+  .markdown ul {
+    @apply my-2 list-disc space-y-1 pl-5;
+  }
+
+  .markdown ol {
+    @apply my-2 list-decimal space-y-1 pl-5;
+  }
+
+  .markdown code {
+    @apply rounded bg-black/25 px-1.5 py-0.5 font-mono text-[0.88em] text-cyan-100;
+  }
+
+  .markdown pre {
+    @apply my-3 overflow-x-auto rounded-xl border border-white/5 bg-slate-950/70 p-3;
+  }
+
+  .markdown pre code {
+    @apply bg-transparent p-0 text-xs leading-5 text-slate-300;
+  }
+
+  .markdown blockquote {
+    @apply my-3 border-l-2 border-cyan-300/30 pl-3 text-slate-400;
+  }
+
+  .markdown a {
+    @apply text-cyan-300 underline decoration-cyan-300/30 underline-offset-2;
+  }
+
+  .markdown table {
+    @apply my-3 w-full border-collapse text-xs;
+  }
+
+  .markdown th,
+  .markdown td {
+    @apply border border-white/10 px-2 py-1.5;
+  }
+}
