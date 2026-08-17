@@ -377,7 +377,7 @@ async fn scale_to_zero_evicts_and_flushes_idle_sessions() {
             completed: completed_tx,
         }),
         MultiplexerConfig {
-            idle_timeout: Duration::from_millis(1),
+            idle_timeout: Duration::ZERO,
             gc_interval: Duration::from_secs(60),
         },
     );
@@ -389,10 +389,20 @@ async fn scale_to_zero_evicts_and_flushes_idle_sessions() {
         .await
         .unwrap()
         .unwrap();
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_millis(2)).await;
 
-    assert_eq!(multiplexer.collect_garbage().await.unwrap(), 1);
+    // With a zero idle timeout the session becomes collectable as soon as the
+    // actor finishes the turn and returns to idle. Poll deterministically until
+    // it is evicted (bounded) instead of relying on a paused-clock/real-clock
+    // interplay, which raced under full-suite load.
+    let mut evicted = 0;
+    for _ in 0..200 {
+        evicted = multiplexer.collect_garbage().await.unwrap();
+        if evicted == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(evicted, 1, "idle session should be garbage-collected");
     assert!(!multiplexer.contains_session(&key));
     let state: String = sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
         .bind(key.storage_key())
@@ -619,6 +629,7 @@ async fn delivery_ledger_deduplicates_concurrent_claims_and_records_latency() {
 async fn transcript_level_inbound_dedup_skips_duplicate_platform_message_id() {
     struct CountingRunner {
         runs: std::sync::atomic::AtomicUsize,
+        ran_tx: tokio::sync::mpsc::UnboundedSender<()>,
     }
 
     #[async_trait]
@@ -629,13 +640,16 @@ async fn transcript_level_inbound_dedup_skips_duplicate_platform_message_id() {
             _event: InboundEvent,
         ) -> Result<(), OmonError> {
             self.runs.fetch_add(1, Ordering::SeqCst);
+            let _ = self.ran_tx.send(());
             Ok(())
         }
     }
 
     let database = Database::connect("sqlite::memory:").await.unwrap();
+    let (ran_tx, mut ran_rx) = tokio::sync::mpsc::unbounded_channel();
     let runner = Arc::new(CountingRunner {
         runs: std::sync::atomic::AtomicUsize::new(0),
+        ran_tx,
     });
     let multiplexer = SessionMultiplexer::new(
         database.pool().clone(),
@@ -647,22 +661,34 @@ async fn transcript_level_inbound_dedup_skips_duplicate_platform_message_id() {
     let event1 = InboundEvent::message(key.clone(), "plat-msg-unique-1", "first prompt");
     multiplexer.route(event1).await.unwrap();
 
-    // Give actor a moment to finish
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for the first turn to actually run (bounded), instead of a fixed sleep.
+    tokio::time::timeout(Duration::from_secs(5), ran_rx.recv())
+        .await
+        .expect("first event should run within timeout")
+        .expect("runner channel closed");
     assert_eq!(runner.runs.load(Ordering::SeqCst), 1);
 
-    // Send another event with the exact same platform_message_id (simulating a replayed webhook/gateway event after ledger eviction)
+    // Send another event with the exact same platform_message_id (simulating a
+    // replayed webhook/gateway event after ledger eviction).
     let event2 = InboundEvent::message(key.clone(), "plat-msg-unique-1", "duplicate prompt");
     multiplexer.route(event2).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    // Runner must NOT have run a second time:
+    // The duplicate must NOT run: assert no run signal arrives within a bounded window.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), ran_rx.recv())
+            .await
+            .is_err(),
+        "duplicate platform_message_id must not trigger a second run"
+    );
     assert_eq!(runner.runs.load(Ordering::SeqCst), 1);
 
-    // Send a new event with a different platform_message_id
+    // Send a new event with a different platform_message_id.
     let event3 = InboundEvent::message(key.clone(), "plat-msg-unique-2", "second prompt");
     multiplexer.route(event3).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(5), ran_rx.recv())
+        .await
+        .expect("new event should run within timeout")
+        .expect("runner channel closed");
     assert_eq!(runner.runs.load(Ordering::SeqCst), 2);
 }

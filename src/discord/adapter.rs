@@ -2692,19 +2692,23 @@ mod tests {
 
         struct CollectingRunner {
             events: Mutex<Vec<InboundEvent>>,
+            routed_tx: tokio::sync::mpsc::UnboundedSender<()>,
         }
 
         #[async_trait]
         impl AgentRunner for CollectingRunner {
             async fn run(&self, _session: &mut SessionContext, event: InboundEvent) -> Result<()> {
                 self.events.lock().await.push(event);
+                let _ = self.routed_tx.send(());
                 Ok(())
             }
         }
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
+        let (routed_tx, mut routed_rx) = tokio::sync::mpsc::unbounded_channel();
         let runner = Arc::new(CollectingRunner {
             events: Mutex::new(Vec::new()),
+            routed_tx,
         });
         let multiplexer = SessionMultiplexer::new(
             db.pool().clone(),
@@ -2720,13 +2724,26 @@ mod tests {
         let msg2 = InboundEvent::message(session.clone(), "msg-2", "chunk 2");
         let msg3 = InboundEvent::message(session.clone(), "msg-3", "chunk 3");
 
+        // Enqueue all three chunks back-to-back so they are guaranteed to land
+        // in the same debounce window (no wall-clock gaps to race the timer).
         debouncer.enqueue(msg1, data.clone()).await;
-        tokio::time::sleep(Duration::from_millis(15)).await;
         debouncer.enqueue(msg2, data.clone()).await;
-        tokio::time::sleep(Duration::from_millis(15)).await;
         debouncer.enqueue(msg3, data.clone()).await;
 
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Deterministically wait for the coalesced turn to reach the runner,
+        // rather than sleeping a fixed duration and hoping it arrived.
+        tokio::time::timeout(Duration::from_secs(5), routed_rx.recv())
+            .await
+            .expect("coalesced turn should be routed within timeout")
+            .expect("runner routed channel closed unexpectedly");
+
+        // Confirm no second turn is routed (the chunks truly coalesced into one).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), routed_rx.recv())
+                .await
+                .is_err(),
+            "expected exactly one coalesced turn, but a second turn was routed"
+        );
 
         let runs = runner.events.lock().await;
         assert_eq!(runs.len(), 1, "expected exactly 1 coalesced turn");

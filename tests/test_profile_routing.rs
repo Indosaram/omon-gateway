@@ -130,10 +130,18 @@ async fn test_multiplexer_routes_inbound_with_profile_defaults() {
     let event2 = InboundEvent::message(session_key_thread.clone(), "msg-2", "Hello thread");
     multiplexer.route(event2).await.unwrap();
 
-    // Allow background turns to run
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let captured = runner.captured.lock().await.clone();
+    // Deterministically wait for both routed turns to be captured (bounded poll).
+    let captured = {
+        let mut c = Vec::new();
+        for _ in 0..500 {
+            c = runner.captured.lock().await.clone();
+            if c.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        c
+    };
     assert_eq!(captured.len(), 2);
 
     let cap_channel = captured
@@ -222,9 +230,18 @@ async fn test_multiplexer_does_not_clobber_existing_explicit_model() {
     );
     multiplexer.route(event).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let captured = runner.captured.lock().await.clone();
+    // Deterministically wait for the routed turn to be captured (bounded poll).
+    let captured = {
+        let mut c = Vec::new();
+        for _ in 0..500 {
+            c = runner.captured.lock().await.clone();
+            if !c.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        c
+    };
     assert_eq!(captured.len(), 1);
     let session = &captured[0];
     // Explicit model is preserved, NOT clobbered by profile default
