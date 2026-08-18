@@ -429,6 +429,27 @@ async fn load_context(
         Some((state_json, created_at, updated_at)) => {
             let mut state: SessionState =
                 serde_json::from_str(&state_json).map_err(serialization_error)?;
+
+            // Check for bot-specific profile override first if bot_id is present
+            if let Some(bot_id) = key.bot_id.as_deref() {
+                if let Ok(Some((model, prompt, toolsets))) = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                    "SELECT model, system_prompt, enabled_toolsets FROM bot_profiles WHERE bot_id = ?"
+                )
+                .bind(bot_id)
+                .fetch_optional(pool)
+                .await {
+                    if state.active_model.is_none() && model.is_some() {
+                        state.active_model = model;
+                    }
+                    if state.system_prompt.is_none() && prompt.is_some() {
+                        state.system_prompt = prompt;
+                    }
+                    if state.enabled_toolsets.is_none() && toolsets.is_some() {
+                        state.enabled_toolsets = toolsets.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+                    }
+                }
+            }
+
             if let Some(router) = profile_router {
                 if let Some(route) = router.match_session(&key) {
                     if state.active_model.is_none() {
@@ -457,6 +478,24 @@ async fn load_context(
         }
         None => {
             let mut context = SessionContext::new(key);
+            if let Some(bot_id) = context.key.bot_id.as_deref() {
+                if let Ok(Some((model, prompt, toolsets))) = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                    "SELECT model, system_prompt, enabled_toolsets FROM bot_profiles WHERE bot_id = ?"
+                )
+                .bind(bot_id)
+                .fetch_optional(pool)
+                .await {
+                    if model.is_some() {
+                        context.state.active_model = model;
+                    }
+                    if prompt.is_some() {
+                        context.state.system_prompt = prompt;
+                    }
+                    if toolsets.is_some() {
+                        context.state.enabled_toolsets = toolsets.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+                    }
+                }
+            }
             if let Some(router) = profile_router {
                 router.apply_to_session(&mut context);
             }

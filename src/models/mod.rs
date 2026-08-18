@@ -1,5 +1,6 @@
 mod events;
 mod ledger;
+mod messenger_policy;
 mod session;
 
 pub use events::{
@@ -9,4 +10,5 @@ pub use events::{
     PROCESSING_START_EMOJI, PROCESSING_SUCCESS_EMOJI,
 };
 pub use ledger::{DeliveryReceipt, DeliveryStatus};
+pub use messenger_policy::{MessageContextOperationLimits, MessageContextPolicyMatrix};
 pub use session::{SessionContext, SessionKey, SessionState};

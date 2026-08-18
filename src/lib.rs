@@ -31,10 +31,16 @@ pub use multiplexer::{
 };
 pub use readiness::*;
 pub use security::*;
-pub use storage::Database;
+pub use storage::{
+    Database, MessageSearchDocument, MessageSearchHit, MessageSearchIndex, MessengerPolicyStore,
+};
 pub use tools::{
     augmented_path_from_environment, build_augmented_path, build_session_environment,
-    ApprovalPolicy, BrowserTool, CronTool, FileTool, McpClientTool, McpTool, McpTransport,
-    SkillsTool, TerminalTool, Tool, ToolRegistry, WebFetchTool, WebSearchTool, DEFAULT_EXTRA_PATH,
+    ApprovalPolicy, BrowserTool, CronTool, DiscordMessageContextApi, DiscordMessageContextProvider,
+    FileTool, McpClientTool, McpTool, McpTransport, MessageContextAttachment,
+    MessageContextConversationMetadata, MessageContextMessage, MessageContextOperation,
+    MessageContextPolicy, MessageContextProvider, MessageContextRequest, MessageContextResult,
+    MessageContextTool, SerenityDiscordMessageContextApi, SkillsTool, TerminalTool, Tool,
+    ToolRegistry, WebFetchTool, WebSearchTool, DEFAULT_EXTRA_PATH,
 };
 pub use voice::*;

@@ -2,6 +2,8 @@ mod browser;
 mod cron;
 mod file;
 mod mcp;
+mod message_context;
+mod message_context_lazy;
 mod skills;
 mod terminal;
 mod web;
@@ -19,6 +21,13 @@ pub use browser::BrowserTool;
 pub use cron::CronTool;
 pub use file::FileTool;
 pub use mcp::{McpClientTool, McpTool, McpTransport};
+pub use message_context::{
+    DiscordMessageContextApi, DiscordMessageContextProvider, MessageContextAttachment,
+    MessageContextConversationMetadata, MessageContextMessage, MessageContextOperation,
+    MessageContextPolicy, MessageContextProvider, MessageContextRequest, MessageContextResult,
+    MessageContextTool, SerenityDiscordMessageContextApi,
+};
+use message_context_lazy::LazyDiscordMessageContextProvider;
 pub use skills::SkillsTool;
 pub use terminal::{
     augmented_path_from_environment, build_augmented_path, build_session_environment,
@@ -33,8 +42,6 @@ pub trait Tool: Send + Sync {
     fn input_schema(&self) -> Value;
     async fn execute(&self, args: Value) -> Result<Value, OmonError>;
 
-    /// Hook returning `Some(reason)` if this tool invocation requires human approval.
-    /// Default implementation returns `None` (safe to execute).
     fn requires_approval(&self, _args: &Value) -> Option<String> {
         None
     }
@@ -67,7 +74,11 @@ impl Default for ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self::default()
+        let mut registry = Self::default();
+        if let Some(provider) = LazyDiscordMessageContextProvider::from_environment() {
+            registry.register(MessageContextTool::new().with_provider(provider));
+        }
+        registry
     }
 
     pub fn with_approval_requester(
@@ -221,15 +232,11 @@ mod tests {
         registry.set_approval_requester(approver, Duration::from_secs(5));
 
         let session = SessionKey::new("discord", None::<String>, "c1", None::<String>, "u1");
-
-        // 1. Safe invocation without approval requirement
         let safe_res = registry
             .execute_with_context("gated_dummy", json!({"dangerous": false}), Some(&session))
             .await
             .unwrap();
         assert_eq!(safe_res, json!({"result": "success"}));
-
-        // 2. Dangerous invocation with approval granted
         let dangerous_res = registry
             .execute_with_context("gated_dummy", json!({"dangerous": true}), Some(&session))
             .await
@@ -249,12 +256,10 @@ mod tests {
         registry.set_approval_requester(approver, Duration::from_secs(5));
 
         let session = SessionKey::new("discord", None::<String>, "c1", None::<String>, "u1");
-
         let err = registry
             .execute_with_context("gated_dummy", json!({"dangerous": true}), Some(&session))
             .await
             .unwrap_err();
-
         assert!(matches!(err, OmonError::Approval(_)));
         assert!(err.to_string().contains("Operation blocked by admin"));
     }

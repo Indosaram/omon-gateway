@@ -597,6 +597,8 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/approvals/pending", get(list_pending_approvals))
         .route("/api/approvals/{id}/resolve", post(resolve_approval))
         .route("/api/approvals/allowlist", get(list_approval_allowlist))
+        .route("/api/bots", get(list_bots).post(create_bot))
+        .route("/api/bots/{id}", get(get_bot).put(update_bot).delete(delete_bot))
         .route("/api/logs", get(list_logs))
         .route("/api/logs/ws", get(logs_ws))
         .fallback(get(serve_static))
@@ -1546,6 +1548,243 @@ fn collect_skills(
             description,
         });
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, FromRow)]
+pub struct BotProfileRow {
+    pub bot_id: String,
+    pub name: String,
+    pub model: Option<String>,
+    pub system_prompt: Option<String>,
+    pub enabled_toolsets: Option<String>,
+    pub custom_settings_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateBotPayload {
+    name: Option<String>,
+    model: Option<String>,
+    system_prompt: Option<String>,
+    enabled_toolsets: Option<Vec<String>>,
+    custom_settings: Option<Value>,
+}
+
+async fn list_bots(State(state): State<DashboardState>) -> Result<Json<Value>, ApiError> {
+    let mut profiles = sqlx::query_as::<_, BotProfileRow>(
+        "SELECT bot_id, name, model, system_prompt, enabled_toolsets, custom_settings_json, created_at, updated_at FROM bot_profiles ORDER BY name ASC"
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let mut configured_ids = HashSet::new();
+    for p in &profiles {
+        configured_ids.insert(p.bot_id.clone());
+    }
+
+    let known_bots = vec![
+        ("1465631383862120451", "wawabot"),
+        ("1529539440589013182", "실피"),
+        ("1529738312833830984", "에리스"),
+    ];
+
+    for (bid, bname) in known_bots {
+        if !configured_ids.contains(bid) {
+            let row = BotProfileRow {
+                bot_id: bid.to_string(),
+                name: bname.to_string(),
+                model: None,
+                system_prompt: None,
+                enabled_toolsets: None,
+                custom_settings_json: "{}".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
+            };
+            profiles.push(row);
+        }
+    }
+
+    let items = profiles
+        .into_iter()
+        .map(|b| {
+            json!({
+                "bot_id": b.bot_id,
+                "name": b.name,
+                "model": b.model,
+                "system_prompt": b.system_prompt,
+                "enabled_toolsets": b.enabled_toolsets.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+                "custom_settings": serde_json::from_str::<Value>(&b.custom_settings_json).unwrap_or_else(|_| json!({})),
+                "created_at": b.created_at,
+                "updated_at": b.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(json!({
+        "items": items,
+        "total": items.len(),
+    })))
+}
+
+async fn get_bot(
+    State(state): State<DashboardState>,
+    AxumPath(bot_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = sqlx::query_as::<_, BotProfileRow>(
+        "SELECT bot_id, name, model, system_prompt, enabled_toolsets, custom_settings_json, created_at, updated_at FROM bot_profiles WHERE bot_id = ?"
+    )
+    .bind(&bot_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let item = match profile {
+        Some(b) => json!({
+            "bot_id": b.bot_id,
+            "name": b.name,
+            "model": b.model,
+            "system_prompt": b.system_prompt,
+            "enabled_toolsets": b.enabled_toolsets.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+            "custom_settings": serde_json::from_str::<Value>(&b.custom_settings_json).unwrap_or_else(|_| json!({})),
+            "created_at": b.created_at,
+            "updated_at": b.updated_at,
+        }),
+        None => {
+            let default_name = match bot_id.as_str() {
+                "1465631383862120451" => "wawabot",
+                "1529539440589013182" => "실피",
+                "1529738312833830984" => "에리스",
+                _ => "Discord Bot",
+            };
+            json!({
+                "bot_id": bot_id,
+                "name": default_name,
+                "model": null,
+                "system_prompt": null,
+                "enabled_toolsets": null,
+                "custom_settings": {},
+                "created_at": Utc::now().to_rfc3339(),
+                "updated_at": Utc::now().to_rfc3339(),
+            })
+        }
+    };
+
+    Ok(Json(item))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBotPayload {
+    bot_id: String,
+    name: String,
+    model: Option<String>,
+    system_prompt: Option<String>,
+    enabled_toolsets: Option<Vec<String>>,
+    custom_settings: Option<Value>,
+}
+
+async fn create_bot(
+    State(state): State<DashboardState>,
+    Json(payload): Json<CreateBotPayload>,
+) -> Result<Json<Value>, ApiError> {
+    let bot_id = payload.bot_id.trim();
+    if bot_id.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "bot_id cannot be empty"));
+    }
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "name cannot be empty"));
+    }
+    let toolsets_str = payload.enabled_toolsets.map(|ts| ts.join(","));
+    let settings_json = payload.custom_settings.map(|cs| cs.to_string()).unwrap_or_else(|| "{}".to_string());
+    let now = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "INSERT INTO bot_profiles (bot_id, name, model, system_prompt, enabled_toolsets, custom_settings_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(bot_id) DO UPDATE SET
+            name = excluded.name,
+            model = excluded.model,
+            system_prompt = excluded.system_prompt,
+            enabled_toolsets = excluded.enabled_toolsets,
+            custom_settings_json = excluded.custom_settings_json,
+            updated_at = excluded.updated_at"
+    )
+    .bind(bot_id)
+    .bind(name)
+    .bind(&payload.model)
+    .bind(&payload.system_prompt)
+    .bind(&toolsets_str)
+    .bind(&settings_json)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(Json(json!({
+        "status": "created",
+        "bot_id": bot_id,
+        "name": name,
+    })))
+}
+
+async fn delete_bot(
+    State(state): State<DashboardState>,
+    AxumPath(bot_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let result = sqlx::query("DELETE FROM bot_profiles WHERE bot_id = ?")
+        .bind(&bot_id)
+        .execute(&state.pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("bot profile"));
+    }
+
+    Ok(Json(json!({
+        "status": "deleted",
+        "bot_id": bot_id,
+    })))
+}
+
+async fn update_bot(
+    State(state): State<DashboardState>,
+    AxumPath(bot_id): AxumPath<String>,
+    Json(payload): Json<UpdateBotPayload>,
+) -> Result<Json<Value>, ApiError> {
+    let name = payload.name.unwrap_or_else(|| match bot_id.as_str() {
+        "1465631383862120451" => "wawabot".to_string(),
+        "1529539440589013182" => "실피".to_string(),
+        "1529738312833830984" => "에리스".to_string(),
+        _ => "Discord Bot".to_string(),
+    });
+    let toolsets_str = payload.enabled_toolsets.map(|ts| ts.join(","));
+    let settings_json = payload.custom_settings.map(|cs| cs.to_string()).unwrap_or_else(|| "{}".to_string());
+    let now = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "INSERT INTO bot_profiles (bot_id, name, model, system_prompt, enabled_toolsets, custom_settings_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(bot_id) DO UPDATE SET
+            name = excluded.name,
+            model = excluded.model,
+            system_prompt = excluded.system_prompt,
+            enabled_toolsets = excluded.enabled_toolsets,
+            custom_settings_json = excluded.custom_settings_json,
+            updated_at = excluded.updated_at"
+    )
+    .bind(&bot_id)
+    .bind(&name)
+    .bind(&payload.model)
+    .bind(&payload.system_prompt)
+    .bind(&toolsets_str)
+    .bind(&settings_json)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.pool)
+    .await?;
+
+    get_bot(State(state), AxumPath(bot_id)).await
 }
 
 #[derive(Debug, Serialize, FromRow)]

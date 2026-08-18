@@ -83,7 +83,9 @@ import {
   TabsTrigger,
 } from './components/ui'
 
-type Page = 'overview' | 'chat' | 'cron' | 'sessions' | 'capabilities' | 'settings' | 'logs'
+import { BotsPage } from './pages/BotsPage'
+
+type Page = 'overview' | 'bots' | 'chat' | 'cron' | 'sessions' | 'capabilities' | 'settings' | 'logs'
 
 interface NavItem {
   id: Page
@@ -94,6 +96,7 @@ interface NavItem {
 
 const NAV_ITEMS: NavItem[] = [
   { id: 'overview', label: 'Overview', hint: 'System health & stats', icon: <Activity className="w-4 h-4" /> },
+  { id: 'bots', label: 'Agent Bots', hint: 'Per-bot profiles & models', icon: <Bot className="w-4 h-4" /> },
   { id: 'chat', label: 'Playground', hint: 'Interactive Agent Chat', icon: <MessageSquare className="w-4 h-4" /> },
   { id: 'cron', label: 'Scheduled Jobs', hint: 'Cron tasks & history', icon: <Clock className="w-4 h-4" /> },
   { id: 'sessions', label: 'Sessions', hint: 'Active & past contexts', icon: <Layers className="w-4 h-4" /> },
@@ -112,6 +115,7 @@ export default function App() {
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [statusError, setStatusError] = useState<string | null>(null)
   const [healthStatus, setHealthStatus] = useState<string>('ok')
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -141,9 +145,12 @@ export default function App() {
     return () => window.removeEventListener('hashchange', handleHash)
   }, [])
 
-  const selectPage = (next: Page) => {
+  const selectPage = (next: Page, sessionId?: string) => {
     window.location.hash = `#/${next}`
     setPage(next)
+    if (sessionId) {
+      setSelectedSessionId(sessionId)
+    }
   }
 
   return (
@@ -151,18 +158,20 @@ export default function App() {
       {/* Sidebar Navigation */}
       <aside className="flex flex-col w-64 border-r border-border bg-card/60 backdrop-blur-xl shrink-0 z-20">
         <div className="flex items-center gap-3 p-4 border-b border-border">
-          <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-primary/10 border border-primary/20 text-primary font-bold text-base shadow-sm">
-            <Zap className="w-4 h-4 fill-primary/30" />
-          </div>
-          <div className="flex flex-col">
+          <img
+            src="/favicon-64.png"
+            alt="omon logo"
+            className="w-8 h-8 rounded-lg border border-primary/20 shadow-sm object-cover shrink-0"
+          />
+          <div className="flex flex-col min-w-0">
             <span className="font-semibold text-sm tracking-tight text-foreground flex items-center gap-1.5">
               omon gateway
               <Badge variant="outline" className="text-[10px] px-1.5 py-0 border-primary/30 text-primary bg-primary/5">
                 v0.1
               </Badge>
             </span>
-            <span className="text-[11px] text-muted-foreground font-mono truncate">
-              {status?.model || 'gpt-5.6-luna'}
+            <span className="text-[11px] text-muted-foreground font-medium truncate">
+              Autonomous Agent Hub
             </span>
           </div>
         </div>
@@ -256,9 +265,21 @@ export default function App() {
         {/* Dynamic Page Views */}
         <div className="flex-1 overflow-y-auto p-6">
           {page === 'overview' && <OverviewPage status={status} onNavigate={selectPage} />}
-          {page === 'chat' && <ChatPlaygroundPage />}
+          {page === 'bots' && <BotsPage />}
+          {page === 'chat' && (
+            <ChatPlaygroundPage
+              initialSessionId={selectedSessionId}
+              onClearInitialSession={() => setSelectedSessionId(null)}
+            />
+          )}
           {page === 'cron' && <CronManagerPage />}
-          {page === 'sessions' && <SessionsExplorerPage onOpenChat={(s) => selectPage('chat')} />}
+          {page === 'sessions' && (
+            <SessionsExplorerPage
+              onOpenChat={(id) => {
+                selectPage('chat', id)
+              }}
+            />
+          )}
           {page === 'capabilities' && <CapabilitiesPage />}
           {page === 'settings' && <SecuritySettingsPage onReloadStatus={refreshStatus} />}
           {page === 'logs' && <LiveLogsPage />}
@@ -286,7 +307,7 @@ function OverviewPage({ status, onNavigate }: { status: StatusResponse | null; o
   const diskUsedPercent = Math.round(((diskTotal - diskAvail) / diskTotal) * 100)
 
   return (
-    <div className="space-y-6 max-w-6xl">
+    <div className="space-y-6 w-full">
       {/* Metric Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <Card className="hover:border-primary/40 transition-colors">
@@ -448,14 +469,27 @@ function OverviewPage({ status, onNavigate }: { status: StatusResponse | null; o
 /* =========================================================================
    2. CHAT PLAYGROUND PAGE
    ========================================================================= */
-function ChatPlaygroundPage() {
+function ChatPlaygroundPage({
+  initialSessionId,
+  onClearInitialSession,
+}: {
+  initialSessionId?: string | null
+  onClearInitialSession?: () => void
+}) {
   const [sessions, setSessions] = useState<SessionRecord[]>([])
-  const [currentSessionId, setCurrentSessionId] = useState<string>('web-default')
+  const [currentSessionId, setCurrentSessionId] = useState<string>(initialSessionId || 'web-default')
   const [messages, setMessages] = useState<SessionMessage[]>([])
   const [input, setInput] = useState('')
   const [streamingContent, setStreamingContent] = useState('')
   const [isSending, setIsSending] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (initialSessionId) {
+      setCurrentSessionId(initialSessionId)
+      onClearInitialSession?.()
+    }
+  }, [initialSessionId, onClearInitialSession])
 
   const loadSessions = useCallback(async () => {
     try {
@@ -465,6 +499,16 @@ function ChatPlaygroundPage() {
   }, [])
 
   const loadMessages = useCallback(async (id: string) => {
+    if (!id || id === 'web-default' || id.startsWith('web-')) {
+      // Ephemeral web sessions start clean unless saved
+      try {
+        const data = await api.sessionMessages(id)
+        setMessages(data.items || [])
+      } catch {
+        setMessages([])
+      }
+      return
+    }
     try {
       const data = await api.sessionMessages(id)
       setMessages(data.items || [])
@@ -570,7 +614,7 @@ function ChatPlaygroundPage() {
   }
 
   return (
-    <div className="flex h-full gap-4 max-w-6xl">
+    <div className="flex h-full gap-4 w-full">
       {/* Session selector sidebar */}
       <Card className="w-72 flex flex-col shrink-0 border-border bg-card/40">
         <CardHeader className="p-3 border-b border-border">
@@ -606,22 +650,29 @@ function ChatPlaygroundPage() {
               <span>Default Playground</span>
             </div>
           </button>
-          {sessions.map((s) => (
-            <button
-              key={s.id}
-              onClick={() => setCurrentSessionId(s.id)}
-              className={`w-full text-left px-3 py-2 rounded-md text-xs font-medium transition-colors truncate ${
-                currentSessionId === s.id
-                  ? 'bg-secondary text-foreground font-semibold'
-                  : 'text-muted-foreground hover:bg-accent/40'
-              }`}
-            >
-              <div className="flex items-center justify-between">
-                <span className="truncate font-mono">{s.id}</span>
-                <span className="text-[10px] text-muted-foreground">{s.platform}</span>
-              </div>
-            </button>
-          ))}
+          {sessions.map((s) => {
+            const label = s.id.includes('|')
+              ? s.id.split('|').slice(1).filter(p => !p.startsWith('-')).pop() || s.id
+              : s.id
+            return (
+              <button
+                key={s.id}
+                onClick={() => setCurrentSessionId(s.id)}
+                className={`w-full text-left px-3 py-2 rounded-md text-xs font-medium transition-colors truncate ${
+                  currentSessionId === s.id
+                    ? 'bg-secondary text-foreground font-semibold'
+                    : 'text-muted-foreground hover:bg-accent/40'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="truncate font-mono">{label}</span>
+                  <Badge variant="outline" className="text-[9px] px-1 py-0 uppercase">
+                    {s.platform}
+                  </Badge>
+                </div>
+              </button>
+            )
+          })}
         </CardContent>
       </Card>
 
@@ -666,6 +717,31 @@ function ChatPlaygroundPage() {
           {messages.map((m) => {
             const isUser = m.role === 'user'
             const isTool = m.role === 'tool'
+
+            // Parse tool calls in assistant message metadata if content is empty
+            let toolCallsText = ''
+            if (!isUser && !isTool && !m.content?.trim()) {
+              try {
+                const meta = m.metadata
+                if (meta && Array.isArray((meta as any).tool_calls)) {
+                  const names = (meta as any).tool_calls.map((tc: any) => tc.name || tc.function?.name).filter(Boolean)
+                  if (names.length > 0) {
+                    toolCallsText = `⚙️ Executing tools: ${names.join(', ')}`
+                  }
+                }
+              } catch {}
+            }
+
+            // Parse image links or attachments in content
+            const contentStr = m.content || ''
+            const imageRegex = /(https?:\/\/[^\s)]+\.(?:png|jpg|jpeg|gif|webp)(?:\?[^\s)]*)?)/gi
+            const imageMatches = [...contentStr.matchAll(imageRegex)].map((match) => match[1])
+
+            // If empty message and no tool calls, skip rendering empty block
+            if (!isUser && !isTool && !contentStr.trim() && !toolCallsText) {
+              return null
+            }
+
             return (
               <div
                 key={m.id}
@@ -686,7 +762,72 @@ function ChatPlaygroundPage() {
                       : 'bg-card border border-border text-foreground'
                   }`}
                 >
-                  <ReactMarkdown>{m.content}</ReactMarkdown>
+                  {isTool ? (
+                    (() => {
+                      try {
+                        const parsed = JSON.parse(m.content)
+                        if (parsed.stdout || parsed.stderr || parsed.content) {
+                          const text = parsed.stdout || parsed.content || parsed.stderr
+                          return <div className="whitespace-pre-wrap break-words">{text}</div>
+                        }
+                        return <pre className="whitespace-pre-wrap break-words">{JSON.stringify(parsed, null, 2)}</pre>
+                      } catch {
+                        return <div className="whitespace-pre-wrap break-words">{m.content}</div>
+                      }
+                    })()
+                  ) : toolCallsText ? (
+                    <div className="text-xs font-mono text-muted-foreground flex items-center gap-1.5 italic">
+                      {toolCallsText}
+                    </div>
+                  ) : (
+                    <div className="prose prose-invert max-w-none text-sm leading-relaxed break-words space-y-2">
+                      <ReactMarkdown
+                        components={{
+                          img: ({ node, ...props }) => (
+                            <img
+                              {...props}
+                              className="max-w-full rounded-md border border-border/80 my-2 shadow-sm object-contain max-h-96"
+                              loading="lazy"
+                            />
+                          ),
+                          p: ({ children }) => <p className="mb-2 last:mb-0 whitespace-pre-wrap">{children}</p>,
+                          pre: ({ children }) => (
+                            <pre className="p-3 my-2 rounded-md bg-black/60 border border-border text-xs font-mono overflow-x-auto whitespace-pre-wrap break-words text-slate-200">
+                              {children}
+                            </pre>
+                          ),
+                          code: ({ node, inline, children, ...props }: any) => {
+                            if (inline) {
+                              return (
+                                <code className="px-1.5 py-0.5 rounded bg-secondary/80 text-primary font-mono text-[12px]" {...props}>
+                                  {children}
+                                </code>
+                              )
+                            }
+                            return <code {...props}>{children}</code>
+                          },
+                        }}
+                      >
+                        {m.content}
+                      </ReactMarkdown>
+
+                      {/* Display extracted direct image links inline */}
+                      {imageMatches.length > 0 && !m.content.includes('![') ? (
+                        <div className="grid grid-cols-1 gap-2 pt-2 border-t border-border/40">
+                          {imageMatches.map((imgUrl, i) => (
+                            <a key={i} href={imgUrl} target="_blank" rel="noreferrer" className="block">
+                              <img
+                                src={imgUrl}
+                                alt="Message attachment"
+                                className="max-w-full rounded-md border border-border/80 shadow-sm object-contain max-h-96 hover:opacity-95 transition-opacity"
+                                loading="lazy"
+                              />
+                            </a>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
                 </div>
 
                 {isUser ? (
@@ -817,7 +958,7 @@ function CronManagerPage() {
   }
 
   return (
-    <div className="space-y-6 max-w-6xl">
+    <div className="space-y-6 w-full">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold tracking-tight">Scheduled Cron Automations</h2>
@@ -998,7 +1139,7 @@ function SessionsExplorerPage({ onOpenChat }: { onOpenChat: (id: string) => void
   }, [load])
 
   return (
-    <div className="space-y-6 max-w-6xl">
+    <div className="space-y-6 w-full">
       <div className="flex items-center justify-between gap-4">
         <div>
           <h2 className="text-lg font-semibold tracking-tight">Session Explorer</h2>
@@ -1076,7 +1217,7 @@ function CapabilitiesPage() {
   }, [])
 
   return (
-    <div className="space-y-6 max-w-6xl">
+    <div className="space-y-6 w-full">
       <div>
         <h2 className="text-lg font-semibold tracking-tight">Agent Capabilities</h2>
         <p className="text-xs text-muted-foreground">
@@ -1166,7 +1307,7 @@ function SecuritySettingsPage({ onReloadStatus }: { onReloadStatus: () => void }
   }
 
   return (
-    <div className="space-y-6 max-w-6xl">
+    <div className="space-y-6 w-full">
       <div>
         <h2 className="text-lg font-semibold tracking-tight">Security & Terminal Approvals</h2>
         <p className="text-xs text-muted-foreground">
@@ -1290,7 +1431,7 @@ function LiveLogsPage() {
   }, [logs])
 
   return (
-    <div className="space-y-4 max-w-6xl h-full flex flex-col">
+    <div className="space-y-4 w-full h-full flex flex-col">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold tracking-tight">Live Telemetry & Logs</h2>
@@ -1306,24 +1447,29 @@ function LiveLogsPage() {
 
       <Card className="flex-1 overflow-hidden flex flex-col bg-black/80 border-border">
         <div className="flex-1 overflow-y-auto p-4 font-mono text-[11px] leading-relaxed space-y-1">
-          {logs.map((log) => (
-            <div key={log.id} className="flex gap-2 items-start hover:bg-white/5 py-0.5 px-1 rounded">
-              <span className="text-muted-foreground/50 shrink-0">{log.timestamp.slice(11, 19)}</span>
-              <span
-                className={`uppercase font-bold text-[9px] px-1 rounded shrink-0 ${
-                  log.level === 'ERROR'
-                    ? 'bg-destructive text-destructive-foreground'
-                    : log.level === 'WARN'
-                    ? 'bg-amber-500/20 text-amber-300'
-                    : 'text-primary/70'
-                }`}
-              >
-                {log.level}
-              </span>
-              <span className="text-muted-foreground/80 shrink-0">[{log.target}]</span>
-              <span className="text-slate-200 flex-1 break-all">{log.message}</span>
-            </div>
-          ))}
+          {logs.map((log, idx) => {
+            const timeStr = log.timestamp && typeof log.timestamp === 'string' && log.timestamp.length >= 19
+              ? log.timestamp.slice(11, 19)
+              : (log.timestamp || '—')
+            return (
+              <div key={log.id ?? idx} className="flex gap-2 items-start hover:bg-white/5 py-0.5 px-1 rounded">
+                <span className="text-muted-foreground/50 shrink-0">{timeStr}</span>
+                <span
+                  className={`uppercase font-bold text-[9px] px-1 rounded shrink-0 ${
+                    log.level === 'ERROR'
+                      ? 'bg-destructive text-destructive-foreground'
+                      : log.level === 'WARN'
+                      ? 'bg-amber-500/20 text-amber-300'
+                      : 'text-primary/70'
+                  }`}
+                >
+                  {log.level || 'INFO'}
+                </span>
+                <span className="text-muted-foreground/80 shrink-0">[{log.target || 'system'}]</span>
+                <span className="text-slate-200 flex-1 break-all">{log.message}</span>
+              </div>
+            )
+          })}
           <div ref={logsEndRef} />
         </div>
       </Card>

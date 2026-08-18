@@ -8,8 +8,9 @@ use omon_gateway::storage::init_pool;
 use omon_gateway::{
     cron_script_timeout_secs_from, ApprovalPolicy, CronScheduler, CronTool,
     DiscordApprovalRequester, FileTool, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore,
-    MultiplexerConfig, OutboundDispatcher, PayloadTaskExecutor, Result, ScaleToZero,
-    SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
+    MessageContextPolicyMatrix, MessengerPolicyStore, MultiplexerConfig, OutboundDispatcher,
+    PayloadTaskExecutor, Result, ScaleToZero, SessionMultiplexer, SmartApprovalGuard, TerminalTool,
+    ToolRegistry,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::{json, Value};
@@ -41,7 +42,8 @@ pub async fn run_standalone(
 ) -> Result<()> {
     settings.validate()?;
 
-    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://omon_gateway.db".into());
+    let database_url =
+        env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://omon_gateway.db".into());
     let workspace_root = dashboard_workspace_root();
     std::fs::create_dir_all(&workspace_root).map_err(|error| {
         omon_gateway::OmonError::Config(format!(
@@ -170,11 +172,18 @@ pub async fn run_standalone(
     }
 
     let bot_connections = configured_bot_count();
+    let policy_defaults = MessageContextPolicyMatrix::from_environment();
+    let policy_store = MessengerPolicyStore::new(pool.clone());
+    let policy_override = policy_store.get_override("discord").await?;
+    let effective_policy = policy_store.effective("discord", &policy_defaults).await?;
     let config_view = dashboard_config_view(
         &settings,
         &workspace_root,
         &extra_tool_roots,
         bot_connections,
+        &policy_defaults,
+        policy_override.as_ref(),
+        &effective_policy,
     );
     let state = DashboardState::new(
         pool.clone(),
@@ -254,7 +263,11 @@ fn configured_bot_count() -> usize {
     let mut tokens = Vec::new();
     for variable in ["DISCORD_BOT_TOKEN", "DISCORD_BOT_TOKENS"] {
         if let Ok(value) = env::var(variable) {
-            for token in value.split(',').map(str::trim).filter(|token| !token.is_empty()) {
+            for token in value
+                .split(',')
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            {
                 let token_str = token.to_string();
                 if !tokens.contains(&token_str) {
                     tokens.push(token_str);
@@ -265,11 +278,15 @@ fn configured_bot_count() -> usize {
     tokens.len()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dashboard_config_view(
     settings: &DashboardSettings,
     workspace_root: &Path,
     tool_roots: &[PathBuf],
     bot_count: usize,
+    policy_defaults: &MessageContextPolicyMatrix,
+    policy_override: Option<&MessageContextPolicyMatrix>,
+    effective_policy: &MessageContextPolicyMatrix,
 ) -> Value {
     let deny_patterns = env::var("APPROVALS_DENY")
         .or_else(|_| env::var("OMON_APPROVALS_DENY"))
@@ -302,6 +319,16 @@ fn dashboard_config_view(
             "auto_thread": super::parse_bool_from(super::optional_env("DISCORD_AUTO_THREAD").as_deref(), false),
             "thread_sessions_per_user": super::parse_bool_from(super::optional_env("DISCORD_THREAD_SESSIONS_PER_USER").as_deref(), true),
             "thread_require_mention": super::parse_bool_from(super::optional_env("DISCORD_THREAD_REQUIRE_MENTION").as_deref(), false),
+        },
+        "message_context_policy": {
+            "platform": "discord",
+            "environment_defaults": policy_defaults,
+            "persisted_override": policy_override,
+            "effective": effective_policy,
+            "allowed_cross_channels": csv_env("DISCORD_ALLOWED_CHANNELS"),
+            "ignored_channels": csv_env("DISCORD_IGNORED_CHANNELS"),
+            "override_store": "messenger_policy_overrides",
+            "search_backend": "sqlite_fts5+discord_rest_backfill",
         },
         "runtime": {
             "processing_reactions": super::parse_bool_from(super::optional_env("DISCORD_PROCESSING_REACTIONS").as_deref(), true),
@@ -348,6 +375,39 @@ mod tests {
         assert_eq!(
             split_csv("one, two, ,three"),
             vec!["one".to_owned(), "two".to_owned(), "three".to_owned()]
+        );
+    }
+
+    #[test]
+    fn dashboard_config_exposes_message_context_policy_matrix() {
+        let settings = DashboardSettings {
+            enabled: true,
+            host: "127.0.0.1".into(),
+            port: 9119,
+            insecure: false,
+            web_root: PathBuf::from("web/dist"),
+        };
+        let defaults = MessageContextPolicyMatrix::default();
+        let effective = MessageContextPolicyMatrix {
+            allow_dm_reads: false,
+            ..defaults.clone()
+        };
+        let value = dashboard_config_view(
+            &settings,
+            Path::new("workspace"),
+            &[],
+            1,
+            &defaults,
+            Some(&effective),
+            &effective,
+        );
+        assert_eq!(
+            value["message_context_policy"]["effective"]["allow_dm_reads"],
+            false
+        );
+        assert_eq!(
+            value["message_context_policy"]["search_backend"],
+            "sqlite_fts5+discord_rest_backfill"
         );
     }
 }
