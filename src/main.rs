@@ -961,7 +961,17 @@ impl LiveAgentRunner {
 
                     if stream_output {
                         self.emit_final(session, final_text).await?;
-                    } else if !final_text.trim().is_empty() {
+                    } else if !final_text.trim().is_empty()
+                        && !session
+                            .state
+                            .metadata
+                            .get("cron_scheduler_delivery")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    {
+                        // CronScheduler owns delivery for scheduled jobs.  The runner must
+                        // return the response to it rather than sending a second Discord
+                        // message here (which caused every cron result to be delivered twice).
                         self.dispatcher
                             .dispatch(OutboundAction::SendMessage {
                                 session: session.key.clone(),
@@ -1619,6 +1629,11 @@ impl CronTaskExecutor for AgentCronExecutor {
             .state
             .metadata
             .insert("hermes_cron_job_id".into(), json!(hermes.id));
+        // The scheduler delivers the returned response exactly once.
+        session
+            .state
+            .metadata
+            .insert("cron_scheduler_delivery".into(), json!(true));
         let event = InboundEvent::message(session_key, format!("cron:{}", job.id), prompt);
         let execution_tools =
             build_cron_tools(&hermes, &self.runner.tools, &self.runner.workspace_root)?;
@@ -1732,6 +1747,11 @@ async fn execute_native_cron(
         format!("cron:{}", job.id),
     );
     let mut session = SessionContext::new(session_key.clone());
+    // The scheduler delivers the returned response exactly once.
+    session
+        .state
+        .metadata
+        .insert("cron_scheduler_delivery".into(), json!(true));
     let event = InboundEvent::message(session_key, format!("cron:{}", job.id), task);
     let enabled = payload
         .get("enabled_toolsets")
