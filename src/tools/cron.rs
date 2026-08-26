@@ -96,6 +96,33 @@ impl Tool for CronTool {
         })
     }
 
+    async fn execute_with_context(
+        &self,
+        mut args: Value,
+        session: Option<&crate::SessionKey>,
+    ) -> Result<Value, OmonError> {
+        // A Discord-created reminder must have an actual delivery target.
+        // Previously the tool defaulted to `local`, so the scheduler completed
+        // the job but had nowhere to send the notification.
+        let is_create = matches!(
+            args.get("action").and_then(Value::as_str),
+            Some("add" | "create")
+        );
+        if is_create {
+            if let Some(session) = session {
+                if session.platform.eq_ignore_ascii_case("discord") {
+                    if args.get("deliver").is_none()
+                        || args.get("deliver").and_then(Value::as_str) == Some("local")
+                    {
+                        args["deliver"] = Value::String(format!("discord:{}", session.channel_id));
+                    }
+                    args["_session_key"] = Value::String(session.storage_key());
+                }
+            }
+        }
+        self.execute(args).await
+    }
+
     async fn execute(&self, args: Value) -> Result<Value, OmonError> {
         let action = args
             .get("action")
@@ -409,18 +436,23 @@ impl Tool for CronTool {
                     "deliver": args.get("deliver").and_then(Value::as_str).unwrap_or("local"),
                     "enabled_toolsets": args.get("enabled_toolsets").cloned().unwrap_or(Value::Null)
                 });
+                let session_key = args
+                    .get("_session_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let payload_json = serde_json::to_string(&payload)
                     .map_err(|error| OmonError::ToolExecution(error.to_string()))?;
                 let now = chrono::Utc::now();
                 let next_run_at = next_run(expression, now)?;
 
                 sqlx::query(
-                    "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)
-                     VALUES (?, ?, ?, 1, ?, ?, ?)
-                     ON CONFLICT(id) DO UPDATE SET expression=excluded.expression, payload_json=excluded.payload_json,
+                    "INSERT INTO cron_jobs (id, session_key, expression, payload_json, enabled, next_run_at, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                     ON CONFLICT(id) DO UPDATE SET session_key=excluded.session_key, expression=excluded.expression, payload_json=excluded.payload_json,
                      enabled=1, next_run_at=excluded.next_run_at, updated_at=excluded.updated_at",
                 )
                 .bind(id)
+                .bind(session_key)
                 .bind(expression)
                 .bind(payload_json)
                 .bind(next_run_at)
