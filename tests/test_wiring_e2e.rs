@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
-    AgentBackendKind, InboundEvent, MultiplexerConfig, OmoBackend, OmoBackendConfig,
+    validate_agent_backend_value, InboundEvent, MultiplexerConfig, OmoBackend, OmoBackendConfig,
     OutboundAction, OutboundDispatcher, ProfileRoute, ProfileRouter, SessionKey,
     SessionMultiplexer, StreamChunk,
 };
@@ -334,36 +334,25 @@ async fn test_e2e_actor_omo_backend_persists_assistant_message() {
 
 #[test]
 fn test_boot_time_backend_selection_parsing() {
-    // 1. Absent or empty defaults to Llm
-    assert_eq!(
-        AgentBackendKind::parse(None).unwrap(),
-        AgentBackendKind::Llm
-    );
-    assert_eq!(
-        AgentBackendKind::parse(Some("")).unwrap(),
-        AgentBackendKind::Llm
-    );
-    assert_eq!(
-        AgentBackendKind::parse(Some("llm")).unwrap(),
-        AgentBackendKind::Llm
+    // 1. Absent or empty defaults to Omo (succeeds)
+    assert!(validate_agent_backend_value(None).is_ok());
+    assert!(validate_agent_backend_value(Some("")).is_ok());
+
+    // 2. omo or appserver resolves to Omo (succeeds)
+    assert!(validate_agent_backend_value(Some("omo")).is_ok());
+    assert!(validate_agent_backend_value(Some("omo-appserver")).is_ok());
+    assert!(validate_agent_backend_value(Some("appserver")).is_ok());
+
+    // 3. Removed direct-LLM aliases fail with descriptive error
+    let err_llm = validate_agent_backend_value(Some("llm")).unwrap_err();
+    let err_llm_str = err_llm.to_string();
+    assert!(
+        err_llm_str.contains("direct LLM backend has been removed"),
+        "Error message '{err_llm_str}' must state direct LLM backend removed"
     );
 
-    // 2. omo or appserver resolves to Omo
-    assert_eq!(
-        AgentBackendKind::parse(Some("omo")).unwrap(),
-        AgentBackendKind::Omo
-    );
-    assert_eq!(
-        AgentBackendKind::parse(Some("omo-appserver")).unwrap(),
-        AgentBackendKind::Omo
-    );
-    assert_eq!(
-        AgentBackendKind::parse(Some("appserver")).unwrap(),
-        AgentBackendKind::Omo
-    );
-
-    // 3. Unknown value fails with an error explicitly naming OMON_AGENT_BACKEND
-    let err = AgentBackendKind::parse(Some("unknown_backend_engine")).unwrap_err();
+    // 4. Unknown value fails with an error explicitly naming OMON_AGENT_BACKEND
+    let err = validate_agent_backend_value(Some("unknown_backend_engine")).unwrap_err();
     let err_str = err.to_string();
     assert!(
         err_str.contains("OMON_AGENT_BACKEND"),

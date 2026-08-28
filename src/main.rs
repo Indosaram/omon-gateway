@@ -1,3 +1,4 @@
+// allow: SIZE_OK — main gateway application orchestration and integration tests
 use std::collections::HashMap;
 use std::env;
 use std::path::{Component, Path, PathBuf};
@@ -11,25 +12,21 @@ use omon_gateway::{
     augmented_path_from_environment, cron_runs_retention_days_from_environment,
     cron_script_timeout_secs_from, format_context_from_block, parse_context_from_ids,
     parse_profile_routes, parse_wake_gate, prune_terminal_cron_runs, resolve_cron_script_timeout,
-    resolve_predecessor_output, truncate_context_output, AgentBackend, AgentBackendKind,
+    resolve_predecessor_output, truncate_context_output, validate_agent_backend_env, AgentBackend,
     ApprovalPolicy, AttachmentDownloader, CronJob, CronScheduler, CronTaskExecutor, CronTool,
     DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool,
-    HermesJob, HermesStoreSynchronizer, InboundEvent, LlmBackend, LlmClient, LlmConfig,
-    LlmProvider, McpTool, MemoryStore, MultiplexerConfig, OmoBackend, OmoBackendConfig,
-    OmonError, OutboundAction, OutboundDispatcher, PoiseData, ProfileRoute, ProfileRouter,
-    RestartLoopGuard, Result, ScaleToZero, SessionContext, SessionKey, SessionMultiplexer,
-    SmartApprovalGuard, TerminalTool, ToolRegistry, MAX_CONTEXT_CHARS,
+    HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool,
+    MultiplexerConfig, OmoBackend, OmoBackendConfig, OmonError, OutboundAction, OutboundDispatcher,
+    PoiseData, ProfileRoute, ProfileRouter, RestartLoopGuard, Result, ScaleToZero, SessionContext,
+    SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
+    MAX_CONTEXT_CHARS,
 };
-use parking_lot::Mutex as ParkingMutex;
 use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-
-#[cfg(test)]
-pub use omon_gateway::{repair_message_sequence, ThinkStripper};
 
 #[derive(Debug, Parser)]
 #[command(name = "omon-gateway")]
@@ -298,8 +295,6 @@ impl OutboundDispatcher for SharedDispatcher {
     }
 }
 
-pub type LiveAgentRunner = LlmBackend;
-
 /// Startup recovery sweep: finds undelivered obligations from previous dead processes,
 /// claims them, and re-dispatches them to the platform (tagging recovered deliveries).
 pub async fn recover_pending_delivery_obligations(
@@ -456,9 +451,11 @@ async fn ensure_agent_session(pool: &SqlitePool, session: &SessionContext) -> Re
     Ok(())
 }
 
-struct AgentCronExecutor {
-    runner: Arc<LiveAgentRunner>,
-    cron_script_timeout_secs: u64,
+pub(crate) struct AgentCronExecutor {
+    pub(crate) backend: Arc<dyn AgentBackend>,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) pool: SqlitePool,
+    pub(crate) cron_script_timeout_secs: u64,
 }
 
 #[async_trait]
@@ -466,8 +463,14 @@ impl CronTaskExecutor for AgentCronExecutor {
     async fn execute(&self, job: &CronJob) -> Result<Option<String>> {
         let payload = job.payload()?;
         if payload.get("schedule").is_none() {
-            return execute_native_cron(&self.runner, job, &payload, self.cron_script_timeout_secs)
-                .await;
+            return execute_native_cron(
+                &self.backend,
+                &self.workspace_root,
+                job,
+                &payload,
+                self.cron_script_timeout_secs,
+            )
+            .await;
         }
         let hermes: HermesJob = serde_json::from_value(payload).map_err(|error| {
             OmonError::Config(format!("invalid Hermes job {}: {error}", job.id))
@@ -477,7 +480,7 @@ impl CronTaskExecutor for AgentCronExecutor {
                 run_cron_script(
                     &hermes,
                     script,
-                    &self.runner.workspace_root,
+                    &self.workspace_root,
                     self.cron_script_timeout_secs,
                 )
                 .await?,
@@ -504,15 +507,15 @@ impl CronTaskExecutor for AgentCronExecutor {
         let mut prompt = cron_hint.to_string();
 
         let workdir = if let Some(custom_workdir) = hermes.workdir.as_ref() {
-            let roots = authorized_cron_roots(&hermes, &self.runner.workspace_root).ok();
+            let roots = authorized_cron_roots(&hermes, &self.workspace_root).ok();
             if let Some(roots) = roots {
                 canonical_authorized_directory(custom_workdir, &roots, "Hermes workdir")
-                    .unwrap_or_else(|_| self.runner.workspace_root.clone())
+                    .unwrap_or_else(|_| self.workspace_root.clone())
             } else {
-                self.runner.workspace_root.clone()
+                self.workspace_root.clone()
             }
         } else {
-            self.runner.workspace_root.clone()
+            self.workspace_root.clone()
         };
 
         if let Some(instructions) = resolve_workspace_instructions(&workdir) {
@@ -525,7 +528,7 @@ impl CronTaskExecutor for AgentCronExecutor {
             let home_path = hermes_home(&hermes).ok();
             for source_id in &context_ids {
                 if let Some(output) =
-                    resolve_predecessor_output(&self.runner.pool, home_path.as_deref(), source_id)
+                    resolve_predecessor_output(&self.pool, home_path.as_deref(), source_id)
                         .await
                 {
                     if !output.trim().is_empty() {
@@ -585,41 +588,16 @@ impl CronTaskExecutor for AgentCronExecutor {
             .metadata
             .insert("cron_scheduler_delivery".into(), json!(true));
         let event = InboundEvent::message(session_key, format!("cron:{}", job.id), prompt);
-        let execution_tools =
-            build_cron_tools(&hermes, &self.runner.tools, &self.runner.workspace_root)?;
-        let cron_llm =
-            if hermes.provider.is_some() || hermes.base_url.is_some() || hermes.model.is_some() {
-                let config = build_cron_llm_config(
-                    self.runner.llm.config(),
-                    hermes.provider.as_deref(),
-                    hermes.base_url.as_deref(),
-                    hermes.model.as_deref(),
-                );
-                Some(LlmClient::new(config)?)
-            } else {
-                None
-            };
-        let response = self
-            .runner
-            .execute(
-                &mut session,
-                event,
-                hermes.enabled_toolsets.as_deref(),
-                execution_tools.as_ref(),
-                false,
-                cron_llm.as_ref(),
-            )
-            .await?;
-        if response.trim().is_empty() || omon_gateway::is_cron_silence_response(&response) {
-            Ok(None)
-        } else {
-            Ok(Some(response))
-        }
+        // TODO(omo-only): Cron execution runs directly through AgentBackend (OMO appserver backend).
+        // Model selection is propagated via session.state.active_model.
+        self.backend.run(&mut session, event).await?;
+        Ok(None)
     }
 }
 
 async fn execute_native_cron(
-    runner: &Arc<LiveAgentRunner>,
+    backend: &Arc<dyn AgentBackend>,
+    workspace_root: &Path,
     job: &CronJob,
     payload: &serde_json::Value,
     global_timeout_secs: u64,
@@ -627,7 +605,7 @@ async fn execute_native_cron(
     let script_output = if let Some(script) =
         payload.get("script").and_then(serde_json::Value::as_str)
     {
-        let workspace = canonical_directory(&runner.workspace_root, "workspace root")?;
+        let workspace = canonical_directory(workspace_root, "workspace root")?;
         let mut command = tokio::process::Command::new("sh");
         command
             .arg("-c")
@@ -703,24 +681,8 @@ async fn execute_native_cron(
         .metadata
         .insert("cron_scheduler_delivery".into(), json!(true));
     let event = InboundEvent::message(session_key, format!("cron:{}", job.id), task);
-    let enabled = payload
-        .get("enabled_toolsets")
-        .and_then(serde_json::Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        });
-    let response = runner
-        .execute(&mut session, event, enabled.as_deref(), None, false, None)
-        .await?;
-    if response.trim().is_empty() || omon_gateway::is_cron_silence_response(&response) {
-        Ok(None)
-    } else {
-        Ok(Some(response))
-    }
+    backend.run(&mut session, event).await?;
+    Ok(None)
 }
 
 fn load_cron_skills(job: &HermesJob) -> Result<String> {
@@ -1189,7 +1151,6 @@ async fn main() -> Result<()> {
 async fn run_gateway() -> Result<()> {
     let config = Config::from_env()?;
     let pool = init_pool(&config.database_url).await?;
-    let memory = MemoryStore::new(pool.clone());
 
     let approval_guard = SmartApprovalGuard::new().with_pool(pool.clone());
     let loaded_allowlist = approval_guard.load_persisted_allowlist().await?;
@@ -1252,41 +1213,22 @@ async fn run_gateway() -> Result<()> {
     );
     let tool_names = tools.names();
 
-    let llm = LlmClient::new(config.llm_config(config.default_model.clone()))?;
+    validate_agent_backend_env()?;
+    let omo_config = OmoBackendConfig::from_env()?;
+    info!(
+        appserver_url = %omo_config.appserver_url,
+        "Initializing agent backend: OMO app-server"
+    );
     let shared_dispatcher = Arc::new(SharedDispatcher::default());
-    let backend_kind = AgentBackendKind::from_env()?;
-    let live_runner = Arc::new(LiveAgentRunner {
-        pool: pool.clone(),
-        memory,
-        tools: tools.clone(),
-        llm: llm.clone(),
-        dispatcher: shared_dispatcher.clone(),
-        workspace_root: config.workspace_root.clone(),
-        streams: ParkingMutex::new(HashMap::new()),
-        processing_reactions: config.processing_reactions,
-        runtime_footer: config.runtime_footer,
-    });
-    let runner: Arc<dyn AgentBackend> = match backend_kind {
-        AgentBackendKind::Llm => {
-            info!("Initializing agent backend: Direct LLM (default)");
-            live_runner.clone()
-        }
-        AgentBackendKind::Omo => {
-            let omo_config = OmoBackendConfig::from_env()?;
-            info!(
-                appserver_url = %omo_config.appserver_url,
-                "Initializing agent backend: OMO app-server"
-            );
-            Arc::new(
-                OmoBackend::new(omo_config, shared_dispatcher.clone())
-                    .with_pool(pool.clone()),
-            )
-        }
-    };
+    let omo_backend = Arc::new(
+        OmoBackend::new(omo_config, shared_dispatcher.clone())
+            .with_pool(pool.clone()),
+    );
+    let runner: Arc<dyn AgentBackend> = omo_backend.clone();
     let profile_router = ProfileRouter::new(config.profile_routes.clone());
     let multiplexer = SessionMultiplexer::with_profile_router(
         pool.clone(),
-        runner,
+        runner.clone(),
         Some(shared_dispatcher.clone()),
         MultiplexerConfig::default(),
         profile_router.clone(),
@@ -1357,7 +1299,9 @@ async fn run_gateway() -> Result<()> {
     let scheduler = CronScheduler::with_dispatcher(
         pool.clone(),
         Arc::new(AgentCronExecutor {
-            runner: live_runner,
+            backend: runner.clone(),
+            workspace_root: config.workspace_root.clone(),
+            pool: pool.clone(),
             cron_script_timeout_secs: config.cron_script_timeout_secs,
         }),
         discord_egress,
@@ -1369,7 +1313,7 @@ async fn run_gateway() -> Result<()> {
     poise_data.pairing_store.init_cache().await?;
     poise_data.profile_router = profile_router;
     poise_data.missed_backfill = config.discord_missed_backfill;
-    poise_data.llm = Some(llm.clone());
+    poise_data.llm = LlmClient::new(config.llm_config(config.default_model.clone())).ok();
     poise_data.tools = tool_names;
     poise_data.tool_registry = tools.clone();
     poise_data.free_response_channels = config.free_response_channels.clone();
@@ -1508,7 +1452,6 @@ mod runner_tests {
     use std::fs;
 
     use clap::Parser;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
         approval_timeout_secs_from, canonical_authorized_directory, hermes_skill_dirs,
@@ -1683,30 +1626,6 @@ mod runner_tests {
         let _ = fs::remove_dir_all(base);
     }
 
-    struct MockTool;
-
-    #[async_trait::async_trait]
-    impl omon_gateway::Tool for MockTool {
-        fn name(&self) -> &str {
-            "mock_tool"
-        }
-
-        fn description(&self) -> &str {
-            "Mock test tool"
-        }
-
-        fn input_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<serde_json::Value, omon_gateway::OmonError> {
-            Ok(serde_json::json!({"status": "ok"}))
-        }
-    }
-
     #[derive(Default)]
     struct CapturingDispatcher {
         actions: tokio::sync::Mutex<Vec<omon_gateway::OutboundAction>>,
@@ -1718,782 +1637,6 @@ mod runner_tests {
             self.actions.lock().await.push(action);
             Ok(())
         }
-    }
-
-    async fn spawn_two_turn_tool_llm_server() -> (String, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            // Turn 1: LLM returns tool call for "mock_tool"
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0_u8; 4096];
-                let _ = socket.read(&mut buf).await;
-                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"mock_tool\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            }
-
-            // Turn 2: LLM returns final text content
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0_u8; 4096];
-                let _ = socket.read(&mut buf).await;
-                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Final result content\"}}]}\n\ndata: [DONE]\n\n";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            }
-        });
-        (format!("http://{address}/v1"), handle)
-    }
-
-    async fn build_test_runner(
-        base_url: String,
-        dispatcher: std::sync::Arc<CapturingDispatcher>,
-    ) -> (super::LiveAgentRunner, tempfile::TempDir) {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
-            .await
-            .unwrap();
-        let memory = omon_gateway::MemoryStore::new(pool.clone());
-        let mut tools = omon_gateway::ToolRegistry::new();
-        tools.register(MockTool);
-
-        let mut config =
-            omon_gateway::LlmConfig::new(omon_gateway::LlmProvider::OpenAi, "gpt-test");
-        config.base_url = Some(base_url);
-        let llm = omon_gateway::LlmClient::new(config).unwrap();
-
-        let runner = super::LiveAgentRunner {
-            pool,
-            memory,
-            tools,
-            llm,
-            dispatcher,
-            workspace_root: temp_dir.path().to_path_buf(),
-            streams: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            processing_reactions: true,
-            runtime_footer: false,
-        };
-        (runner, temp_dir)
-    }
-
-    #[tokio::test]
-    async fn test_execute_suppresses_delivery_for_silence_sentinel_and_empty() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server_handle = tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0_u8; 4096];
-                let _ = socket.read(&mut buf).await;
-                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"[SILENT]\"}}]}\n\ndata: [DONE]\n\n";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            }
-        });
-
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner, _dir) =
-            build_test_runner(format!("http://{address}/v1"), dispatcher.clone()).await;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            None::<String>,
-            "chan-silence",
-            None::<String>,
-            "user-silence",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event =
-            omon_gateway::InboundEvent::message(session_key.clone(), "msg-silence", "Hello");
-
-        let response = runner
-            .execute(&mut session, event, None, None, true, None)
-            .await
-            .unwrap();
-        assert_eq!(response, "[SILENT]");
-
-        let actions = dispatcher.actions.lock().await;
-        let stream_actions: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, omon_gateway::OutboundAction::Stream { .. }))
-            .collect();
-        assert!(
-            stream_actions.is_empty(),
-            "Expected zero Stream outbound actions for silence sentinel, found: {stream_actions:?}"
-        );
-
-        // Assistant message should NOT be persisted in DB
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT role, content FROM messages WHERE session_key = $1 AND role = 'assistant'",
-        )
-        .bind(session_key.storage_key())
-        .fetch_all(&runner.pool)
-        .await
-        .unwrap();
-        assert!(
-            rows.is_empty(),
-            "Expected 0 assistant messages in DB for silence sentinel"
-        );
-
-        server_handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn execute_suppresses_tool_status_when_stream_output_is_false() {
-        let (base_url, server_handle) = spawn_two_turn_tool_llm_server().await;
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            None::<String>,
-            "chan-1",
-            None::<String>,
-            "user-1",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event = omon_gateway::InboundEvent::message(session_key, "msg-1", "Run a tool");
-
-        let response = runner
-            .execute(&mut session, event, None, None, false, None)
-            .await
-            .unwrap();
-        assert_eq!(response, "Final result content");
-
-        let actions = dispatcher.actions.lock().await.clone();
-        let has_tool_status = actions.iter().any(|action| match action {
-            omon_gateway::OutboundAction::Stream { chunk, .. } => {
-                chunk.content.contains("Running tool")
-            }
-            _ => false,
-        });
-        assert!(
-            !has_tool_status,
-            "Non-streaming (cron) run must not emit tool-call status chunks"
-        );
-        let stream_actions: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, omon_gateway::OutboundAction::Stream { .. }))
-            .collect();
-        assert!(
-            stream_actions.is_empty(),
-            "Non-streaming run should not dispatch any stream actions, got: {actions:?}"
-        );
-
-        server_handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn execute_emits_tool_status_when_stream_output_is_true() {
-        let (base_url, server_handle) = spawn_two_turn_tool_llm_server().await;
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            None::<String>,
-            "chan-1",
-            None::<String>,
-            "user-1",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-1", "Run a tool");
-
-        let response = runner
-            .execute(&mut session, event, None, None, true, None)
-            .await
-            .unwrap();
-        assert_eq!(response, "Final result content");
-        assert!(
-            !response.contains("Running tool"),
-            "Final assistant response must not contain tool status lines"
-        );
-
-        let actions = dispatcher.actions.lock().await.clone();
-        let tool_status_actions: Vec<_> = actions
-            .iter()
-            .filter(|action| match action {
-                omon_gateway::OutboundAction::Stream { chunk, .. } => {
-                    chunk.content.contains("Running tool `mock_tool`")
-                }
-                _ => false,
-            })
-            .collect();
-        assert!(
-            !tool_status_actions.is_empty(),
-            "Streaming run must emit tool-call status chunks"
-        );
-
-        // Verify final assistant stream chunk does NOT contain tool-status text
-        let final_stream_actions: Vec<_> = actions
-            .iter()
-            .filter(|action| match action {
-                omon_gateway::OutboundAction::Stream { chunk, .. } => {
-                    chunk.is_final && chunk.content.contains("Final result content")
-                }
-                _ => false,
-            })
-            .collect();
-        assert!(
-            !final_stream_actions.is_empty(),
-            "Expected final assistant prose stream chunk"
-        );
-        for action in &final_stream_actions {
-            if let omon_gateway::OutboundAction::Stream { chunk, .. } = action {
-                assert!(
-                    !chunk.content.contains("Running tool"),
-                    "Final stream chunk content polluted with tool-status: {:?}",
-                    chunk.content
-                );
-            }
-        }
-
-        // Verify assistant message persisted in db has only model prose
-        let history: Vec<(String, String)> = sqlx::query_as(
-            "SELECT role, content FROM messages WHERE session_key = ? AND role = 'assistant' ORDER BY sequence ASC",
-        )
-        .bind(session_key.storage_key())
-        .fetch_all(&runner.pool)
-        .await
-        .unwrap();
-        for (_, content) in history {
-            assert!(
-                !content.contains("Running tool"),
-                "Persisted assistant message polluted with tool-status: {content}"
-            );
-        }
-
-        server_handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn execute_dispatches_typing_start_and_stop_for_streaming_turns_and_omits_for_non_streaming(
-    ) {
-        // 1. Streaming (interactive) turn: dispatches Typing { active: true } first,
-        // intermediate stream / tool chunks, and Typing { active: false } last.
-        let (base_url, server_handle) = spawn_two_turn_tool_llm_server().await;
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            None::<String>,
-            "chan-1",
-            None::<String>,
-            "user-1",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-1", "Run a tool");
-
-        let response = runner
-            .execute(&mut session, event, None, None, true, None)
-            .await
-            .unwrap();
-        assert_eq!(response, "Final result content");
-
-        let actions = dispatcher.actions.lock().await.clone();
-        assert!(
-            actions.len() >= 2,
-            "Expected at least start and stop typing actions, got {actions:?}"
-        );
-
-        assert_eq!(
-            actions.first(),
-            Some(&omon_gateway::OutboundAction::Typing {
-                session: session_key.clone(),
-                active: true,
-            }),
-            "First action dispatched in interactive turn must be Typing {{ active: true }}"
-        );
-
-        assert!(
-            actions.contains(&omon_gateway::OutboundAction::Typing {
-                session: session_key.clone(),
-                active: false,
-            }),
-            "Interactive turn must dispatch Typing {{ active: false }}"
-        );
-
-        assert_eq!(
-            actions.last(),
-            Some(&omon_gateway::OutboundAction::React {
-                session: session_key.clone(),
-                message_id: "msg-1".into(),
-                emoji: "✅".into(),
-                remove_others: true,
-            }),
-            "Last action dispatched on success must be React with check mark"
-        );
-
-        let typing_stop_idx = actions
-            .iter()
-            .position(|a| {
-                matches!(
-                    a,
-                    omon_gateway::OutboundAction::Typing { active: false, .. }
-                )
-            })
-            .expect("typing stop action present");
-        let intermediate_actions = &actions[1..typing_stop_idx];
-        assert!(
-            !intermediate_actions.is_empty(),
-            "Expected intermediate stream/tool actions between typing start and stop"
-        );
-        assert!(
-            intermediate_actions
-                .iter()
-                .all(|a| !matches!(a, omon_gateway::OutboundAction::Typing { .. })),
-            "Intermediate actions must not be typing actions"
-        );
-
-        server_handle.await.unwrap();
-
-        // 2. Non-streaming turn: dispatches neither start nor stop typing.
-        let (base_url_non_stream, server_handle_non_stream) =
-            spawn_two_turn_tool_llm_server().await;
-        let dispatcher_non_stream = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner_non_stream, _dir_non_stream) =
-            build_test_runner(base_url_non_stream, dispatcher_non_stream.clone()).await;
-
-        let mut session_non_stream = omon_gateway::SessionContext::new(session_key.clone());
-        let event_non_stream =
-            omon_gateway::InboundEvent::message(session_key.clone(), "msg-2", "Run a tool");
-
-        let response_non_stream = runner_non_stream
-            .execute(
-                &mut session_non_stream,
-                event_non_stream,
-                None,
-                None,
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(response_non_stream, "Final result content");
-
-        let non_stream_actions = dispatcher_non_stream.actions.lock().await.clone();
-        let non_stream_typing_or_stream: Vec<_> = non_stream_actions
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a,
-                    omon_gateway::OutboundAction::Typing { .. }
-                        | omon_gateway::OutboundAction::Stream { .. }
-                )
-            })
-            .collect();
-        assert!(
-            non_stream_typing_or_stream.is_empty(),
-            "Non-streaming turn must not dispatch typing or stream actions, got: {non_stream_actions:?}"
-        );
-        assert_eq!(
-            non_stream_actions.last(),
-            Some(&omon_gateway::OutboundAction::React {
-                session: session_key.clone(),
-                message_id: "msg-2".into(),
-                emoji: "✅".into(),
-                remove_others: true,
-            }),
-            "Non-streaming turn must still dispatch success reaction"
-        );
-        server_handle_non_stream.await.unwrap();
-    }
-
-    async fn spawn_single_turn_llm_server(
-        content: String,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server_handle = tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0_u8; 4096];
-                let _ = socket.read(&mut buf).await;
-                let escaped = serde_json::to_string(&content).unwrap();
-                let body = format!(
-                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{escaped}}}}}]}}\n\ndata: [DONE]\n\n"
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            }
-        });
-        (format!("http://{address}/v1"), server_handle)
-    }
-
-    #[tokio::test]
-    async fn test_execute_uploads_media_directive_and_delivers_stripped_text() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let image_path = temp_dir.path().join("chart.png");
-        std::fs::write(&image_path, b"fake png data").unwrap();
-
-        let llm_text = format!(
-            "Here is the generated chart:\nMEDIA:{}\nEnjoy!",
-            image_path.display()
-        );
-        let (base_url, server_handle) = spawn_single_turn_llm_server(llm_text).await;
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            None::<String>,
-            "chan-media",
-            None::<String>,
-            "user-media",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event =
-            omon_gateway::InboundEvent::message(session_key.clone(), "msg-media", "Draw a chart");
-
-        let response = runner
-            .execute(&mut session, event, None, None, true, None)
-            .await
-            .unwrap();
-        assert!(response.contains("MEDIA:"));
-
-        let actions = dispatcher.actions.lock().await.clone();
-
-        // Verify UploadFile was dispatched for the local file
-        let uploads: Vec<_> = actions
-            .iter()
-            .filter_map(|a| match a {
-                omon_gateway::OutboundAction::UploadFile { path, session: s } => {
-                    Some((path.clone(), s.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(uploads.len(), 1);
-        assert_eq!(uploads[0].0, image_path);
-        assert_eq!(uploads[0].1, session_key);
-
-        // Verify final stream chunk delivered stripped text without MEDIA line
-        let final_stream = actions.iter().find(|a| match a {
-            omon_gateway::OutboundAction::Stream { chunk, .. } => chunk.is_final,
-            _ => false,
-        });
-        assert!(final_stream.is_some());
-        if let Some(omon_gateway::OutboundAction::Stream { chunk, .. }) = final_stream {
-            assert!(!chunk.content.contains("MEDIA:"));
-            assert_eq!(chunk.content, "Here is the generated chart:\nEnjoy!");
-        }
-
-        server_handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_execute_uploads_media_only_and_suppresses_empty_text_delivery() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let report_path = temp_dir.path().join("report.pdf");
-        std::fs::write(&report_path, b"fake pdf data").unwrap();
-
-        let llm_text = format!("MEDIA:{}", report_path.display());
-        let (base_url, server_handle) = spawn_single_turn_llm_server(llm_text).await;
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            None::<String>,
-            "chan-media",
-            None::<String>,
-            "user-media",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event = omon_gateway::InboundEvent::message(
-            session_key.clone(),
-            "msg-media-only",
-            "Generate report",
-        );
-
-        let response = runner
-            .execute(&mut session, event, None, None, true, None)
-            .await
-            .unwrap();
-        assert!(response.contains("MEDIA:"));
-
-        let actions = dispatcher.actions.lock().await.clone();
-
-        // Verify UploadFile was dispatched
-        let uploads: Vec<_> = actions
-            .iter()
-            .filter_map(|a| match a {
-                omon_gateway::OutboundAction::UploadFile { path, .. } => Some(path.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(uploads, vec![report_path]);
-
-        // Verify no stream chunk was delivered with empty text
-        let has_final_stream = actions.iter().any(|a| match a {
-            omon_gateway::OutboundAction::Stream { chunk, .. } => chunk.is_final,
-            _ => false,
-        });
-        assert!(
-            !has_final_stream,
-            "Must suppress empty text message when only media is delivered"
-        );
-
-        server_handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn execute_suppresses_reactions_when_processing_reactions_is_false() {
-        let (base_url, server_handle) = spawn_two_turn_tool_llm_server().await;
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (mut runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
-        runner.processing_reactions = false;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            None::<String>,
-            "chan-1",
-            None::<String>,
-            "user-1",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event = omon_gateway::InboundEvent::message(session_key, "msg-1", "Run a tool");
-
-        let response = runner
-            .execute(&mut session, event, None, None, true, None)
-            .await
-            .unwrap();
-        assert_eq!(response, "Final result content");
-
-        let actions = dispatcher.actions.lock().await.clone();
-        assert!(
-            actions
-                .iter()
-                .all(|a| !matches!(a, omon_gateway::OutboundAction::React { .. })),
-            "Must not dispatch React actions when processing_reactions is false, got: {actions:?}"
-        );
-        server_handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn execute_dispatches_typing_stop_on_error() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server_handle = tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0_u8; 4096];
-                let _ = socket.read(&mut buf).await;
-                let body = "{\"error\": \"Internal server error\"}";
-                let response = format!(
-                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            }
-        });
-
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner, _dir) =
-            build_test_runner(format!("http://{address}/v1"), dispatcher.clone()).await;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            None::<String>,
-            "chan-1",
-            None::<String>,
-            "user-1",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-err", "Hello");
-
-        let result = runner
-            .execute(&mut session, event, None, None, true, None)
-            .await;
-        assert!(result.is_err(), "Expected error from 500 response");
-
-        let actions = dispatcher.actions.lock().await.clone();
-        assert_eq!(
-            actions,
-            vec![
-                omon_gateway::OutboundAction::Typing {
-                    session: session_key.clone(),
-                    active: true,
-                },
-                omon_gateway::OutboundAction::Typing {
-                    session: session_key.clone(),
-                    active: false,
-                },
-                omon_gateway::OutboundAction::React {
-                    session: session_key,
-                    message_id: "msg-err".into(),
-                    emoji: "❌".into(),
-                    remove_others: true,
-                },
-            ],
-            "Both typing start and stop and failure reaction must be dispatched even when execution fails"
-        );
-
-        server_handle.await.unwrap();
-    }
-
-    #[test]
-    fn repair_message_sequence_merges_consecutive_user_messages() {
-        let msgs = vec![
-            omon_gateway::ChatMessage::new("system", "sys prompt"),
-            omon_gateway::ChatMessage::new("user", "first message"),
-            omon_gateway::ChatMessage::new("user", "second message"),
-        ];
-        let repaired = super::repair_message_sequence(msgs);
-        assert_eq!(repaired.len(), 2);
-        assert_eq!(repaired[0].role, "system");
-        assert_eq!(repaired[0].content, "sys prompt");
-        assert_eq!(repaired[1].role, "user");
-        assert_eq!(repaired[1].content, "first message\n\nsecond message");
-    }
-
-    #[test]
-    fn repair_message_sequence_merges_consecutive_assistant_messages() {
-        let msgs = vec![
-            omon_gateway::ChatMessage::new("system", "sys prompt"),
-            omon_gateway::ChatMessage::new("user", "question"),
-            omon_gateway::ChatMessage::new("assistant", "partial answer"),
-            omon_gateway::ChatMessage::new("assistant", "full answer"),
-            omon_gateway::ChatMessage::new("user", "follow up"),
-        ];
-        let repaired = super::repair_message_sequence(msgs);
-        assert_eq!(repaired.len(), 4);
-        assert_eq!(repaired[0].role, "system");
-        assert_eq!(repaired[1].role, "user");
-        assert_eq!(repaired[1].content, "question");
-        assert_eq!(repaired[2].role, "assistant");
-        assert_eq!(repaired[2].content, "partial answer\n\nfull answer");
-        assert_eq!(repaired[3].role, "user");
-        assert_eq!(repaired[3].content, "follow up");
-    }
-
-    #[test]
-    fn repair_message_sequence_keeps_system_messages_leading() {
-        let msgs = vec![
-            omon_gateway::ChatMessage::new("user", "user 1"),
-            omon_gateway::ChatMessage::new("system", "system 1"),
-            omon_gateway::ChatMessage::new("assistant", "assistant 1"),
-            omon_gateway::ChatMessage::new("system", "system 2"),
-            omon_gateway::ChatMessage::new("user", "user 2"),
-        ];
-        let repaired = super::repair_message_sequence(msgs);
-        assert_eq!(repaired[0].role, "system");
-        assert_eq!(repaired[0].content, "system 1\n\nsystem 2");
-        assert_eq!(repaired[1].role, "user");
-        assert_eq!(repaired[1].content, "user 1");
-        assert_eq!(repaired[2].role, "assistant");
-        assert_eq!(repaired[2].content, "assistant 1");
-        assert_eq!(repaired[3].role, "user");
-        assert_eq!(repaired[3].content, "user 2");
-    }
-
-    #[test]
-    fn repair_message_sequence_strictly_alternates_and_ends_on_user() {
-        let msgs = vec![
-            omon_gateway::ChatMessage::new("system", "sys prompt"),
-            omon_gateway::ChatMessage::new("user", "user 1"),
-            omon_gateway::ChatMessage::new("assistant", "assistant 1"),
-        ];
-        let repaired = super::repair_message_sequence(msgs);
-        assert_eq!(repaired.len(), 4);
-        assert_eq!(repaired[0].role, "system");
-        assert_eq!(repaired[1].role, "user");
-        assert_eq!(repaired[1].content, "user 1");
-        assert_eq!(repaired[2].role, "assistant");
-        assert_eq!(repaired[2].content, "assistant 1");
-        assert_eq!(repaired[3].role, "user");
-        assert_eq!(repaired[3].content, "Continue");
-    }
-
-    #[test]
-    fn repair_message_sequence_handles_leading_assistant_gracefully() {
-        let msgs = vec![
-            omon_gateway::ChatMessage::new("system", "sys prompt"),
-            omon_gateway::ChatMessage::new("assistant", "unprompted greeting"),
-            omon_gateway::ChatMessage::new("user", "my answer"),
-        ];
-        let repaired = super::repair_message_sequence(msgs);
-        assert_eq!(repaired.len(), 4);
-        assert_eq!(repaired[0].role, "system");
-        assert_eq!(repaired[1].role, "user");
-        assert_eq!(repaired[1].content, "Continue");
-        assert_eq!(repaired[2].role, "assistant");
-        assert_eq!(repaired[2].content, "unprompted greeting");
-        assert_eq!(repaired[3].role, "user");
-        assert_eq!(repaired[3].content, "my answer");
-    }
-
-    #[tokio::test]
-    async fn test_emit_records_and_completes_delivery_obligation() {
-        let (base_url, server_handle) = spawn_two_turn_tool_llm_server().await;
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner, _dir) = build_test_runner(base_url, dispatcher.clone()).await;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            None::<String>,
-            "chan-emit-obl",
-            None::<String>,
-            "user-1",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event =
-            omon_gateway::InboundEvent::message(session_key.clone(), "msg-emit", "Hello obl");
-
-        let response = runner
-            .execute(&mut session, event, None, None, true, None)
-            .await
-            .unwrap();
-        assert_eq!(response, "Final result content");
-
-        // Check delivery_obligations table
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT id, state, content FROM delivery_obligations WHERE channel_id = 'chan-emit-obl'",
-        )
-        .fetch_all(&runner.pool)
-        .await
-        .unwrap();
-
-        assert!(
-            !rows.is_empty(),
-            "Expected at least 1 delivery obligation recorded"
-        );
-        // All recorded obligations should be marked 'delivered' after successful dispatch
-        for (id, state, content) in rows {
-            assert_eq!(
-                state, "delivered",
-                "obligation {id} state should be delivered"
-            );
-            assert!(content.contains("Final result content"));
-        }
-
-        server_handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -2810,238 +1953,6 @@ mod runner_tests {
                 .unwrap(),
             1
         );
-    }
-
-    fn drive_stripper(chunks: &[&str]) -> String {
-        let mut stripper = super::ThinkStripper::new();
-        let mut out = String::new();
-        for chunk in chunks {
-            out.push_str(&stripper.push(chunk));
-        }
-        out.push_str(&stripper.finish());
-        out
-    }
-
-    #[test]
-    fn test_think_stripper_closed_pairs() {
-        assert_eq!(
-            drive_stripper(&["<think>reasoning</think>Hello world"]),
-            "Hello world"
-        );
-        assert_eq!(
-            drive_stripper(&["Hello <think>internal thoughts</think> world"]),
-            "Hello  world"
-        );
-    }
-
-    #[test]
-    fn test_think_stripper_all_tag_variants_and_case() {
-        for tag in [
-            "think",
-            "thinking",
-            "reasoning",
-            "thought",
-            "reasoning_scratchpad",
-        ] {
-            let chunk = format!("<{tag}>secret scratchpad</{tag}>Visible answer");
-            assert_eq!(drive_stripper(&[&chunk]), "Visible answer");
-        }
-        assert_eq!(drive_stripper(&["<THINK>mixed case</Think>Hello"]), "Hello");
-        assert_eq!(
-            drive_stripper(&["<Reasoning>planning</REASONING>Done"]),
-            "Done"
-        );
-    }
-
-    #[test]
-    fn test_think_stripper_unterminated_open_drops_to_end() {
-        assert_eq!(drive_stripper(&["<think>reasoning without close"]), "");
-        assert_eq!(drive_stripper(&["Hello\n<think>reasoning text"]), "Hello\n");
-        assert_eq!(
-            drive_stripper(&["Hello\n  <thought>reasoning text"]),
-            "Hello\n  "
-        );
-    }
-
-    #[test]
-    fn test_think_stripper_prose_mentioning_tag_preserved() {
-        let text = "Use the <think> tag for reasoning models";
-        assert_eq!(drive_stripper(&[text]), text);
-    }
-
-    #[test]
-    fn test_think_stripper_orphan_close_tags() {
-        assert_eq!(drive_stripper(&["Hello</think>world"]), "Helloworld");
-        assert_eq!(drive_stripper(&["Hello</think> world"]), "Helloworld");
-        assert_eq!(drive_stripper(&["A</think>B</thinking>C"]), "ABC");
-    }
-
-    #[test]
-    fn test_think_stripper_split_tags_across_chunks() {
-        assert_eq!(
-            drive_stripper(&["<", "think>reasoning</think>done"]),
-            "done"
-        );
-        assert_eq!(
-            drive_stripper(&["<", "thi", "nk>internal thoughts</think>Answer"]),
-            "Answer"
-        );
-        assert_eq!(
-            drive_stripper(&["<think>reasoning<", "/think>after"]),
-            "after"
-        );
-        assert_eq!(
-            drive_stripper(&["<think>reasoning<", "/", "think>after"]),
-            "after"
-        );
-    }
-
-    #[test]
-    fn test_think_stripper_non_tag_flushed() {
-        assert_eq!(drive_stripper(&["Is 3 < 5?"]), "Is 3 < 5?");
-        assert_eq!(drive_stripper(&["Is 3 <"]), "Is 3 <");
-    }
-
-    #[tokio::test]
-    async fn test_execute_strips_think_blocks_from_streamed_responses() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server_handle = tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0_u8; 4096];
-                let _ = socket.read(&mut buf).await;
-                let chunk1 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>Internal deep thought\"}}]}\n\n";
-                let chunk2 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" and hidden steps</think>Hello user!\"}}]}\n\n";
-                let chunk_done = "data: [DONE]\n\n";
-                let body = format!("{chunk1}{chunk2}{chunk_done}");
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            }
-        });
-
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner, _dir) =
-            build_test_runner(format!("http://{address}/v1"), dispatcher.clone()).await;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            None::<String>,
-            "chan-think",
-            None::<String>,
-            "user-1",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        let event = omon_gateway::InboundEvent::message(session_key.clone(), "msg-think", "Hello!");
-
-        let response = runner
-            .execute(&mut session, event, None, None, true, None)
-            .await
-            .unwrap();
-
-        assert_eq!(response, "Hello user!");
-
-        let actions = dispatcher.actions.lock().await.clone();
-        for action in &actions {
-            if let omon_gateway::OutboundAction::Stream { chunk, .. } = action {
-                assert!(
-                    !chunk.content.contains("Internal deep thought"),
-                    "Dispatched stream chunk contained reasoning text: {:?}",
-                    chunk.content
-                );
-                assert!(
-                    !chunk.content.contains("<think>"),
-                    "Dispatched stream chunk contained <think> tag: {:?}",
-                    chunk.content
-                );
-            }
-        }
-
-        // Check persisted messages
-        let history: Vec<(String, String)> = sqlx::query_as(
-            "SELECT role, content FROM messages WHERE session_key = ? ORDER BY sequence ASC",
-        )
-        .bind(session_key.storage_key())
-        .fetch_all(&runner.pool)
-        .await
-        .unwrap();
-
-        let assistant_msg = history.iter().find(|(role, _)| role == "assistant");
-        assert!(assistant_msg.is_some());
-        let content = &assistant_msg.unwrap().1;
-        assert_eq!(content, "Hello user!");
-
-        server_handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_live_agent_runner_applies_session_custom_system_prompt_and_toolsets() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let captured_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let captured = captured_requests.clone();
-
-        let server_handle = tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0_u8; 8192];
-                let n = socket.read(&mut buf).await.unwrap_or(0);
-                let req_str = String::from_utf8_lossy(&buf[..n]).into_owned();
-                captured.lock().await.push(req_str);
-
-                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Profile response\"}}]}\n\ndata: [DONE]\n\n";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            }
-        });
-
-        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
-        let (runner, _dir) =
-            build_test_runner(format!("http://{address}/v1"), dispatcher.clone()).await;
-
-        let session_key = omon_gateway::SessionKey::new(
-            "discord",
-            Some("guild-routed"),
-            "chan-profile",
-            None::<String>,
-            "user-1",
-        );
-        let mut session = omon_gateway::SessionContext::new(session_key.clone());
-        session.state.system_prompt = Some("Custom profile prompt for this channel".into());
-        session.state.enabled_toolsets = Some(vec!["terminal".into()]);
-
-        let event = omon_gateway::InboundEvent::message(
-            session_key.clone(),
-            "msg-profile",
-            "Hello profile",
-        );
-
-        let response = runner
-            .execute(&mut session, event, None, None, true, None)
-            .await
-            .unwrap();
-
-        assert_eq!(response, "Profile response");
-
-        let reqs = captured_requests.lock().await.clone();
-        assert!(!reqs.is_empty(), "LLM must receive request");
-        let first_req = &reqs[0];
-        assert!(
-            first_req.contains("Custom profile prompt for this channel"),
-            "Payload sent to LLM must contain the profile system prompt: {first_req}"
-        );
-
-        server_handle.await.unwrap();
     }
 
     #[test]

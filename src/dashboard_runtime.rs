@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+// allow: SIZE_OK — dashboard runtime orchestration wiring
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,13 +6,12 @@ use std::time::Duration;
 
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
-    cron_script_timeout_secs_from, AgentBackendKind, ApprovalPolicy, CronScheduler, CronTool,
-    DiscordApprovalRequester, FileTool, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore,
-    MessageContextPolicyMatrix, MessengerPolicyStore, MultiplexerConfig, OmoBackend,
-    OmoBackendConfig, OutboundDispatcher, PayloadTaskExecutor, Result, ScaleToZero,
-    SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
+    cron_script_timeout_secs_from, ApprovalPolicy, CronScheduler, CronTool,
+    DiscordApprovalRequester, FileTool, McpTool, MessageContextPolicyMatrix,
+    MessengerPolicyStore, MultiplexerConfig, OmoBackend, OmoBackendConfig, OutboundDispatcher,
+    Result, ScaleToZero, SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
+    validate_agent_backend_env,
 };
-use parking_lot::Mutex as ParkingMutex;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -53,7 +52,6 @@ pub async fn run_standalone(
     })?;
     let extra_tool_roots = dashboard_tool_roots();
     let pool = init_pool(&database_url).await?;
-    let memory = MemoryStore::new(pool.clone());
 
     let approval_guard = SmartApprovalGuard::new().with_pool(pool.clone());
     let loaded_allowlist = approval_guard.load_persisted_allowlist().await?;
@@ -114,104 +112,37 @@ pub async fn run_standalone(
     let skill_roots = super::hermes_skill_dirs(&hermes_root, &home);
     tools.register(omon_gateway::SkillsTool::new(skill_roots.clone()).with_pool(pool.clone()));
 
-    let backend_kind = AgentBackendKind::from_env()?;
-    let model = super::optional_env("DEFAULT_MODEL");
-    let mut scale_to_zero = None;
-    let mut runner = None;
-    let multiplexer = match backend_kind {
-        AgentBackendKind::Omo => {
-            let omo_config = OmoBackendConfig::from_env()?;
-            tracing::info!(
-                appserver_url = %omo_config.appserver_url,
-                "Configured dashboard agent backend: OMO app-server"
-            );
-            let omo_backend = Arc::new(
-                OmoBackend::new(omo_config, dispatcher.clone()).with_pool(pool.clone()),
-            );
-            let mux = SessionMultiplexer::with_dispatcher(
-                pool.clone(),
-                omo_backend,
-                Some(dispatcher.clone()),
-                MultiplexerConfig::default(),
-            );
-            approval_requester.set_heartbeat(mux.activity_heartbeat()).await;
-            scale_to_zero = Some(ScaleToZero::start(mux.clone()));
-            if let Some(model) = model.as_deref() {
-                if let Ok(llm) = LlmClient::new(llm_config_from_environment(model)) {
-                    runner = Some(Arc::new(super::LiveAgentRunner {
-                        pool: pool.clone(),
-                        memory,
-                        tools: tools.clone(),
-                        llm,
-                        dispatcher: dispatcher.clone(),
-                        workspace_root: workspace_root.clone(),
-                        streams: ParkingMutex::new(HashMap::new()),
-                        processing_reactions: super::parse_bool_from(
-                            super::optional_env("DISCORD_PROCESSING_REACTIONS").as_deref(),
-                            true,
-                        ),
-                        runtime_footer: super::parse_bool_from(
-                            super::optional_env("DISCORD_RUNTIME_FOOTER").as_deref(),
-                            false,
-                        ),
-                    }));
-                }
-            }
-            Some(mux)
-        }
-        AgentBackendKind::Llm => {
-            if let Some(model) = model.as_deref() {
-                let llm = LlmClient::new(llm_config_from_environment(model))?;
-                let live_runner = Arc::new(super::LiveAgentRunner {
-                    pool: pool.clone(),
-                    memory,
-                    tools: tools.clone(),
-                    llm,
-                    dispatcher: dispatcher.clone(),
-                    workspace_root: workspace_root.clone(),
-                    streams: ParkingMutex::new(HashMap::new()),
-                    processing_reactions: super::parse_bool_from(
-                        super::optional_env("DISCORD_PROCESSING_REACTIONS").as_deref(),
-                        true,
-                    ),
-                    runtime_footer: super::parse_bool_from(
-                        super::optional_env("DISCORD_RUNTIME_FOOTER").as_deref(),
-                        false,
-                    ),
-                });
-                let mux = SessionMultiplexer::with_dispatcher(
-                    pool.clone(),
-                    live_runner.clone(),
-                    Some(dispatcher.clone()),
-                    MultiplexerConfig::default(),
-                );
-                approval_requester.set_heartbeat(mux.activity_heartbeat()).await;
-                scale_to_zero = Some(ScaleToZero::start(mux.clone()));
-                runner = Some(live_runner);
-                Some(mux)
-            } else {
-                tracing::warn!(
-                    "DEFAULT_MODEL is not configured; dashboard chat is disabled but administrative APIs remain available"
-                );
-                None
-            }
-        }
-    };
+    validate_agent_backend_env()?;
+    let omo_config = OmoBackendConfig::from_env()?;
+    tracing::info!(
+        appserver_url = %omo_config.appserver_url,
+        "Configured dashboard agent backend: OMO app-server"
+    );
+    let omo_backend = Arc::new(
+        OmoBackend::new(omo_config, dispatcher.clone()).with_pool(pool.clone()),
+    );
+    let mux = SessionMultiplexer::with_dispatcher(
+        pool.clone(),
+        omo_backend.clone(),
+        Some(dispatcher.clone()),
+        MultiplexerConfig::default(),
+    );
+    approval_requester.set_heartbeat(mux.activity_heartbeat()).await;
+    let scale_to_zero = Some(ScaleToZero::start(mux.clone()));
+    let multiplexer = Some(mux);
 
-    let scheduler = if let Some(runner) = runner {
-        CronScheduler::with_dispatcher(
-            pool.clone(),
-            Arc::new(super::AgentCronExecutor {
-                runner,
-                cron_script_timeout_secs: cron_script_timeout_secs_from(
-                    super::optional_env("OMON_CRON_SCRIPT_TIMEOUT_SECS").as_deref(),
-                ),
-            }),
-            dispatcher,
-        )
-    } else {
-        CronScheduler::new(pool.clone(), Arc::new(PayloadTaskExecutor))
-    };
+    let scheduler = CronScheduler::with_dispatcher(
+        pool.clone(),
+        Arc::new(super::AgentCronExecutor {
+            backend: omo_backend,
+            workspace_root: workspace_root.clone(),
+            pool: pool.clone(),
+            cron_script_timeout_secs: cron_script_timeout_secs_from(
+                super::optional_env("OMON_CRON_SCRIPT_TIMEOUT_SECS").as_deref(),
+            ),
+        }),
+        dispatcher,
+    );
     if start_scheduler {
         scheduler.start().await;
     }
@@ -282,26 +213,6 @@ fn dashboard_tool_roots() -> Vec<PathBuf> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."))]
         })
-}
-
-fn llm_config_from_environment(model: &str) -> LlmConfig {
-    let anthropic = model.starts_with("claude");
-    let mut config = LlmConfig::new(
-        if anthropic {
-            LlmProvider::Anthropic
-        } else {
-            LlmProvider::OpenAi
-        },
-        model,
-    );
-    if anthropic {
-        config.base_url = super::optional_env("ANTHROPIC_BASE_URL");
-        config.api_key = super::optional_env("ANTHROPIC_API_KEY");
-    } else {
-        config.base_url = super::optional_env("OPENAI_API_BASE");
-        config.api_key = super::optional_env("OPENAI_API_KEY");
-    }
-    config
 }
 
 fn configured_bot_count() -> usize {
@@ -406,14 +317,6 @@ fn split_csv(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn llm_config_selects_provider_from_model_name() {
-        let openai = llm_config_from_environment("gpt-test");
-        assert_eq!(openai.provider, LlmProvider::OpenAi);
-        let anthropic = llm_config_from_environment("claude-test");
-        assert_eq!(anthropic.provider, LlmProvider::Anthropic);
-    }
 
     #[test]
     fn split_csv_trims_and_drops_empty_values() {

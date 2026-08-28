@@ -2,43 +2,35 @@ use crate::{OmonError, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Agent backend engine variant selection.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentBackendKind {
-    #[default]
-    Llm,
-    Omo,
+pub fn validate_agent_backend_value(value: Option<&str>) -> Result<()> {
+    match value.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(()),
+        Some(v)
+            if v.eq_ignore_ascii_case("omo")
+                || v.eq_ignore_ascii_case("omo-appserver")
+                || v.eq_ignore_ascii_case("appserver") =>
+        {
+            Ok(())
+        }
+        Some(v)
+            if v.eq_ignore_ascii_case("llm")
+                || v.eq_ignore_ascii_case("hermes")
+                || v.eq_ignore_ascii_case("direct") =>
+        {
+            Err(OmonError::Config(
+                "direct LLM backend has been removed; only 'omo' (app-server) backend is supported"
+                    .to_string(),
+            ))
+        }
+        Some(invalid) => Err(OmonError::Config(format!(
+            "invalid OMON_AGENT_BACKEND '{invalid}': direct LLM backend has been removed and only 'omo' is supported"
+        ))),
+    }
 }
 
-impl AgentBackendKind {
-    pub fn parse(value: Option<&str>) -> Result<Self> {
-        match value.map(str::trim).filter(|s| !s.is_empty()) {
-            None => Ok(Self::Llm),
-            Some(v)
-                if v.eq_ignore_ascii_case("llm")
-                    || v.eq_ignore_ascii_case("hermes")
-                    || v.eq_ignore_ascii_case("direct") =>
-            {
-                Ok(Self::Llm)
-            }
-            Some(v)
-                if v.eq_ignore_ascii_case("omo")
-                    || v.eq_ignore_ascii_case("omo-appserver")
-                    || v.eq_ignore_ascii_case("appserver") =>
-            {
-                Ok(Self::Omo)
-            }
-            Some(invalid) => Err(OmonError::Config(format!(
-                "invalid OMON_AGENT_BACKEND: '{invalid}', expected 'llm' or 'omo'"
-            ))),
-        }
-    }
-
-    pub fn from_env() -> Result<Self> {
-        let val = std::env::var("OMON_AGENT_BACKEND").ok();
-        Self::parse(val.as_deref())
-    }
+pub fn validate_agent_backend_env() -> Result<()> {
+    let val = std::env::var("OMON_AGENT_BACKEND").ok();
+    validate_agent_backend_value(val.as_deref())
 }
 
 /// Configuration for the OMO app-server WebSocket daemon backend.
@@ -150,59 +142,40 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_agent_backend_kind_defaults_to_llm_when_absent() {
-        assert_eq!(
-            AgentBackendKind::parse(None).unwrap(),
-            AgentBackendKind::Llm
-        );
-        assert_eq!(
-            AgentBackendKind::parse(Some("")).unwrap(),
-            AgentBackendKind::Llm
-        );
-        assert_eq!(
-            AgentBackendKind::parse(Some("   ")).unwrap(),
-            AgentBackendKind::Llm
-        );
-    }
+    fn test_validate_agent_backend_env_contract() {
+        // Default (absent or empty) succeeds as Omo backend
+        assert!(validate_agent_backend_value(None).is_ok());
+        assert!(validate_agent_backend_value(Some("")).is_ok());
+        assert!(validate_agent_backend_value(Some("   ")).is_ok());
 
-    #[test]
-    fn test_agent_backend_kind_parses_supported_aliases() {
-        assert_eq!(
-            AgentBackendKind::parse(Some("llm")).unwrap(),
-            AgentBackendKind::Llm
-        );
-        assert_eq!(
-            AgentBackendKind::parse(Some("hermes")).unwrap(),
-            AgentBackendKind::Llm
-        );
-        assert_eq!(
-            AgentBackendKind::parse(Some("direct")).unwrap(),
-            AgentBackendKind::Llm
-        );
-        assert_eq!(
-            AgentBackendKind::parse(Some("omo")).unwrap(),
-            AgentBackendKind::Omo
-        );
-        assert_eq!(
-            AgentBackendKind::parse(Some("omo-appserver")).unwrap(),
-            AgentBackendKind::Omo
-        );
-        assert_eq!(
-            AgentBackendKind::parse(Some("appserver")).unwrap(),
-            AgentBackendKind::Omo
-        );
-        assert_eq!(
-            AgentBackendKind::parse(Some("OMO")).unwrap(),
-            AgentBackendKind::Omo
-        );
-    }
+        // Supported OMO aliases succeed
+        assert!(validate_agent_backend_value(Some("omo")).is_ok());
+        assert!(validate_agent_backend_value(Some("omo-appserver")).is_ok());
+        assert!(validate_agent_backend_value(Some("appserver")).is_ok());
+        assert!(validate_agent_backend_value(Some("OMO")).is_ok());
 
-    #[test]
-    fn test_agent_backend_kind_invalid_returns_descriptive_error() {
-        let err = AgentBackendKind::parse(Some("invalid-backend")).unwrap_err();
+        // Legacy direct-LLM aliases return Config error stating removal
+        let err_llm = validate_agent_backend_value(Some("llm")).unwrap_err();
         assert!(
-            matches!(err, OmonError::Config(ref msg) if msg.contains("invalid OMON_AGENT_BACKEND")),
-            "Expected Config error with description, got {err:?}"
+            matches!(err_llm, OmonError::Config(ref msg) if msg.contains("direct LLM backend has been removed") && msg.contains("omo")),
+            "Expected Config error for 'llm', got {err_llm:?}"
+        );
+        let err_hermes = validate_agent_backend_value(Some("hermes")).unwrap_err();
+        assert!(
+            matches!(err_hermes, OmonError::Config(ref msg) if msg.contains("direct LLM backend has been removed") && msg.contains("omo")),
+            "Expected Config error for 'hermes', got {err_hermes:?}"
+        );
+        let err_direct = validate_agent_backend_value(Some("direct")).unwrap_err();
+        assert!(
+            matches!(err_direct, OmonError::Config(ref msg) if msg.contains("direct LLM backend has been removed") && msg.contains("omo")),
+            "Expected Config error for 'direct', got {err_direct:?}"
+        );
+
+        // Unknown backend returns Config error
+        let err_unknown = validate_agent_backend_value(Some("unknown_backend")).unwrap_err();
+        assert!(
+            matches!(err_unknown, OmonError::Config(ref msg) if msg.contains("invalid OMON_AGENT_BACKEND")),
+            "Expected Config error for unknown backend, got {err_unknown:?}"
         );
     }
 

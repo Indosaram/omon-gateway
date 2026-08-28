@@ -23,7 +23,7 @@ use crate::{OmonError, Result};
 ///
 /// 3. **Heterogeneous Backend Architectures**: Future backends (such as an external agent server
 ///    or appserver backend) execute their own tool loops and agent runtimes remotely. Placing the
-///    trait at the runner boundary allows `SessionActor` to treat direct-LLM execution (`LlmBackend`)
+///    trait at the runner boundary allows `SessionActor` to treat execution backends
 ///    and remote agent protocols uniformly without leaking LLM-specific details into the multiplexer.
 ///
 /// 4. **Delivery Ledger & Lifecycle Integrity**: Cancellation (`cancel`), streaming token chunks
