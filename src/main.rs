@@ -16,8 +16,9 @@ use omon_gateway::{
     ApprovalPolicy, AttachmentDownloader, CronJob, CronScheduler, CronTaskExecutor, CronTool,
     DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool,
     HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool,
-    MultiplexerConfig, OmoBackend, OmoBackendConfig, OmonError, OutboundAction, OutboundDispatcher,
-    PoiseData, ProfileRoute, ProfileRouter, RestartLoopGuard, Result, ScaleToZero, SessionContext,
+    MultiplexerConfig, OmoBackend, OmoBackendConfig, OmoDaemonSupervisor, OmonError, OutboundAction,
+    OutboundDispatcher, PoiseData, ProfileRoute, ProfileRouter, RestartLoopGuard, Result,
+    ScaleToZero, SessionContext,
     SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
     MAX_CONTEXT_CHARS,
 };
@@ -1215,6 +1216,9 @@ async fn run_gateway() -> Result<()> {
 
     validate_agent_backend_env()?;
     let omo_config = OmoBackendConfig::from_env()?;
+    // Zero-config daemon lifecycle: spawn/keep-alive/kill the local
+    // `omo app-server` unless an external one is already serving.
+    let _daemon_supervisor = OmoDaemonSupervisor::ensure(&omo_config).await?;
     info!(
         appserver_url = %omo_config.appserver_url,
         "Initializing agent backend: OMO app-server"

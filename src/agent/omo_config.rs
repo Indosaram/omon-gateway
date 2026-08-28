@@ -99,16 +99,13 @@ impl OmoBackendConfig {
     }
 
     pub fn from_env() -> Result<Self> {
+        // Zero-config default: when the env var is absent, target the local
+        // daemon URL that the supervisor (see omo_daemon) auto-spawns.
         let appserver_url = std::env::var("OMON_OMO_APPSERVER_URL")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                OmonError::Config(
-                    "OMON_OMO_APPSERVER_URL is required when OMON_AGENT_BACKEND is 'omo'"
-                        .to_string(),
-                )
-            })?;
+            .unwrap_or_else(|| "ws://127.0.0.1:19742".to_string());
 
         Self::validate_url(&appserver_url)?;
 
@@ -195,6 +192,18 @@ mod tests {
 
         assert!(OmoBackendConfig::validate_url("ws://127.0.0.1:19742").is_ok());
         assert!(OmoBackendConfig::validate_url("wss://example.com/ws").is_ok());
+    }
+
+    #[test]
+    fn test_from_env_defaults_to_local_daemon_when_env_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OMON_OMO_APPSERVER_URL");
+
+        // The gateway must be zero-config: with no env var, the backend targets
+        // the local default daemon URL that the supervisor auto-spawns.
+        let config = OmoBackendConfig::from_env()
+            .expect("from_env must succeed with default local daemon URL");
+        assert_eq!(config.appserver_url, "ws://127.0.0.1:19742");
     }
 
     #[test]

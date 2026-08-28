@@ -2,6 +2,7 @@ mod backend;
 mod llm;
 mod omo_backend;
 mod omo_config;
+mod omo_daemon;
 mod omo_protocol;
 
 pub use backend::AgentBackend;
@@ -10,3 +11,4 @@ pub use llm::{
 };
 pub use omo_backend::OmoBackend;
 pub use omo_config::{validate_agent_backend_env, validate_agent_backend_value, OmoBackendConfig};
+pub use omo_daemon::OmoDaemonSupervisor;

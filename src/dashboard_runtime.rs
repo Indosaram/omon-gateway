@@ -8,9 +8,9 @@ use omon_gateway::storage::init_pool;
 use omon_gateway::{
     cron_script_timeout_secs_from, ApprovalPolicy, CronScheduler, CronTool,
     DiscordApprovalRequester, FileTool, McpTool, MessageContextPolicyMatrix,
-    MessengerPolicyStore, MultiplexerConfig, OmoBackend, OmoBackendConfig, OutboundDispatcher,
-    Result, ScaleToZero, SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
-    validate_agent_backend_env,
+    MessengerPolicyStore, MultiplexerConfig, OmoBackend, OmoBackendConfig, OmoDaemonSupervisor,
+    OutboundDispatcher, Result, ScaleToZero, SessionMultiplexer, SmartApprovalGuard, TerminalTool,
+    ToolRegistry, validate_agent_backend_env,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -114,6 +114,9 @@ pub async fn run_standalone(
 
     validate_agent_backend_env()?;
     let omo_config = OmoBackendConfig::from_env()?;
+    // Zero-config daemon lifecycle: spawn/keep-alive/kill the local
+    // `omo app-server` unless an external one is already serving.
+    let _daemon_supervisor = OmoDaemonSupervisor::ensure(&omo_config).await?;
     tracing::info!(
         appserver_url = %omo_config.appserver_url,
         "Configured dashboard agent backend: OMO app-server"
