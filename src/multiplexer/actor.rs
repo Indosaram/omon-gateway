@@ -18,26 +18,8 @@ use crate::{
 /// are rejected to avoid unbounded memory growth.
 const MAX_PENDING_EVENTS: usize = 64;
 
-#[async_trait]
-pub trait AgentRunner: Send + Sync + 'static {
-    async fn run(&self, session: &mut SessionContext, event: InboundEvent) -> Result<()>;
-
-    async fn run_cancelable(
-        &self,
-        session: &mut SessionContext,
-        event: InboundEvent,
-        cancellation: CancellationToken,
-    ) -> Result<()> {
-        tokio::select! {
-            result = self.run(session, event) => result,
-            _ = cancellation.cancelled() => Err(OmonError::Multiplexer("agent turn cancelled".into())),
-        }
-    }
-
-    async fn cancel(&self, _session: &SessionContext) -> Result<()> {
-        Ok(())
-    }
-}
+pub use crate::agent::AgentBackend;
+pub use crate::agent::AgentBackend as AgentRunner;
 
 #[async_trait]
 pub trait OutboundDispatcher: Send + Sync + 'static {
@@ -222,6 +204,9 @@ impl SessionActor {
                                     &self.context.key.storage_key(),
                                 )
                                 .await;
+                                if let Err(error) = self.flush_if_dirty().await {
+                                    tracing::error!(session = %self.context.key, %error, "failed to flush session actor on turn completion");
+                                }
                             }
                             self.complete_delivery(delivery_id.as_deref(), &result)
                                 .await;
@@ -773,6 +758,171 @@ mod tests {
         assert_eq!(
             actor2.context.state.enabled_toolsets.as_deref(),
             Some(&["terminal".to_string(), "web".to_string()][..])
+        );
+    }
+
+    #[derive(Default)]
+    struct CapturingDispatcher {
+        actions: tokio::sync::Mutex<Vec<OutboundAction>>,
+    }
+
+    #[async_trait]
+    impl OutboundDispatcher for CapturingDispatcher {
+        async fn dispatch(&self, action: OutboundAction) -> Result<()> {
+            self.actions.lock().await.push(action);
+            Ok(())
+        }
+    }
+
+    struct ScriptedFakeBackend {
+        pool: SqlitePool,
+        dispatcher: Arc<CapturingDispatcher>,
+        chunks_to_emit: Vec<String>,
+        final_assistant_message: String,
+        completed: mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl AgentBackend for ScriptedFakeBackend {
+        async fn run(&self, session: &mut SessionContext, _event: InboundEvent) -> Result<()> {
+            let stream_id = uuid::Uuid::new_v4();
+            for (seq, chunk_text) in self.chunks_to_emit.iter().enumerate() {
+                let is_final = seq + 1 == self.chunks_to_emit.len();
+                self.dispatcher
+                    .dispatch(OutboundAction::Stream {
+                        session: session.key.clone(),
+                        chunk: crate::StreamChunk {
+                            stream_id,
+                            sequence: seq as u64,
+                            content: chunk_text.clone(),
+                            is_final,
+                        },
+                    })
+                    .await?;
+            }
+
+            let now = Utc::now();
+            sqlx::query(
+                "INSERT INTO messages (id, session_key, role, content, metadata_json, created_at) VALUES (?, ?, 'assistant', ?, '{}', ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(session.key.storage_key())
+            .bind(&self.final_assistant_message)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+
+            let _ = self.completed.send(());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_turn_loop_with_scripted_fake_backend() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let key = test_session("actor-fake-backend-test");
+        let pool = db.pool().clone();
+
+        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+        let dispatcher = Arc::new(CapturingDispatcher::default());
+        let backend = Arc::new(ScriptedFakeBackend {
+            pool: pool.clone(),
+            dispatcher: dispatcher.clone(),
+            chunks_to_emit: vec!["Hello ".to_string(), "world!".to_string()],
+            final_assistant_message: "Hello world!".to_string(),
+            completed: completed_tx,
+        });
+
+        let delivery_id = "delivery_claim_test_1";
+        let ledger = DeliveryLedgerService::new(pool.clone());
+        let mut event = InboundEvent::message(key.clone(), "msg-platform-123", "Hello agent");
+        event.delivery_id = Some(delivery_id.to_string());
+        ledger
+            .record_incoming_as(&event, delivery_id)
+            .await
+            .unwrap();
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let actor = SessionActor::load(
+            key.clone(),
+            cmd_rx,
+            backend,
+            Some(dispatcher.clone()),
+            pool.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let handle = tokio::spawn(actor.run());
+
+        cmd_tx
+            .send(ActorCommand::Event(Box::new(event)))
+            .await
+            .unwrap();
+
+        // Wait until the backend turn has executed completely
+        assert_eq!(completed_rx.recv().await, Some(()));
+
+        // Allow actor loop to complete turn finalization and delivery ledger update
+        drop(cmd_tx);
+        handle.await.unwrap();
+
+        // 1. Assert user message was persisted
+        let user_msgs: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT role, content, platform_message_id FROM messages WHERE session_key = ? AND role = 'user'",
+        )
+        .bind(key.storage_key())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(user_msgs.len(), 1, "Expected 1 persisted user message");
+        assert_eq!(user_msgs[0].0, "user");
+        assert_eq!(user_msgs[0].1, "Hello agent");
+        assert_eq!(user_msgs[0].2.as_deref(), Some("msg-platform-123"));
+
+        // 2. Assert assistant chunks delivered via dispatcher
+        let actions = dispatcher.actions.lock().await;
+        let stream_chunks: Vec<&crate::StreamChunk> = actions
+            .iter()
+            .filter_map(|action| match action {
+                OutboundAction::Stream { chunk, .. } => Some(chunk),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stream_chunks.len(), 2, "Expected 2 stream chunks delivered");
+        assert_eq!(stream_chunks[0].sequence, 0);
+        assert_eq!(stream_chunks[0].content, "Hello ");
+        assert!(!stream_chunks[0].is_final);
+        assert_eq!(stream_chunks[1].sequence, 1);
+        assert_eq!(stream_chunks[1].content, "world!");
+        assert!(stream_chunks[1].is_final);
+
+        // 3. Assert assistant message persisted
+        let assistant_msgs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, content FROM messages WHERE session_key = ? AND role = 'assistant'",
+        )
+        .bind(key.storage_key())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            assistant_msgs.len(),
+            1,
+            "Expected 1 persisted assistant message"
+        );
+        assert_eq!(assistant_msgs[0].0, "assistant");
+        assert_eq!(assistant_msgs[0].1, "Hello world!");
+
+        // 4. Assert delivery ledger completed
+        let entry = ledger
+            .get(delivery_id)
+            .await
+            .unwrap()
+            .expect("Ledger entry must exist");
+        assert_eq!(
+            entry.status, "delivered",
+            "Delivery ledger claim must be marked delivered"
         );
     }
 }

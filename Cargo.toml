@@ -49,6 +49,7 @@ cron = "0.15"
 urlencoding = "2.1"
 base64 = "0.22"
 regex = "1.11"
+tokio-tungstenite = "0.26"
 
 [dev-dependencies]
 tempfile = "3"

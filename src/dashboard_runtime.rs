@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
-    cron_script_timeout_secs_from, ApprovalPolicy, CronScheduler, CronTool,
+    cron_script_timeout_secs_from, AgentBackendKind, ApprovalPolicy, CronScheduler, CronTool,
     DiscordApprovalRequester, FileTool, LlmClient, LlmConfig, LlmProvider, McpTool, MemoryStore,
-    MessageContextPolicyMatrix, MessengerPolicyStore, MultiplexerConfig, OutboundDispatcher,
-    PayloadTaskExecutor, Result, ScaleToZero, SessionMultiplexer, SmartApprovalGuard, TerminalTool,
-    ToolRegistry,
+    MessageContextPolicyMatrix, MessengerPolicyStore, MultiplexerConfig, OmoBackend,
+    OmoBackendConfig, OutboundDispatcher, PayloadTaskExecutor, Result, ScaleToZero,
+    SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::{json, Value};
@@ -114,43 +114,88 @@ pub async fn run_standalone(
     let skill_roots = super::hermes_skill_dirs(&hermes_root, &home);
     tools.register(omon_gateway::SkillsTool::new(skill_roots.clone()).with_pool(pool.clone()));
 
+    let backend_kind = AgentBackendKind::from_env()?;
     let model = super::optional_env("DEFAULT_MODEL");
     let mut scale_to_zero = None;
     let mut runner = None;
-    let multiplexer = if let Some(model) = model.as_deref() {
-        let llm = LlmClient::new(llm_config_from_environment(model))?;
-        let live_runner = Arc::new(super::LiveAgentRunner {
-            pool: pool.clone(),
-            memory,
-            tools: tools.clone(),
-            llm,
-            dispatcher: dispatcher.clone(),
-            workspace_root: workspace_root.clone(),
-            streams: ParkingMutex::new(HashMap::new()),
-            processing_reactions: super::parse_bool_from(
-                super::optional_env("DISCORD_PROCESSING_REACTIONS").as_deref(),
-                true,
-            ),
-            runtime_footer: super::parse_bool_from(
-                super::optional_env("DISCORD_RUNTIME_FOOTER").as_deref(),
-                false,
-            ),
-        });
-        let mux = SessionMultiplexer::with_dispatcher(
-            pool.clone(),
-            live_runner.clone(),
-            Some(dispatcher.clone()),
-            MultiplexerConfig::default(),
-        );
-        approval_requester.set_heartbeat(mux.activity_heartbeat()).await;
-        scale_to_zero = Some(ScaleToZero::start(mux.clone()));
-        runner = Some(live_runner);
-        Some(mux)
-    } else {
-        tracing::warn!(
-            "DEFAULT_MODEL is not configured; dashboard chat is disabled but administrative APIs remain available"
-        );
-        None
+    let multiplexer = match backend_kind {
+        AgentBackendKind::Omo => {
+            let omo_config = OmoBackendConfig::from_env()?;
+            tracing::info!(
+                appserver_url = %omo_config.appserver_url,
+                "Configured dashboard agent backend: OMO app-server"
+            );
+            let omo_backend = Arc::new(
+                OmoBackend::new(omo_config, dispatcher.clone()).with_pool(pool.clone()),
+            );
+            let mux = SessionMultiplexer::with_dispatcher(
+                pool.clone(),
+                omo_backend,
+                Some(dispatcher.clone()),
+                MultiplexerConfig::default(),
+            );
+            approval_requester.set_heartbeat(mux.activity_heartbeat()).await;
+            scale_to_zero = Some(ScaleToZero::start(mux.clone()));
+            if let Some(model) = model.as_deref() {
+                if let Ok(llm) = LlmClient::new(llm_config_from_environment(model)) {
+                    runner = Some(Arc::new(super::LiveAgentRunner {
+                        pool: pool.clone(),
+                        memory,
+                        tools: tools.clone(),
+                        llm,
+                        dispatcher: dispatcher.clone(),
+                        workspace_root: workspace_root.clone(),
+                        streams: ParkingMutex::new(HashMap::new()),
+                        processing_reactions: super::parse_bool_from(
+                            super::optional_env("DISCORD_PROCESSING_REACTIONS").as_deref(),
+                            true,
+                        ),
+                        runtime_footer: super::parse_bool_from(
+                            super::optional_env("DISCORD_RUNTIME_FOOTER").as_deref(),
+                            false,
+                        ),
+                    }));
+                }
+            }
+            Some(mux)
+        }
+        AgentBackendKind::Llm => {
+            if let Some(model) = model.as_deref() {
+                let llm = LlmClient::new(llm_config_from_environment(model))?;
+                let live_runner = Arc::new(super::LiveAgentRunner {
+                    pool: pool.clone(),
+                    memory,
+                    tools: tools.clone(),
+                    llm,
+                    dispatcher: dispatcher.clone(),
+                    workspace_root: workspace_root.clone(),
+                    streams: ParkingMutex::new(HashMap::new()),
+                    processing_reactions: super::parse_bool_from(
+                        super::optional_env("DISCORD_PROCESSING_REACTIONS").as_deref(),
+                        true,
+                    ),
+                    runtime_footer: super::parse_bool_from(
+                        super::optional_env("DISCORD_RUNTIME_FOOTER").as_deref(),
+                        false,
+                    ),
+                });
+                let mux = SessionMultiplexer::with_dispatcher(
+                    pool.clone(),
+                    live_runner.clone(),
+                    Some(dispatcher.clone()),
+                    MultiplexerConfig::default(),
+                );
+                approval_requester.set_heartbeat(mux.activity_heartbeat()).await;
+                scale_to_zero = Some(ScaleToZero::start(mux.clone()));
+                runner = Some(live_runner);
+                Some(mux)
+            } else {
+                tracing::warn!(
+                    "DEFAULT_MODEL is not configured; dashboard chat is disabled but administrative APIs remain available"
+                );
+                None
+            }
+        }
     };
 
     let scheduler = if let Some(runner) = runner {
