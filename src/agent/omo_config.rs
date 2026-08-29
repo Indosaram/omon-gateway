@@ -49,7 +49,7 @@ impl Default for OmoBackendConfig {
             appserver_url: "ws://127.0.0.1:19742".to_string(),
             auth_token: None,
             connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(600),
             default_model: None,
         }
     }
@@ -109,6 +109,19 @@ impl OmoBackendConfig {
 
         Self::validate_url(&appserver_url)?;
 
+        // Idle-gap tolerance between streamed daemon events; long agent turns
+        // (digests, refactors) need minutes, not seconds.
+        let request_timeout = match std::env::var("OMON_OMO_TURN_TIMEOUT_SECS") {
+            Ok(v) if !v.trim().is_empty() => {
+                Duration::from_secs(v.trim().parse::<u64>().map_err(|_| {
+                    OmonError::Config(format!(
+                        "invalid OMON_OMO_TURN_TIMEOUT_SECS: '{v}', expected a positive integer"
+                    ))
+                })?)
+            }
+            _ => Duration::from_secs(600),
+        };
+
         let auth_token = std::env::var("OMON_OMO_APPSERVER_AUTH_TOKEN")
             .or_else(|_| std::env::var("OMON_OMO_AUTH_TOKEN"))
             .ok()
@@ -125,7 +138,7 @@ impl OmoBackendConfig {
             appserver_url,
             auth_token,
             connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(60),
+            request_timeout,
             default_model,
         })
     }
@@ -137,6 +150,25 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_turn_stream_timeout_env_contract() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Default: 10 minutes of event-gap tolerance for long agent turns
+        std::env::remove_var("OMON_OMO_TURN_TIMEOUT_SECS");
+        let cfg = OmoBackendConfig::from_env().unwrap();
+        assert_eq!(cfg.request_timeout, Duration::from_secs(600));
+
+        // Explicit override
+        std::env::set_var("OMON_OMO_TURN_TIMEOUT_SECS", "300");
+        let cfg = OmoBackendConfig::from_env().unwrap();
+        assert_eq!(cfg.request_timeout, Duration::from_secs(300));
+
+        // Invalid value fails boot (fail-fast convention)
+        std::env::set_var("OMON_OMO_TURN_TIMEOUT_SECS", "soon");
+        assert!(OmoBackendConfig::from_env().is_err());
+        std::env::remove_var("OMON_OMO_TURN_TIMEOUT_SECS");
+    }
 
     #[test]
     fn test_validate_agent_backend_env_contract() {
