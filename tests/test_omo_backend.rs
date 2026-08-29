@@ -50,18 +50,25 @@ struct FakeAppServer {
     pub received_model: Arc<ParkingMutex<Option<String>>>,
     pub turn_threads: Arc<ParkingMutex<Vec<String>>>,
     pub approval_responses: Arc<ParkingMutex<Vec<Value>>>,
+    pub conn_count: Arc<AtomicUsize>,
 }
 
 impl FakeAppServer {
     async fn spawn() -> Self {
-        Self::spawn_inner(false).await
+        Self::spawn_inner(false, false).await
     }
 
     async fn spawn_with_activity() -> Self {
-        Self::spawn_inner(true).await
+        Self::spawn_inner(true, false).await
     }
 
-    async fn spawn_inner(emit_activity: bool) -> Self {
+    /// Drop the client's first connection abruptly: exercises the
+    /// one-shot transport retry.
+    async fn spawn_with_first_connection_drop() -> Self {
+        Self::spawn_inner(false, true).await
+    }
+
+    async fn spawn_inner(emit_activity: bool, drop_first_connection: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind free port");
@@ -73,6 +80,8 @@ impl FakeAppServer {
         let turn_threads = Arc::new(ParkingMutex::new(Vec::new()));
         let approval_responses = Arc::new(ParkingMutex::new(Vec::new()));
         let emit_activity_flag = Arc::new(AtomicBool::new(emit_activity));
+        let conn_count = Arc::new(AtomicUsize::new(0));
+        let drop_flag = drop_first_connection;
 
         let tsc = thread_start_count.clone();
         let rdi = received_developer_instructions.clone();
@@ -80,9 +89,18 @@ impl FakeAppServer {
         let tt = turn_threads.clone();
         let ar = approval_responses.clone();
         let ea = emit_activity_flag.clone();
+        let cc = conn_count.clone();
+        let drop_first = drop_flag;
 
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                let conn_num = cc.fetch_add(1, Ordering::SeqCst) + 1;
+                if drop_first && conn_num == 1 {
+                    // Abruptly drop the first connection (no WS close frame):
+                    // the client must see a transport error and retry once.
+                    drop(stream);
+                    continue;
+                }
                 let tsc = tsc.clone();
                 let rdi = rdi.clone();
                 let rm = rm.clone();
@@ -346,6 +364,7 @@ impl FakeAppServer {
             received_model,
             turn_threads,
             approval_responses,
+            conn_count,
         }
     }
 }
@@ -511,4 +530,101 @@ async fn test_omo_backend_emits_hermes_activity_lines() {
     let last = chunks.last().map(|c| c.content.clone()).unwrap_or_default();
     let expected = "> 💭 hmm let me think about this carefully…\n⚙️ Running `echo OMOITEMPROBE-OK`…\n⤷ OMOITEMPROBE-OK\n\nOMOACT-OK";
     assert_eq!(last, expected, "final chunk layout mismatch: {last:?}");
+}
+
+#[tokio::test]
+async fn test_omo_backend_persists_without_preexisting_session_row() {
+    // Regression: cron sessions are created implicitly by backend.run —
+    // persisting the assistant message must not violate the messages->
+    // sessions foreign key (code 787).
+    let server = FakeAppServer::spawn().await;
+    let url = format!("ws://127.0.0.1:{}", server.port);
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .expect("in-memory pool");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrations");
+
+    let config = OmoBackendConfig::new(&url).with_default_model(Some("claude-3-5-sonnet"));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone()).with_pool(pool.clone());
+
+    let session_key = SessionKey::new(
+        "local",
+        None::<String>,
+        "test-cron-job",
+        None::<String>,
+        "cron:test-cron-job",
+    );
+    let mut session = SessionContext::new(session_key.clone());
+    session.state.system_prompt = Some("You are a helpful test persona.".to_string());
+
+    let event = InboundEvent::message(session_key.clone(), "msg-1", "Say hello");
+    let result = backend.run(&mut session, event).await;
+    assert!(
+        result.is_ok(),
+        "turn must succeed without a pre-existing session row: {:?}",
+        result.err()
+    );
+
+    let session_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(session_rows >= 1, "session row must be ensured");
+
+    let assistant: Option<String> =
+        sqlx::query_scalar("SELECT content FROM messages WHERE role='assistant'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert_eq!(assistant.as_deref(), Some("Hello World!"));
+
+    let fk_enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        fk_enabled, 1,
+        "foreign keys must be enforced for this test to be meaningful"
+    );
+}
+
+#[tokio::test]
+async fn test_omo_backend_retries_once_after_connection_drop() {
+    // Given: the fake server drops the client's first connection abruptly
+    let server = FakeAppServer::spawn_with_first_connection_drop().await;
+    let url = format!("ws://127.0.0.1:{}", server.port);
+
+    let config = OmoBackendConfig::new(&url).with_default_model(Some("claude-3-5-sonnet"));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+
+    let session_key = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "chan-1",
+        None::<String>,
+        "user-1",
+    );
+    let mut session = SessionContext::new(session_key.clone());
+
+    // When: the turn survives exactly one transport drop
+    let event = InboundEvent::message(session_key.clone(), "msg-1", "Say hello");
+    let result = backend.run(&mut session, event).await;
+    assert!(
+        result.is_ok(),
+        "turn must succeed via the one-shot transport retry: {:?}",
+        result.err()
+    );
+
+    // Then: the retry reconnected and served the full flow
+    assert_eq!(server.conn_count.load(Ordering::SeqCst), 2);
+    let chunks = dispatcher.stream_chunks();
+    let last = chunks.last().map(|c| c.content.clone()).unwrap_or_default();
+    assert_eq!(last, "Hello World!");
 }

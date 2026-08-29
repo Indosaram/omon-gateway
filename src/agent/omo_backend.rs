@@ -219,9 +219,8 @@ impl OmoBackend {
     }
 }
 
-#[async_trait]
-impl AgentBackend for OmoBackend {
-    async fn run(&self, session: &mut SessionContext, event: InboundEvent) -> Result<()> {
+impl OmoBackend {
+    async fn run_once(&self, session: &mut SessionContext, event: InboundEvent) -> Result<()> {
         let mut ws = self.connect_ws().await?;
         self.do_initialize(&mut ws).await?;
         let thread_id = self.resolve_thread_id(&mut ws, session).await?;
@@ -355,6 +354,7 @@ impl AgentBackend for OmoBackend {
                         self.emit_chunk(session, stream_id, sequence, rendered.clone(), true)
                             .await;
                         if let Some(pool) = &self.pool {
+                            ensure_session_row(pool, session).await?;
                             persist_message(pool, session, &rendered).await?;
                         }
                         return Ok(());
@@ -374,6 +374,49 @@ impl AgentBackend for OmoBackend {
         }
         Ok(())
     }
+}
+
+#[async_trait]
+impl AgentBackend for OmoBackend {
+    async fn run(&self, session: &mut SessionContext, event: InboundEvent) -> Result<()> {
+        // One automatic retry when the daemon connection drops mid-turn
+        // (ECONNRESET from a daemon restart); the persisted threadId keeps
+        // the conversation continuous across the retry.
+        let outcome = self.run_once(session, event.clone()).await;
+        let retryable = matches!(
+            &outcome,
+            Err(OmonError::Llm(msg))
+                if msg.contains("Connection reset")
+                    || msg.contains("os error 54")
+                    || msg.contains("Broken pipe")
+                    || msg.contains("connection closed")
+        );
+        if retryable {
+            tracing::warn!("omo daemon connection reset mid-turn; retrying once");
+            return self.run_once(session, event).await;
+        }
+        outcome
+    }
+}
+
+async fn ensure_session_row(pool: &sqlx::SqlitePool, session: &SessionContext) -> Result<()> {
+    let now = chrono::Utc::now();
+    sqlx::query(
+        "INSERT OR IGNORE INTO sessions (session_key, platform, guild_id, channel_id, thread_id, user_id, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(session.key.storage_key())
+    .bind(&session.key.platform)
+    .bind(&session.key.guild_id)
+    .bind(&session.key.channel_id)
+    .bind(&session.key.thread_id)
+    .bind(&session.key.user_id)
+    .bind(serde_json::to_string(&session.state).unwrap_or_else(|_| "{}".to_string()))
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|e| OmonError::Llm(format!("ensure session row: {e}")))?;
+    Ok(())
 }
 
 async fn persist_message(pool: &SqlitePool, session: &SessionContext, content: &str) -> Result<()> {
