@@ -13,6 +13,9 @@ use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
 use super::backend::AgentBackend;
+use super::omo_activity::{
+    command_output_excerpt, format_activity_line, reasoning_blockquote, OUTPUT_CAP, REASONING_CAP,
+};
 use super::omo_config::OmoBackendConfig;
 use super::omo_protocol::{
     approval_denial_response, initialize_request, is_approval_request, thread_start_request,
@@ -236,6 +239,10 @@ impl AgentBackend for OmoBackend {
         let stream_id = Uuid::new_v4();
         let mut sequence: u64 = 0;
         let mut full_content = String::new();
+        let mut activity_lines: Vec<String> = Vec::new();
+        let mut started_ids: std::collections::HashSet<String> = Default::default();
+        let mut completed_ids: std::collections::HashSet<String> = Default::default();
+        let mut excerpt_ids: std::collections::HashSet<String> = Default::default();
 
         while let Some(msg) = tokio::time::timeout(self.config.request_timeout, ws.next())
             .await
@@ -256,6 +263,73 @@ impl AgentBackend for OmoBackend {
                 }
 
                 match val.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "item/started" | "item/completed" => {
+                        let is_started =
+                            val.get("method").and_then(Value::as_str) == Some("item/started");
+                        let Some(item) = val.pointer("/params/item") else {
+                            continue;
+                        };
+                        let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+
+                        if let Some(line) = format_activity_line(item) {
+                            if is_started {
+                                if !item_id.is_empty() && started_ids.contains(item_id) {
+                                    continue;
+                                }
+                                if !item_id.is_empty() {
+                                    started_ids.insert(item_id.to_string());
+                                }
+                                activity_lines.push(line);
+                            } else if !started_ids.contains(item_id)
+                                && !completed_ids.contains(item_id)
+                            {
+                                if !item_id.is_empty() {
+                                    completed_ids.insert(item_id.to_string());
+                                }
+                                activity_lines.push(line);
+                            }
+                        }
+
+                        if !is_started {
+                            match item.get("type").and_then(Value::as_str) {
+                                Some("reasoning") => {
+                                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                        if item_id.is_empty()
+                                            || completed_ids.insert(item_id.to_string())
+                                        {
+                                            activity_lines
+                                                .push(reasoning_blockquote(text, REASONING_CAP));
+                                        }
+                                    }
+                                }
+                                Some("commandExecution") => {
+                                    if let Some(output) =
+                                        item.get("aggregatedOutput").and_then(Value::as_str)
+                                    {
+                                        if !output.trim().is_empty()
+                                            && (item_id.is_empty()
+                                                || excerpt_ids.insert(item_id.to_string()))
+                                        {
+                                            activity_lines.push(format!(
+                                                "⤷ {}",
+                                                command_output_excerpt(output, OUTPUT_CAP)
+                                            ));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        let rendered = if activity_lines.is_empty() {
+                            full_content.clone()
+                        } else {
+                            format!("{}\n\n{}", activity_lines.join("\n"), full_content)
+                        };
+                        self.emit_chunk(session, stream_id, sequence, rendered, false)
+                            .await;
+                        sequence = sequence.saturating_add(1);
+                    }
                     "item/agentMessage/delta" => {
                         if let Some(delta) = val.pointer("/params/delta").and_then(Value::as_str) {
                             if !delta.is_empty() {
@@ -273,10 +347,15 @@ impl AgentBackend for OmoBackend {
                         }
                     }
                     "turn/completed" => {
-                        self.emit_chunk(session, stream_id, sequence, full_content.clone(), true)
+                        let rendered = if activity_lines.is_empty() {
+                            full_content.clone()
+                        } else {
+                            format!("{}\n\n{}", activity_lines.join("\n"), full_content)
+                        };
+                        self.emit_chunk(session, stream_id, sequence, rendered.clone(), true)
                             .await;
                         if let Some(pool) = &self.pool {
-                            persist_message(pool, session, &full_content).await?;
+                            persist_message(pool, session, &rendered).await?;
                         }
                         return Ok(());
                     }

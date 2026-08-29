@@ -1,5 +1,6 @@
 mod backend;
 mod llm;
+mod omo_activity;
 mod omo_backend;
 mod omo_config;
 mod omo_daemon;

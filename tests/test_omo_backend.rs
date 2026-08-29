@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -54,6 +54,14 @@ struct FakeAppServer {
 
 impl FakeAppServer {
     async fn spawn() -> Self {
+        Self::spawn_inner(false).await
+    }
+
+    async fn spawn_with_activity() -> Self {
+        Self::spawn_inner(true).await
+    }
+
+    async fn spawn_inner(emit_activity: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind free port");
@@ -64,12 +72,14 @@ impl FakeAppServer {
         let received_model = Arc::new(ParkingMutex::new(None));
         let turn_threads = Arc::new(ParkingMutex::new(Vec::new()));
         let approval_responses = Arc::new(ParkingMutex::new(Vec::new()));
+        let emit_activity_flag = Arc::new(AtomicBool::new(emit_activity));
 
         let tsc = thread_start_count.clone();
         let rdi = received_developer_instructions.clone();
         let rm = received_model.clone();
         let tt = turn_threads.clone();
         let ar = approval_responses.clone();
+        let ea = emit_activity_flag.clone();
 
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -78,6 +88,7 @@ impl FakeAppServer {
                 let rm = rm.clone();
                 let tt = tt.clone();
                 let ar = ar.clone();
+                let ea = ea.clone();
 
                 tokio::spawn(async move {
                     let ws = match tokio_tungstenite::accept_async(stream).await {
@@ -191,6 +202,76 @@ impl FakeAppServer {
                                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
                                     // Stream item/agentMessage/delta chunks
+                                    let emit_activity = ea.load(Ordering::SeqCst);
+                                    if emit_activity {
+                                        let reasoning_done = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "item/completed",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turnId": "turn-001",
+                                                "item": {
+                                                    "type": "reasoning",
+                                                    "text": "hmm let me think about this carefully"
+                                                }
+                                            }
+                                        });
+                                        let _ = outgoing_tx
+                                            .send(Message::text(reasoning_done.to_string()))
+                                            .await;
+
+                                        let tool_started = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "item/started",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turnId": "turn-001",
+                                                "item": {
+                                                    "type": "commandExecution",
+                                                    "id": "call-1",
+                                                    "command": "echo OMOITEMPROBE-OK",
+                                                    "status": "inProgress"
+                                                }
+                                            }
+                                        });
+                                        let _ = outgoing_tx
+                                            .send(Message::text(tool_started.to_string()))
+                                            .await;
+
+                                        let output_delta = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "item/commandExecution/outputDelta",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turnId": "turn-001",
+                                                "itemId": "call-1",
+                                                "delta": "OMOITEMPROBE-OK"
+                                            }
+                                        });
+                                        let _ = outgoing_tx
+                                            .send(Message::text(output_delta.to_string()))
+                                            .await;
+
+                                        let tool_completed = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "item/completed",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turnId": "turn-001",
+                                                "item": {
+                                                    "type": "commandExecution",
+                                                    "id": "call-1",
+                                                    "command": "echo OMOITEMPROBE-OK",
+                                                    "status": "completed",
+                                                    "aggregatedOutput": "OMOITEMPROBE-OK"
+                                                }
+                                            }
+                                        });
+                                        let _ = outgoing_tx
+                                            .send(Message::text(tool_completed.to_string()))
+                                            .await;
+                                    }
+
                                     let delta1 = json!({
                                         "jsonrpc": "2.0",
                                         "method": "item/agentMessage/delta",
@@ -198,7 +279,7 @@ impl FakeAppServer {
                                             "threadId": thread_id,
                                             "turnId": "turn-001",
                                             "itemId": "msg-001",
-                                            "delta": "Hello "
+                                            "delta": if emit_activity { "OMO" } else { "Hello " }
                                         }
                                     });
                                     let _ =
@@ -211,7 +292,7 @@ impl FakeAppServer {
                                             "threadId": thread_id,
                                             "turnId": "turn-001",
                                             "itemId": "msg-001",
-                                            "delta": "World!"
+                                            "delta": if emit_activity { "ACT-OK" } else { "World!" }
                                         }
                                     });
                                     let _ =
@@ -226,7 +307,7 @@ impl FakeAppServer {
                                             "turnId": "turn-001",
                                             "item": {
                                                 "type": "agentMessage",
-                                                "text": "Hello World!"
+                                                "text": if emit_activity { "OMOACT-OK" } else { "Hello World!" }
                                             }
                                         }
                                     });
@@ -377,4 +458,57 @@ async fn test_omo_backend_unreachable_daemon_error() {
 
     let result = backend.run(&mut session, event).await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_omo_backend_emits_hermes_activity_lines() {
+    // Given: fake server emitting reasoning + commandExecution activity items
+    let server = FakeAppServer::spawn_with_activity().await;
+    let url = format!("ws://127.0.0.1:{}", server.port);
+
+    let config = OmoBackendConfig::new(&url).with_default_model(Some("claude-3-5-sonnet"));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+
+    let session_key = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "chan-1",
+        None::<String>,
+        "user-1",
+    );
+    let mut session = SessionContext::new(session_key.clone());
+    session.state.system_prompt = Some("You are a helpful test persona.".to_string());
+
+    // When: a turn runs through tool + reasoning activity
+    let event = InboundEvent::message(session_key.clone(), "msg-1", "Run the probe command");
+    let result = backend.run(&mut session, event).await;
+    assert!(result.is_ok(), "turn failed: {:?}", result.err());
+
+    // Then: activity lines appear in the stream, interleaved before the reply
+    let chunks = dispatcher.stream_chunks();
+    assert!(!chunks.is_empty(), "no chunks emitted");
+
+    let combined: String = chunks
+        .iter()
+        .map(|c| c.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        combined.contains("⚙️ Running `echo OMOITEMPROBE-OK`…"),
+        "tool activity line missing: {combined}"
+    );
+    assert!(
+        combined.contains("> 💭 hmm let me think about this carefully…"),
+        "thinking block missing: {combined}"
+    );
+    assert!(
+        combined.contains("⤷ OMOITEMPROBE-OK"),
+        "output excerpt missing: {combined}"
+    );
+
+    // And: the final visible message carries activity block + reply
+    let last = chunks.last().map(|c| c.content.clone()).unwrap_or_default();
+    let expected = "> 💭 hmm let me think about this carefully…\n⚙️ Running `echo OMOITEMPROBE-OK`…\n⤷ OMOITEMPROBE-OK\n\nOMOACT-OK";
+    assert_eq!(last, expected, "final chunk layout mismatch: {last:?}");
 }
