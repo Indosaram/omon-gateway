@@ -44,6 +44,9 @@ pub struct OmoBackendConfig {
     pub default_model: Option<String>,
 }
 
+/// Default daemon URL for the isolated cron lane (see [`OmoBackendConfig::cron_from_env`]).
+pub const CRON_APPSERVER_URL_DEFAULT: &str = "ws://127.0.0.1:19743";
+
 impl Default for OmoBackendConfig {
     fn default() -> Self {
         Self {
@@ -164,6 +167,35 @@ impl OmoBackendConfig {
             default_model,
         })
     }
+
+    /// Configuration for the **cron lane**.
+    ///
+    /// An app-server thread runs one turn at a time, so a multi-minute cron
+    /// turn (digests, syncs) would otherwise queue every Discord message
+    /// behind it until the total deadline fires. Cron therefore targets its
+    /// own daemon instance on a separate port, with a tighter ceiling, while
+    /// inheriting the credentials and model of the interactive lane.
+    pub fn cron_from_env() -> Result<Self> {
+        let mut config = Self::from_env()?;
+
+        config.appserver_url = std::env::var("OMON_OMO_CRON_APPSERVER_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| CRON_APPSERVER_URL_DEFAULT.to_string());
+        Self::validate_url(&config.appserver_url)?;
+
+        config.total_timeout = match std::env::var("OMON_OMO_CRON_TURN_TOTAL_TIMEOUT_SECS") {
+            Ok(v) if !v.trim().is_empty() => Duration::from_secs(v.trim().parse::<u64>().map_err(|_| {
+                OmonError::Config(format!(
+                    "invalid OMON_OMO_CRON_TURN_TOTAL_TIMEOUT_SECS: '{v}', expected a positive integer"
+                ))
+            })?),
+            _ => Duration::from_secs(600),
+        };
+
+        Ok(config)
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +278,51 @@ mod tests {
 
         assert!(OmoBackendConfig::validate_url("ws://127.0.0.1:19742").is_ok());
         assert!(OmoBackendConfig::validate_url("wss://example.com/ws").is_ok());
+    }
+
+    #[test]
+    fn test_cron_from_env_uses_isolated_daemon_lane() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OMON_OMO_APPSERVER_URL");
+        std::env::remove_var("OMON_OMO_CRON_APPSERVER_URL");
+        std::env::remove_var("OMON_OMO_CRON_TURN_TOTAL_TIMEOUT_SECS");
+
+        let interactive = OmoBackendConfig::from_env().unwrap();
+        let cron = OmoBackendConfig::cron_from_env().unwrap();
+
+        // A long cron turn must never occupy the interactive daemon: the two
+        // lanes target different app-server instances.
+        assert_eq!(interactive.appserver_url, "ws://127.0.0.1:19742");
+        assert_eq!(cron.appserver_url, "ws://127.0.0.1:19743");
+        assert_ne!(cron.appserver_url, interactive.appserver_url);
+
+        // Cron turns get a tighter ceiling than interactive turns.
+        assert_eq!(cron.total_timeout, Duration::from_secs(600));
+        assert!(cron.total_timeout < interactive.total_timeout);
+    }
+
+    #[test]
+    fn test_cron_from_env_honours_overrides_and_inherits_credentials() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OMON_OMO_CRON_APPSERVER_URL", "ws://127.0.0.1:29999");
+        std::env::set_var("OMON_OMO_CRON_TURN_TOTAL_TIMEOUT_SECS", "120");
+        std::env::set_var("OMON_OMO_APPSERVER_AUTH_TOKEN", "shared-token");
+        std::env::set_var("OMON_DEFAULT_MODEL", "glm-5.3-flash");
+
+        let cron = OmoBackendConfig::cron_from_env().unwrap();
+        assert_eq!(cron.appserver_url, "ws://127.0.0.1:29999");
+        assert_eq!(cron.total_timeout, Duration::from_secs(120));
+        assert_eq!(cron.auth_token.as_deref(), Some("shared-token"));
+        assert_eq!(cron.default_model.as_deref(), Some("glm-5.3-flash"));
+
+        // Invalid override fails boot, consistent with the other timeouts.
+        std::env::set_var("OMON_OMO_CRON_TURN_TOTAL_TIMEOUT_SECS", "later");
+        assert!(OmoBackendConfig::cron_from_env().is_err());
+
+        std::env::remove_var("OMON_OMO_CRON_APPSERVER_URL");
+        std::env::remove_var("OMON_OMO_CRON_TURN_TOTAL_TIMEOUT_SECS");
+        std::env::remove_var("OMON_OMO_APPSERVER_AUTH_TOKEN");
+        std::env::remove_var("OMON_DEFAULT_MODEL");
     }
 
     #[test]

@@ -1300,10 +1300,24 @@ async fn run_gateway() -> Result<()> {
         }
     }
 
+    // Cron runs on its own app-server instance: an agent thread executes one
+    // turn at a time, so a long digest turn on the interactive daemon would
+    // stall every Discord message behind it.
+    let cron_omo_config = OmoBackendConfig::cron_from_env()?;
+    let _cron_daemon_supervisor = OmoDaemonSupervisor::ensure(&cron_omo_config).await?;
+    info!(
+        appserver_url = %cron_omo_config.appserver_url,
+        total_timeout_secs = cron_omo_config.total_timeout.as_secs(),
+        "Initializing isolated cron agent backend: OMO app-server"
+    );
+    let cron_backend: Arc<dyn AgentBackend> = Arc::new(
+        OmoBackend::new(cron_omo_config, shared_dispatcher.clone()).with_pool(pool.clone()),
+    );
+
     let scheduler = CronScheduler::with_dispatcher(
         pool.clone(),
         Arc::new(AgentCronExecutor {
-            backend: runner.clone(),
+            backend: cron_backend,
             workspace_root: config.workspace_root.clone(),
             pool: pool.clone(),
             cron_script_timeout_secs: config.cron_script_timeout_secs,

@@ -134,10 +134,23 @@ pub async fn run_standalone(
     let scale_to_zero = Some(ScaleToZero::start(mux.clone()));
     let multiplexer = Some(mux);
 
+    // Cron gets its own app-server instance so a long cron turn cannot
+    // occupy the interactive daemon (one turn per agent thread).
+    let cron_omo_config = OmoBackendConfig::cron_from_env()?;
+    let _cron_daemon_supervisor = OmoDaemonSupervisor::ensure(&cron_omo_config).await?;
+    tracing::info!(
+        appserver_url = %cron_omo_config.appserver_url,
+        total_timeout_secs = cron_omo_config.total_timeout.as_secs(),
+        "Configured isolated dashboard cron backend: OMO app-server"
+    );
+    let cron_backend = Arc::new(
+        OmoBackend::new(cron_omo_config, dispatcher.clone()).with_pool(pool.clone()),
+    );
+
     let scheduler = CronScheduler::with_dispatcher(
         pool.clone(),
         Arc::new(super::AgentCronExecutor {
-            backend: omo_backend,
+            backend: cron_backend,
             workspace_root: workspace_root.clone(),
             pool: pool.clone(),
             cron_script_timeout_secs: cron_script_timeout_secs_from(

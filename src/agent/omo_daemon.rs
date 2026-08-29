@@ -56,6 +56,61 @@ async fn probe_readyz(ws_url: &str, limit: Duration) -> bool {
     .unwrap_or(false)
 }
 
+/// Resolve the daemon binary to something spawnable.
+///
+/// Under launchd the gateway inherits a minimal `PATH`
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) which excludes user-level install
+/// directories such as `~/.bun/bin`, so a bare `omo` fails with ENOENT even
+/// though it resolves fine in an interactive shell. When the name carries no
+/// path separator and cannot be found on `path_env`, fall back to well-known
+/// absolute install locations. Explicit paths are returned untouched.
+fn resolve_daemon_bin(bin: &str, path_env: &str) -> String {
+    if bin.contains('/') {
+        return bin.to_string();
+    }
+
+    let on_path = path_env
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .any(|dir| {
+            std::path::Path::new(dir)
+                .join(bin)
+                .try_exists()
+                .unwrap_or(false)
+        });
+    if on_path {
+        return bin.to_string();
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        for candidate in [
+            format!("{home}/.bun/bin/{bin}"),
+            format!("{home}/.local/bin/{bin}"),
+            format!("{home}/.npm-global/bin/{bin}"),
+        ] {
+            if std::path::Path::new(&candidate)
+                .try_exists()
+                .unwrap_or(false)
+            {
+                return candidate;
+            }
+        }
+    }
+    for candidate in [
+        format!("/opt/homebrew/bin/{bin}"),
+        format!("/usr/local/bin/{bin}"),
+    ] {
+        if std::path::Path::new(&candidate)
+            .try_exists()
+            .unwrap_or(false)
+        {
+            return candidate;
+        }
+    }
+
+    bin.to_string()
+}
+
 /// Build the spawn command for a local daemon. Exposed for tests.
 fn daemon_command(bin: &str, listen_url: &str) -> Command {
     let mut cmd = Command::new(bin);
@@ -91,7 +146,10 @@ impl OmoDaemonSupervisor {
     /// when necessary. Returns `Ok(None)` when an externally managed daemon
     /// is already serving (or autospawn is disabled / URL is non-local).
     pub async fn ensure(cfg: &OmoBackendConfig) -> Result<Option<Self>> {
-        let bin = std::env::var("OMON_OMO_BIN").unwrap_or_else(|_| "omo".to_string());
+        let bin = resolve_daemon_bin(
+            &std::env::var("OMON_OMO_BIN").unwrap_or_else(|_| "omo".to_string()),
+            &std::env::var("PATH").unwrap_or_default(),
+        );
         if !autospawn_enabled() || !is_local_url(&cfg.appserver_url) {
             return Ok(None);
         }
@@ -259,6 +317,30 @@ mod tests {
                 Duration::from_secs(2)
             )
             .await
+        );
+    }
+
+    #[test]
+    fn test_resolve_daemon_bin_falls_back_to_known_install_paths() {
+        // launchd hands the gateway a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+        // that excludes ~/.bun/bin, so a bare "omo" fails to spawn with ENOENT.
+        // Resolution must fall back to well-known absolute install locations.
+        let home = std::env::var("HOME").unwrap();
+        let bun_omo = format!("{home}/.bun/bin/omo");
+        if !std::path::Path::new(&bun_omo).exists() {
+            return; // fallback target absent on this machine
+        }
+
+        let resolved = resolve_daemon_bin("omo", "/usr/bin:/bin:/usr/sbin:/sbin");
+        assert_eq!(
+            resolved, bun_omo,
+            "bare 'omo' must resolve to an absolute path when PATH lacks the install dir"
+        );
+
+        // An explicit absolute override is always honoured verbatim.
+        assert_eq!(
+            resolve_daemon_bin("/custom/omo", "/usr/bin:/bin"),
+            "/custom/omo"
         );
     }
 
