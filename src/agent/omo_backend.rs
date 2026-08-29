@@ -1,6 +1,7 @@
 // allow: SIZE_OK — OMO WebSocket protocol state machine
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -243,10 +244,31 @@ impl OmoBackend {
         let mut completed_ids: std::collections::HashSet<String> = Default::default();
         let mut excerpt_ids: std::collections::HashSet<String> = Default::default();
 
+        let started_at = std::time::Instant::now();
+        let mut turn_id: Option<String> = None;
+
         while let Some(msg) = tokio::time::timeout(self.config.request_timeout, ws.next())
             .await
             .map_err(|_| OmonError::Llm("timeout during turn streaming".into()))?
         {
+            if started_at.elapsed() > self.config.total_timeout {
+                if let Some(turn_id) = &turn_id {
+                    let interrupt = json!({
+                        "jsonrpc": "2.0",
+                        "id": 9_001,
+                        "method": "turn/interrupt",
+                        "params": { "threadId": thread_id, "turnId": turn_id }
+                    });
+                    let _ = ws.send(Message::text(interrupt.to_string())).await;
+                    // Give the frame a moment to reach the daemon before the
+                    // connection drops.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                return Err(OmonError::Llm(format!(
+                    "turn exceeded total deadline of {:?}; turn/interrupt sent",
+                    self.config.total_timeout
+                )));
+            }
             let msg = msg.map_err(|e| OmonError::Llm(format!("ws streaming error: {e}")))?;
             if let Message::Text(text) = msg {
                 let val: Value = serde_json::from_str(text.as_str())
@@ -262,6 +284,11 @@ impl OmoBackend {
                 }
 
                 match val.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "turn/started" => {
+                        if let Some(tid) = val.pointer("/params/turnId").and_then(Value::as_str) {
+                            turn_id = Some(tid.to_string());
+                        }
+                    }
                     "item/started" | "item/completed" => {
                         let is_started =
                             val.get("method").and_then(Value::as_str) == Some("item/started");

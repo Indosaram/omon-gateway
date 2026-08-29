@@ -51,24 +51,35 @@ struct FakeAppServer {
     pub turn_threads: Arc<ParkingMutex<Vec<String>>>,
     pub approval_responses: Arc<ParkingMutex<Vec<Value>>>,
     pub conn_count: Arc<AtomicUsize>,
+    pub interrupts: Arc<ParkingMutex<Vec<Value>>>,
 }
 
 impl FakeAppServer {
     async fn spawn() -> Self {
-        Self::spawn_inner(false, false).await
+        Self::spawn_inner(false, false, false).await
     }
 
     async fn spawn_with_activity() -> Self {
-        Self::spawn_inner(true, false).await
+        Self::spawn_inner(true, false, false).await
     }
 
     /// Drop the client's first connection abruptly: exercises the
     /// one-shot transport retry.
     async fn spawn_with_first_connection_drop() -> Self {
-        Self::spawn_inner(false, true).await
+        Self::spawn_inner(false, true, false).await
     }
 
-    async fn spawn_inner(emit_activity: bool, drop_first_connection: bool) -> Self {
+    /// Stream deltas forever (well, 5s) without turn/completed: exercises
+    /// the whole-turn deadline + turn/interrupt.
+    async fn spawn_with_looping_deltas() -> Self {
+        Self::spawn_inner(false, false, true).await
+    }
+
+    async fn spawn_inner(
+        emit_activity: bool,
+        drop_first_connection: bool,
+        loop_deltas: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind free port");
@@ -82,6 +93,7 @@ impl FakeAppServer {
         let emit_activity_flag = Arc::new(AtomicBool::new(emit_activity));
         let conn_count = Arc::new(AtomicUsize::new(0));
         let drop_flag = drop_first_connection;
+        let interrupts = Arc::new(ParkingMutex::new(Vec::new()));
 
         let tsc = thread_start_count.clone();
         let rdi = received_developer_instructions.clone();
@@ -91,6 +103,8 @@ impl FakeAppServer {
         let ea = emit_activity_flag.clone();
         let cc = conn_count.clone();
         let drop_first = drop_flag;
+        let it = interrupts.clone();
+        let looping = loop_deltas;
 
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -107,6 +121,7 @@ impl FakeAppServer {
                 let tt = tt.clone();
                 let ar = ar.clone();
                 let ea = ea.clone();
+                let it = it.clone();
 
                 tokio::spawn(async move {
                     let ws = match tokio_tungstenite::accept_async(stream).await {
@@ -142,6 +157,9 @@ impl FakeAppServer {
                             let id = parsed.get("id").and_then(Value::as_u64).unwrap_or(0);
 
                             match method {
+                                "turn/interrupt" => {
+                                    it.lock().push(parsed.clone());
+                                }
                                 "initialize" => {
                                     let resp = json!({
                                         "jsonrpc": "2.0",
@@ -290,64 +308,125 @@ impl FakeAppServer {
                                             .await;
                                     }
 
-                                    let delta1 = json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "item/agentMessage/delta",
-                                        "params": {
-                                            "threadId": thread_id,
-                                            "turnId": "turn-001",
-                                            "itemId": "msg-001",
-                                            "delta": if emit_activity { "OMO" } else { "Hello " }
-                                        }
-                                    });
-                                    let _ =
-                                        outgoing_tx.send(Message::text(delta1.to_string())).await;
-
-                                    let delta2 = json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "item/agentMessage/delta",
-                                        "params": {
-                                            "threadId": thread_id,
-                                            "turnId": "turn-001",
-                                            "itemId": "msg-001",
-                                            "delta": if emit_activity { "ACT-OK" } else { "World!" }
-                                        }
-                                    });
-                                    let _ =
-                                        outgoing_tx.send(Message::text(delta2.to_string())).await;
-
-                                    // Send item/completed
-                                    let item_completed = json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "item/completed",
-                                        "params": {
-                                            "threadId": thread_id,
-                                            "turnId": "turn-001",
-                                            "item": {
-                                                "type": "agentMessage",
-                                                "text": if emit_activity { "OMOACT-OK" } else { "Hello World!" }
+                                    if looping {
+                                        // Emulate an agent that never finishes:
+                                        // deltas forever, no turn/completed.
+                                        let t_id = thread_id.clone();
+                                        let sink = outgoing_tx.clone();
+                                        tokio::spawn(async move {
+                                            let started = json!({
+                                                "jsonrpc": "2.0",
+                                                "method": "turn/started",
+                                                "params": {
+                                                    "threadId": t_id,
+                                                    "turnId": "turn-loop"
+                                                }
+                                            });
+                                            let _ =
+                                                sink.send(Message::text(started.to_string())).await;
+                                            let mut i: u32 = 0;
+                                            while i < 60 {
+                                                i += 1;
+                                                let d = json!({
+                                                    "jsonrpc": "2.0",
+                                                    "method": "item/agentMessage/delta",
+                                                    "params": {
+                                                        "threadId": t_id,
+                                                        "turnId": "turn-loop",
+                                                        "itemId": "loop-msg",
+                                                        "delta": format!("loop {} ", i)
+                                                    }
+                                                });
+                                                if sink
+                                                    .send(Message::text(d.to_string()))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(150),
+                                                )
+                                                .await;
                                             }
-                                        }
-                                    });
-                                    let _ = outgoing_tx
-                                        .send(Message::text(item_completed.to_string()))
-                                        .await;
+                                            let done = json!({
+                                                "jsonrpc": "2.0",
+                                                "method": "turn/completed",
+                                                "params": {
+                                                    "threadId": t_id,
+                                                    "turn": {"id": "turn-loop", "status": "completed"}
+                                                }
+                                            });
+                                            let _ =
+                                                sink.send(Message::text(done.to_string())).await;
+                                        });
+                                        // NOTE: the reader task must keep running
+                                        // so it can observe the client's
+                                        // turn/interrupt frame.
+                                    }
 
-                                    // Send turn/completed
-                                    let turn_completed = json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "turn/completed",
-                                        "params": {
-                                            "threadId": thread_id,
-                                            "turn": {
-                                                "id": "turn-001",
-                                                "status": "completed"
+                                    if !looping {
+                                        let delta1 = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "item/agentMessage/delta",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turnId": "turn-001",
+                                                "itemId": "msg-001",
+                                                "delta": if emit_activity { "OMO" } else { "Hello " }
                                             }
-                                        }
-                                    });
-                                    let _ = outgoing_tx
-                                        .send(Message::text(turn_completed.to_string()))
-                                        .await;
+                                        });
+                                        let _ = outgoing_tx
+                                            .send(Message::text(delta1.to_string()))
+                                            .await;
+
+                                        let delta2 = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "item/agentMessage/delta",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turnId": "turn-001",
+                                                "itemId": "msg-001",
+                                                "delta": if emit_activity { "ACT-OK" } else { "World!" }
+                                            }
+                                        });
+                                        let _ = outgoing_tx
+                                            .send(Message::text(delta2.to_string()))
+                                            .await;
+
+                                        // Send item/completed
+                                        let item_completed = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "item/completed",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turnId": "turn-001",
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "text": if emit_activity { "OMOACT-OK" } else { "Hello World!" }
+                                                }
+                                            }
+                                        });
+                                        let _ = outgoing_tx
+                                            .send(Message::text(item_completed.to_string()))
+                                            .await;
+
+                                        // Send turn/completed
+                                        let turn_completed = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "turn/completed",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turn": {
+                                                    "id": "turn-001",
+                                                    "status": "completed"
+                                                }
+                                            }
+                                        });
+                                        let _ = outgoing_tx
+                                            .send(Message::text(turn_completed.to_string()))
+                                            .await;
+                                    }
                                 }
                                 _ => {}
                             }
@@ -365,6 +444,7 @@ impl FakeAppServer {
             turn_threads,
             approval_responses,
             conn_count,
+            interrupts,
         }
     }
 }
@@ -627,4 +707,49 @@ async fn test_omo_backend_retries_once_after_connection_drop() {
     let chunks = dispatcher.stream_chunks();
     let last = chunks.last().map(|c| c.content.clone()).unwrap_or_default();
     assert_eq!(last, "Hello World!");
+}
+
+#[tokio::test]
+async fn test_omo_backend_deadline_interrupts_looping_turn() {
+    // Given: a daemon whose agent loops forever streaming deltas
+    let server = FakeAppServer::spawn_with_looping_deltas().await;
+    let url = format!("ws://127.0.0.1:{}", server.port);
+
+    let config = OmoBackendConfig::new(&url)
+        .with_default_model(Some("claude-3-5-sonnet"))
+        .with_total_timeout(std::time::Duration::from_millis(600));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+
+    let session_key = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "chan-1",
+        None::<String>,
+        "user-1",
+    );
+    let mut session = SessionContext::new(session_key.clone());
+
+    // When: the turn runs past the whole-turn deadline
+    let event = InboundEvent::message(session_key.clone(), "msg-1", "Loop forever");
+    let started = std::time::Instant::now();
+    let result = backend.run(&mut session, event).await;
+    let elapsed = started.elapsed();
+
+    // Then: the turn fails fast instead of hanging, and the daemon is
+    // asked to interrupt the turn (freeing the thread).
+    assert!(
+        result.is_err(),
+        "looping turn must hit the total deadline, got {:?}",
+        result.ok()
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "deadline must fire promptly, took {:?}",
+        elapsed
+    );
+    assert!(
+        !server.interrupts.lock().is_empty(),
+        "turn/interrupt must be sent to the daemon"
+    );
 }

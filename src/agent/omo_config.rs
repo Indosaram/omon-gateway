@@ -40,6 +40,7 @@ pub struct OmoBackendConfig {
     pub auth_token: Option<String>,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    pub total_timeout: Duration,
     pub default_model: Option<String>,
 }
 
@@ -50,6 +51,7 @@ impl Default for OmoBackendConfig {
             auth_token: None,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(600),
+            total_timeout: Duration::from_secs(900),
             default_model: None,
         }
     }
@@ -75,6 +77,11 @@ impl OmoBackendConfig {
 
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    pub fn with_total_timeout(mut self, timeout: Duration) -> Self {
+        self.total_timeout = timeout;
         self
     }
 
@@ -122,6 +129,20 @@ impl OmoBackendConfig {
             _ => Duration::from_secs(600),
         };
 
+        // Hard ceiling for a whole turn: a looping agent keeps emitting
+        // events, so the per-event gap timeout never fires. On deadline the
+        // backend sends turn/interrupt so the daemon thread is freed.
+        let total_timeout = match std::env::var("OMON_OMO_TURN_TOTAL_TIMEOUT_SECS") {
+            Ok(v) if !v.trim().is_empty() => Duration::from_secs(
+                v.trim().parse::<u64>().map_err(|_| {
+                    OmonError::Config(format!(
+                        "invalid OMON_OMO_TURN_TOTAL_TIMEOUT_SECS: '{v}', expected a positive integer"
+                    ))
+                })?,
+            ),
+            _ => Duration::from_secs(900),
+        };
+
         let auth_token = std::env::var("OMON_OMO_APPSERVER_AUTH_TOKEN")
             .or_else(|_| std::env::var("OMON_OMO_AUTH_TOKEN"))
             .ok()
@@ -139,6 +160,7 @@ impl OmoBackendConfig {
             auth_token,
             connect_timeout: Duration::from_secs(5),
             request_timeout,
+            total_timeout,
             default_model,
         })
     }
