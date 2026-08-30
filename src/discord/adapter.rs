@@ -1472,6 +1472,24 @@ pub struct DiscordEgress {
     allowed_users: Vec<u64>,
     approval_mentions: bool,
     dead_targets: Arc<DeadTargetRegistry>,
+    typing_refresh: Arc<Mutex<HashMap<u64, std::time::Instant>>>,
+}
+
+const TYPING_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn should_refresh_typing(
+    last: &mut HashMap<u64, std::time::Instant>,
+    channel_id: u64,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    match last.get(&channel_id) {
+        Some(at) if now.duration_since(*at) < interval => false,
+        _ => {
+            last.insert(channel_id, now);
+            true
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1594,6 +1612,7 @@ impl DiscordEgress {
             allowed_users: Vec::new(),
             approval_mentions: false,
             dead_targets: Arc::new(DeadTargetRegistry::new()),
+            typing_refresh: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1617,6 +1636,7 @@ impl DiscordEgress {
             allowed_users: Vec::new(),
             approval_mentions: false,
             dead_targets: Arc::new(DeadTargetRegistry::new()),
+            typing_refresh: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1693,7 +1713,39 @@ impl DiscordEgress {
         })
     }
 
+    async fn keep_typing(&self, session: &SessionKey) {
+        let Ok(channel) = Self::target(session) else {
+            return;
+        };
+        let channel_id = channel.get();
+        if self.dead_targets.is_dead(channel_id) {
+            return;
+        }
+        let should = {
+            let mut last = self.typing_refresh.lock().await;
+            should_refresh_typing(
+                &mut last,
+                channel_id,
+                std::time::Instant::now(),
+                TYPING_REFRESH_INTERVAL,
+            )
+        };
+        if !should {
+            return;
+        }
+        let Ok(http) = self.http_for(session) else {
+            return;
+        };
+        if let Err(error) = http.broadcast_typing(channel).await {
+            tracing::debug!(%error, channel_id, "Failed to refresh Discord typing indicator");
+        }
+    }
+
     async fn stream(&self, session: SessionKey, chunk: crate::StreamChunk) -> Result<()> {
+        let Some(content) = completed_stream_content(&chunk.content, chunk.is_final) else {
+            self.keep_typing(&session).await;
+            return Ok(());
+        };
         let identity = self.identity(&session).to_owned();
         let key = (identity, chunk.stream_id);
         let channel = Self::target(&session)?;
@@ -1721,10 +1773,7 @@ impl DiscordEgress {
         if last_sequence.is_some_and(|sequence| chunk.sequence <= sequence) {
             return Ok(());
         }
-        active
-            .throttler
-            .update(&chunk.content, chunk.is_final)
-            .await?;
+        active.throttler.update(content, true).await?;
         *last_sequence = Some(chunk.sequence);
         drop(last_sequence);
 
@@ -1736,9 +1785,15 @@ impl DiscordEgress {
             {
                 streams.remove(&key);
             }
+            drop(streams);
+            self.typing_refresh.lock().await.remove(&channel.get());
         }
         Ok(())
     }
+}
+
+fn completed_stream_content(content: &str, is_final: bool) -> Option<&str> {
+    is_final.then_some(content)
 }
 
 #[async_trait]
@@ -2427,6 +2482,34 @@ mod tests {
 
     fn test_session(name: &str) -> SessionKey {
         SessionKey::new("discord", Some("guild"), "channel", None::<String>, name)
+    }
+
+    #[test]
+    fn discord_stream_delivers_only_completed_content() {
+        assert_eq!(completed_stream_content("partial", false), None);
+        assert_eq!(completed_stream_content("complete", true), Some("complete"));
+    }
+
+    #[test]
+    fn typing_refresh_rate_limits_per_channel() {
+        let mut last = HashMap::new();
+        let interval = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+
+        assert!(should_refresh_typing(&mut last, 1, start, interval));
+        assert!(!should_refresh_typing(
+            &mut last,
+            1,
+            start + std::time::Duration::from_secs(2),
+            interval
+        ));
+        assert!(should_refresh_typing(
+            &mut last,
+            1,
+            start + interval,
+            interval
+        ));
+        assert!(should_refresh_typing(&mut last, 2, start, interval));
     }
 
     #[test]

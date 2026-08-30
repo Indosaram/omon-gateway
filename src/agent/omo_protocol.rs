@@ -38,6 +38,18 @@ pub fn thread_start_request(system_prompt: Option<&str>, model: Option<&str>) ->
     )
 }
 
+pub fn thread_resume_request(thread_id: &str) -> Message {
+    Message::text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "thread/resume",
+            "params": { "threadId": thread_id }
+        })
+        .to_string(),
+    )
+}
+
 pub fn turn_start_request(thread_id: &str, user_prompt: &str, model: Option<&str>) -> Message {
     let mut params = json!({
         "threadId": thread_id,

@@ -19,8 +19,8 @@ use super::omo_activity::{
 };
 use super::omo_config::OmoBackendConfig;
 use super::omo_protocol::{
-    approval_denial_response, initialize_request, is_approval_request, thread_start_request,
-    turn_start_request,
+    approval_denial_response, initialize_request, is_approval_request, thread_resume_request,
+    thread_start_request, turn_start_request,
 };
 use crate::models::{
     render_user_prompt, InboundEvent, OutboundAction, SessionContext, StreamChunk,
@@ -147,12 +147,50 @@ impl OmoBackend {
             .map(String::from)
             .or_else(|| self.thread_ids.lock().get(&storage_key).cloned())
         {
-            session
-                .state
-                .metadata
-                .insert("omo_thread_id".into(), json!(id));
-            self.thread_ids.lock().insert(storage_key, id.clone());
-            return Ok(id);
+            let mut start_replacement = false;
+            ws.send(thread_resume_request(&id)).await.map_err(|error| {
+                OmonError::Llm(format!("failed to send thread/resume: {error}"))
+            })?;
+            while let Some(message) = tokio::time::timeout(self.config.request_timeout, ws.next())
+                .await
+                .map_err(|_| OmonError::Llm("timeout waiting for thread/resume response".into()))?
+            {
+                let message = message.map_err(|error| {
+                    OmonError::Llm(format!("ws error in thread/resume: {error}"))
+                })?;
+                if let Message::Text(text) = message {
+                    let response: Value = serde_json::from_str(text.as_str())
+                        .map_err(|error| OmonError::Llm(format!("invalid json: {error}")))?;
+                    if response.get("id").and_then(Value::as_u64) == Some(2) {
+                        if let Some(error) = response.get("error") {
+                            let message = error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if message.contains("no rollout found")
+                                || message.contains("thread not found")
+                            {
+                                session.state.metadata.remove("omo_thread_id");
+                                self.thread_ids.lock().remove(&storage_key);
+                                start_replacement = true;
+                                break;
+                            }
+                            return Err(OmonError::Llm(format!("thread/resume error: {error}")));
+                        }
+                        session
+                            .state
+                            .metadata
+                            .insert("omo_thread_id".into(), json!(id));
+                        self.thread_ids.lock().insert(storage_key, id.clone());
+                        return Ok(id);
+                    }
+                }
+            }
+            if !start_replacement {
+                return Err(OmonError::Llm(
+                    "closed before thread/resume response".into(),
+                ));
+            }
         }
 
         let model = session
@@ -251,28 +289,40 @@ impl OmoBackend {
             .await
             .map_err(|_| OmonError::Llm("timeout during turn streaming".into()))?
         {
-            if started_at.elapsed() > self.config.total_timeout {
-                if let Some(turn_id) = &turn_id {
-                    let interrupt = json!({
-                        "jsonrpc": "2.0",
-                        "id": 9_001,
-                        "method": "turn/interrupt",
-                        "params": { "threadId": thread_id, "turnId": turn_id }
-                    });
-                    let _ = ws.send(Message::text(interrupt.to_string())).await;
-                    // Give the frame a moment to reach the daemon before the
-                    // connection drops.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                return Err(OmonError::Llm(format!(
-                    "turn exceeded total deadline of {:?}; turn/interrupt sent",
-                    self.config.total_timeout
-                )));
-            }
             let msg = msg.map_err(|e| OmonError::Llm(format!("ws streaming error: {e}")))?;
             if let Message::Text(text) = msg {
                 let val: Value = serde_json::from_str(text.as_str())
                     .map_err(|e| OmonError::Llm(format!("invalid json: {e}")))?;
+                let method = val.get("method").and_then(Value::as_str).unwrap_or("");
+
+                if method != "turn/completed" && started_at.elapsed() > self.config.total_timeout {
+                    if let Some(turn_id) = &turn_id {
+                        let interrupt = json!({
+                            "jsonrpc": "2.0",
+                            "id": 9_001,
+                            "method": "turn/interrupt",
+                            "params": { "threadId": thread_id, "turnId": turn_id }
+                        });
+                        let _ = ws.send(Message::text(interrupt.to_string())).await;
+                        // Give the frame a moment to reach the daemon before the
+                        // connection drops.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    return Err(OmonError::Llm(format!(
+                        "turn exceeded total deadline of {:?}; turn/interrupt sent",
+                        self.config.total_timeout
+                    )));
+                }
+
+                if val.get("id").and_then(Value::as_u64) == Some(3) {
+                    if let Some(error) = val.get("error") {
+                        return Err(OmonError::Llm(format!("turn/start error: {error}")));
+                    }
+                    if let Some(id) = val.pointer("/result/turn/id").and_then(Value::as_str) {
+                        turn_id = Some(id.to_string());
+                    }
+                    continue;
+                }
 
                 if let (Some(req_id), Some(method)) =
                     (val.get("id"), val.get("method").and_then(Value::as_str))
@@ -283,7 +333,7 @@ impl OmoBackend {
                     }
                 }
 
-                match val.get("method").and_then(Value::as_str).unwrap_or("") {
+                match method {
                     "turn/started" => {
                         if let Some(tid) = val.pointer("/params/turnId").and_then(Value::as_str) {
                             turn_id = Some(tid.to_string());
@@ -318,6 +368,12 @@ impl OmoBackend {
 
                         if !is_started {
                             match item.get("type").and_then(Value::as_str) {
+                                Some("agentMessage") => {
+                                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                        full_content.clear();
+                                        full_content.push_str(text);
+                                    }
+                                }
                                 Some("reasoning") => {
                                     if let Some(text) = item.get("text").and_then(Value::as_str) {
                                         if item_id.is_empty()
@@ -372,7 +428,14 @@ impl OmoBackend {
                             }
                         }
                     }
-                    "turn/completed" => {
+                    "turn/completed" | "thread/status/changed"
+                        if method == "turn/completed"
+                            || (val.pointer("/params/threadId").and_then(Value::as_str)
+                                == Some(thread_id.as_str())
+                                && val.pointer("/params/status/type").and_then(Value::as_str)
+                                    == Some("idle")
+                                && !full_content.is_empty()) =>
+                    {
                         let rendered = if activity_lines.is_empty() {
                             full_content.clone()
                         } else {

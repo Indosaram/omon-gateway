@@ -46,6 +46,7 @@ impl OutboundDispatcher for CapturingDispatcher {
 struct FakeAppServer {
     pub port: u16,
     pub thread_start_count: Arc<AtomicUsize>,
+    pub thread_resume_count: Arc<AtomicUsize>,
     pub received_developer_instructions: Arc<ParkingMutex<Option<String>>>,
     pub received_model: Arc<ParkingMutex<Option<String>>>,
     pub turn_threads: Arc<ParkingMutex<Vec<String>>>,
@@ -56,29 +57,39 @@ struct FakeAppServer {
 
 impl FakeAppServer {
     async fn spawn() -> Self {
-        Self::spawn_inner(false, false, false).await
+        Self::spawn_inner(false, false, false, false, 0).await
     }
 
     async fn spawn_with_activity() -> Self {
-        Self::spawn_inner(true, false, false).await
+        Self::spawn_inner(true, false, false, false, 0).await
+    }
+
+    async fn spawn_without_turn_completed() -> Self {
+        Self::spawn_inner(false, false, false, true, 0).await
+    }
+
+    async fn spawn_with_delayed_turn_completed(delay_ms: u64) -> Self {
+        Self::spawn_inner(false, false, false, false, delay_ms).await
     }
 
     /// Drop the client's first connection abruptly: exercises the
     /// one-shot transport retry.
     async fn spawn_with_first_connection_drop() -> Self {
-        Self::spawn_inner(false, true, false).await
+        Self::spawn_inner(false, true, false, false, 0).await
     }
 
     /// Stream deltas forever (well, 5s) without turn/completed: exercises
     /// the whole-turn deadline + turn/interrupt.
     async fn spawn_with_looping_deltas() -> Self {
-        Self::spawn_inner(false, false, true).await
+        Self::spawn_inner(false, false, true, false, 0).await
     }
 
     async fn spawn_inner(
         emit_activity: bool,
         drop_first_connection: bool,
         loop_deltas: bool,
+        omit_turn_completed: bool,
+        turn_completed_delay_ms: u64,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -86,6 +97,7 @@ impl FakeAppServer {
         let port = listener.local_addr().expect("local addr").port();
 
         let thread_start_count = Arc::new(AtomicUsize::new(0));
+        let thread_resume_count = Arc::new(AtomicUsize::new(0));
         let received_developer_instructions = Arc::new(ParkingMutex::new(None));
         let received_model = Arc::new(ParkingMutex::new(None));
         let turn_threads = Arc::new(ParkingMutex::new(Vec::new()));
@@ -96,6 +108,7 @@ impl FakeAppServer {
         let interrupts = Arc::new(ParkingMutex::new(Vec::new()));
 
         let tsc = thread_start_count.clone();
+        let trc = thread_resume_count.clone();
         let rdi = received_developer_instructions.clone();
         let rm = received_model.clone();
         let tt = turn_threads.clone();
@@ -105,6 +118,8 @@ impl FakeAppServer {
         let drop_first = drop_flag;
         let it = interrupts.clone();
         let looping = loop_deltas;
+        let omit_terminal = omit_turn_completed;
+        let terminal_delay_ms = turn_completed_delay_ms;
 
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -116,6 +131,7 @@ impl FakeAppServer {
                     continue;
                 }
                 let tsc = tsc.clone();
+                let trc = trc.clone();
                 let rdi = rdi.clone();
                 let rm = rm.clone();
                 let tt = tt.clone();
@@ -193,6 +209,38 @@ impl FakeAppServer {
                                                 "sessionId": "fake-session-001"
                                             },
                                             "model": "claude-3-5-sonnet"
+                                        }
+                                    });
+                                    let _ = outgoing_tx.send(Message::text(resp.to_string())).await;
+                                }
+                                "thread/resume" => {
+                                    trc.fetch_add(1, Ordering::SeqCst);
+                                    let thread_id = parsed
+                                        .pointer("/params/threadId")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default();
+                                    if thread_id == "stale-thread" {
+                                        let response = json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "error": {
+                                                "code": -32603,
+                                                "message": "no rollout found for thread id stale-thread"
+                                            }
+                                        });
+                                        let _ = outgoing_tx
+                                            .send(Message::text(response.to_string()))
+                                            .await;
+                                        continue;
+                                    }
+                                    let resp = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": {
+                                            "thread": {
+                                                "id": "server-assigned-thread-uuid-1234",
+                                                "sessionId": "fake-session-001"
+                                            }
                                         }
                                     });
                                     let _ = outgoing_tx.send(Message::text(resp.to_string())).await;
@@ -423,9 +471,31 @@ impl FakeAppServer {
                                                 }
                                             }
                                         });
-                                        let _ = outgoing_tx
-                                            .send(Message::text(turn_completed.to_string()))
-                                            .await;
+                                        if !omit_terminal {
+                                            if terminal_delay_ms > 0 {
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(
+                                                        terminal_delay_ms,
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                            let _ = outgoing_tx
+                                                .send(Message::text(turn_completed.to_string()))
+                                                .await;
+                                        } else {
+                                            let idle = json!({
+                                                "jsonrpc": "2.0",
+                                                "method": "thread/status/changed",
+                                                "params": {
+                                                    "threadId": thread_id,
+                                                    "status": {"type": "idle"}
+                                                }
+                                            });
+                                            let _ = outgoing_tx
+                                                .send(Message::text(idle.to_string()))
+                                                .await;
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -439,6 +509,7 @@ impl FakeAppServer {
         Self {
             port,
             thread_start_count,
+            thread_resume_count,
             received_developer_instructions,
             received_model,
             turn_threads,
@@ -447,6 +518,227 @@ impl FakeAppServer {
             interrupts,
         }
     }
+}
+
+async fn spawn_turn_start_error_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind free port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let Ok(request) = serde_json::from_str::<Value>(text.as_str()) else {
+                continue;
+            };
+            let id = request
+                .get("id")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let response = match request.get("method").and_then(Value::as_str) {
+                Some("initialize") => json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                Some("thread/start") => json!({
+                    "jsonrpc":"2.0","id":id,
+                    "result":{"thread":{"id":"thread-1"}}
+                }),
+                Some("turn/start") => json!({
+                    "jsonrpc":"2.0","id":id,
+                    "error":{"code":-32603,"message":"turn rejected"}
+                }),
+                _ => continue,
+            };
+            let _ = ws.send(Message::text(response.to_string())).await;
+        }
+    });
+    port
+}
+
+async fn spawn_tool_after_agent_message_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind free port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let Ok(request) = serde_json::from_str::<Value>(text.as_str()) else {
+                continue;
+            };
+            let id = request
+                .get("id")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            match request.get("method").and_then(Value::as_str) {
+                Some("initialize") => {
+                    let response = json!({"jsonrpc":"2.0","id":id,"result":{}});
+                    let _ = ws.send(Message::text(response.to_string())).await;
+                }
+                Some("thread/start") => {
+                    let response = json!({
+                        "jsonrpc":"2.0","id":id,
+                        "result":{"thread":{"id":"thread-tool-sequence"}}
+                    });
+                    let _ = ws.send(Message::text(response.to_string())).await;
+                }
+                Some("turn/start") => {
+                    let response = json!({
+                        "jsonrpc":"2.0","id":id,
+                        "result":{"turn":{"id":"turn-tool-sequence","status":"inProgress"}}
+                    });
+                    let _ = ws.send(Message::text(response.to_string())).await;
+                    let intent = json!({
+                        "jsonrpc":"2.0","method":"item/completed",
+                        "params":{"item":{"type":"agentMessage","id":"intent","text":"I read this as the digest task."}}
+                    });
+                    let _ = ws.send(Message::text(intent.to_string())).await;
+                    let tool_started = json!({
+                        "jsonrpc":"2.0","method":"item/started",
+                        "params":{"item":{"type":"commandExecution","id":"tool-1","command":"write digest","status":"inProgress"}}
+                    });
+                    let _ = ws.send(Message::text(tool_started.to_string())).await;
+
+                    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+                    let tool_completed = json!({
+                        "jsonrpc":"2.0","method":"item/completed",
+                        "params":{"item":{"type":"commandExecution","id":"tool-1","command":"write digest","status":"completed"}}
+                    });
+                    let _ = ws.send(Message::text(tool_completed.to_string())).await;
+                    let digest = json!({
+                        "jsonrpc":"2.0","method":"item/completed",
+                        "params":{"item":{"type":"agentMessage","id":"digest","text":"## Actual digest body"}}
+                    });
+                    let _ = ws.send(Message::text(digest.to_string())).await;
+                    let idle = json!({
+                        "jsonrpc":"2.0","method":"thread/status/changed",
+                        "params":{"threadId":"thread-tool-sequence","status":{"type":"idle"}}
+                    });
+                    let _ = ws.send(Message::text(idle.to_string())).await;
+                }
+                _ => {}
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn test_omo_backend_surfaces_turn_start_rpc_error_immediately() {
+    // Given: app-server rejects turn/start before any turn notifications.
+    let port = spawn_turn_start_error_server().await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
+        .with_total_timeout(std::time::Duration::from_secs(5));
+    let backend = OmoBackend::new(config, Arc::new(CapturingDispatcher::new()));
+    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "user");
+    let mut session = SessionContext::new(session_key.clone());
+
+    // When: a turn is rejected at the RPC boundary.
+    let started = std::time::Instant::now();
+    let error = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg", "hello"),
+        )
+        .await
+        .expect_err("turn/start RPC error must fail the run");
+
+    // Then: the concrete server error is surfaced without waiting for the deadline.
+    assert!(error.to_string().contains("turn rejected"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn test_omo_backend_completes_from_final_agent_message_when_turn_terminal_is_missing() {
+    let server = FakeAppServer::spawn_without_turn_completed().await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{}", server.port))
+        .with_request_timeout(std::time::Duration::from_millis(800));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "cron");
+    let mut session = SessionContext::new(session_key.clone());
+
+    let result = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg", "digest"),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "missing terminal fallback failed: {result:?}"
+    );
+    let chunks = dispatcher.stream_chunks();
+    let final_chunk = chunks.last().expect("final fallback chunk");
+    assert!(final_chunk.is_final);
+    assert_eq!(final_chunk.content, "Hello World!");
+}
+
+#[tokio::test]
+async fn test_omo_backend_waits_for_final_message_after_tool_activity() {
+    let port = spawn_tool_after_agent_message_server().await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
+        .with_request_timeout(std::time::Duration::from_secs(3));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "cron");
+    let mut session = SessionContext::new(session_key.clone());
+
+    let result = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg", "digest"),
+        )
+        .await;
+
+    assert!(result.is_ok(), "tool sequence failed: {result:?}");
+    let final_chunk = dispatcher
+        .stream_chunks()
+        .into_iter()
+        .find(|chunk| chunk.is_final)
+        .expect("final digest chunk");
+    assert!(final_chunk.content.contains("## Actual digest body"));
+    assert!(!final_chunk
+        .content
+        .contains("I read this as the digest task"));
+}
+
+#[tokio::test]
+async fn test_omo_backend_accepts_received_completion_at_deadline_edge() {
+    let server = FakeAppServer::spawn_with_delayed_turn_completed(80).await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{}", server.port))
+        .with_request_timeout(std::time::Duration::from_secs(2))
+        .with_total_timeout(std::time::Duration::from_millis(50));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "cron");
+    let mut session = SessionContext::new(session_key.clone());
+
+    let result = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg", "digest"),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "deadline-edge completion failed: {result:?}"
+    );
+    assert!(dispatcher
+        .stream_chunks()
+        .last()
+        .is_some_and(|chunk| chunk.is_final));
 }
 
 #[tokio::test]
@@ -525,17 +817,65 @@ async fn test_omo_backend_e2e_thread_lifecycle_and_streaming() {
     let event2 = InboundEvent::message(session_key.clone(), "msg-2", "Say hello again");
     let result2 = backend.run(&mut session, event2).await;
 
-    // Then: Second turn succeeds and REUSES the threadId without starting a new thread
+    // Then: Second turn resumes the existing thread on its new WebSocket and
+    // reuses the threadId without starting another thread.
     assert!(result2.is_ok(), "Second turn failed: {:?}", result2.err());
     assert_eq!(
         server.thread_start_count.load(Ordering::SeqCst),
         1,
         "thread/start must NOT be called again on second turn with same session"
     );
+    assert_eq!(
+        server.thread_resume_count.load(Ordering::SeqCst),
+        1,
+        "thread/resume must subscribe the new WebSocket before the second turn"
+    );
     let turn_threads = server.turn_threads.lock().clone();
     assert_eq!(turn_threads.len(), 2);
     assert_eq!(turn_threads[0], "server-assigned-thread-uuid-1234");
     assert_eq!(turn_threads[1], "server-assigned-thread-uuid-1234");
+}
+
+#[tokio::test]
+async fn test_omo_backend_replaces_stale_cached_thread() {
+    // Given: a session carrying a thread ID that the app-server has unloaded.
+    let server = FakeAppServer::spawn().await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{}", server.port));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher);
+    let session_key = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "chan-1",
+        None::<String>,
+        "cron:stale-test",
+    );
+    let mut session = SessionContext::new(session_key.clone());
+    session
+        .state
+        .metadata
+        .insert("omo_thread_id".into(), json!("stale-thread"));
+
+    // When: a turn starts after the remote thread has been unloaded.
+    let result = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg-1", "Hello"),
+        )
+        .await;
+
+    // Then: the stale ID is evicted and a new thread starts transparently.
+    assert!(result.is_ok(), "stale thread recovery failed: {result:?}");
+    assert_eq!(server.thread_resume_count.load(Ordering::SeqCst), 1);
+    assert_eq!(server.thread_start_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        session
+            .state
+            .metadata
+            .get("omo_thread_id")
+            .and_then(Value::as_str),
+        Some("server-assigned-thread-uuid-1234")
+    );
 }
 
 #[tokio::test]
