@@ -929,6 +929,28 @@ fn channel_allow_and_ignore_lists() {
 }
 
 #[test]
+fn test_dm_accepted_when_channel_type_private_regardless_of_guild_id_or_secondary_bot() {
+    // Given: A message with guild_id set but channel_type is Private (e.g. from context or edge payload)
+    // and secondary bot id where allowed_channels whitelist is active
+    let bot_id = UserId::new(42);
+    let msg = message_fixture(Some(12345), "hello direct message", Vec::new());
+    let config = InboundFilterConfig {
+        allowed_channels: &[9999],
+        primary_bot_id: Some(999), // different from bot_id (42)
+        ..Default::default()
+    };
+
+    // When: filtering inbound message with channel_type = Private
+    let event = message_to_inbound_with_config(&msg, bot_id, Some(ChannelType::Private), &config);
+
+    // Then: DM is recognized, bypassing channel whitelist and primary bot requirement,
+    // and session.guild_id is None
+    let event = event.expect("DM should be accepted when channel_type is Private");
+    assert_eq!(event.session.guild_id, None);
+    assert_eq!(event.content, "hello direct message");
+}
+
+#[test]
 fn user_authorization_allow_all_and_roles() {
     // 1. Default open when both allowed_users and allowed_roles are empty
     assert!(is_user_authorized(10, &[], &[], &[], false));
