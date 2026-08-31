@@ -10,7 +10,7 @@ use omon_gateway::{
     DiscordApprovalRequester, FileTool, McpTool, MessageContextPolicyMatrix,
     MessengerPolicyStore, MultiplexerConfig, OmoBackend, OmoBackendConfig, OmoDaemonSupervisor,
     OutboundDispatcher, Result, ScaleToZero, SessionMultiplexer, SmartApprovalGuard, TerminalTool,
-    ToolRegistry, validate_agent_backend_env,
+    ToolRegistry, validate_agent_backend_env, wipe_omo_thread_bindings,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -113,7 +113,17 @@ pub async fn run_standalone(
     tools.register(omon_gateway::SkillsTool::new(skill_roots.clone()).with_pool(pool.clone()));
 
     validate_agent_backend_env()?;
-    let omo_config = OmoBackendConfig::from_env()?;
+    let omo_config = OmoBackendConfig::from_env()?.with_workspace_root(workspace_root.clone());
+    if omo_config.per_agent_workspace {
+        match wipe_omo_thread_bindings(&pool).await {
+            Ok(wiped) => {
+                tracing::info!(wiped, "cleared omo thread bindings for per-agent workspace rebind");
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to clear omo thread bindings on boot");
+            }
+        }
+    }
     // Zero-config daemon lifecycle: spawn/keep-alive/kill the local
     // `omo app-server` unless an external one is already serving.
     let _daemon_supervisor = OmoDaemonSupervisor::ensure(&omo_config).await?;
@@ -136,7 +146,8 @@ pub async fn run_standalone(
 
     // Cron gets its own app-server instance so a long cron turn cannot
     // occupy the interactive daemon (one turn per agent thread).
-    let cron_omo_config = OmoBackendConfig::cron_from_env()?;
+    let cron_omo_config =
+        OmoBackendConfig::cron_from_env()?.with_workspace_root(workspace_root.clone());
     let _cron_daemon_supervisor = OmoDaemonSupervisor::ensure(&cron_omo_config).await?;
     tracing::info!(
         appserver_url = %cron_omo_config.appserver_url,

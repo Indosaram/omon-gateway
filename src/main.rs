@@ -20,12 +20,12 @@ use omon_gateway::{
     OutboundDispatcher, PoiseData, ProfileRoute, ProfileRouter, RestartLoopGuard, Result,
     ScaleToZero, SessionContext,
     SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
-    MAX_CONTEXT_CHARS,
+    wipe_omo_thread_bindings, MAX_CONTEXT_CHARS,
 };
 use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -1215,7 +1215,18 @@ async fn run_gateway() -> Result<()> {
     let tool_names = tools.names();
 
     validate_agent_backend_env()?;
-    let omo_config = OmoBackendConfig::from_env()?;
+    let omo_config =
+        OmoBackendConfig::from_env()?.with_workspace_root(config.workspace_root.clone());
+    if omo_config.per_agent_workspace {
+        match wipe_omo_thread_bindings(&pool).await {
+            Ok(wiped) => {
+                info!(wiped, "cleared omo thread bindings for per-agent workspace rebind");
+            }
+            Err(error) => {
+                error!(%error, "failed to clear omo thread bindings on boot");
+            }
+        }
+    }
     // Zero-config daemon lifecycle: spawn/keep-alive/kill the local
     // `omo app-server` unless an external one is already serving.
     let _daemon_supervisor = OmoDaemonSupervisor::ensure(&omo_config).await?;
@@ -1303,7 +1314,8 @@ async fn run_gateway() -> Result<()> {
     // Cron runs on its own app-server instance: an agent thread executes one
     // turn at a time, so a long digest turn on the interactive daemon would
     // stall every Discord message behind it.
-    let cron_omo_config = OmoBackendConfig::cron_from_env()?;
+    let cron_omo_config =
+        OmoBackendConfig::cron_from_env()?.with_workspace_root(config.workspace_root.clone());
     let _cron_daemon_supervisor = OmoDaemonSupervisor::ensure(&cron_omo_config).await?;
     info!(
         appserver_url = %cron_omo_config.appserver_url,

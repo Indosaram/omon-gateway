@@ -48,6 +48,7 @@ songbird = { version = "0.5", default-features = false, features = ["driver", "g
 cron = "0.15"
 urlencoding = "2.1"
 base64 = "0.22"
+sha2 = "0.10"
 regex = "1.11"
 tokio-tungstenite = "0.26"
 

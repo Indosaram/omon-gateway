@@ -956,7 +956,13 @@ async fn handle_event(
                         let _ = new_message.channel_id.say(&ctx.http, prompt).await;
                     }
                 }
-                tracing::info!("Message ignored by filter (not DM, not thread, not mentioned, not in free channels)");
+                tracing::debug!(
+                    channel = %new_message.channel_id,
+                    author = %new_message.author.name,
+                    guild = ?new_message.guild_id,
+                    is_dm,
+                    "Message ignored by filter"
+                );
             }
         }
         FullEvent::InteractionCreate {
@@ -1147,7 +1153,7 @@ pub fn message_to_inbound_with_config(
         return None;
     }
 
-    let is_dm = message.guild_id.is_none();
+    let is_dm = message.guild_id.is_none() || channel_type == Some(ChannelType::Private);
     let channel_id_u64 = message.channel_id.get();
 
     // Channel blacklist: if ignored_channels contains the channel id -> return None
@@ -1280,7 +1286,11 @@ pub fn message_to_inbound_with_config(
     let channel_id = message.channel_id.to_string();
     let session = SessionKey::new(
         "discord",
-        message.guild_id.map(|id| id.to_string()),
+        if is_dm {
+            None
+        } else {
+            message.guild_id.map(|id| id.to_string())
+        },
         channel_id.clone(),
         is_thread.then_some(channel_id),
         user_id,

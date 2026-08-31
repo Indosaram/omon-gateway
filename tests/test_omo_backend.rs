@@ -49,6 +49,8 @@ struct FakeAppServer {
     pub thread_resume_count: Arc<AtomicUsize>,
     pub received_developer_instructions: Arc<ParkingMutex<Option<String>>>,
     pub received_model: Arc<ParkingMutex<Option<String>>>,
+    pub received_cwd: Arc<ParkingMutex<Option<String>>>,
+    pub received_roots: Arc<ParkingMutex<Vec<String>>>,
     pub turn_threads: Arc<ParkingMutex<Vec<String>>>,
     pub approval_responses: Arc<ParkingMutex<Vec<Value>>>,
     pub conn_count: Arc<AtomicUsize>,
@@ -100,6 +102,8 @@ impl FakeAppServer {
         let thread_resume_count = Arc::new(AtomicUsize::new(0));
         let received_developer_instructions = Arc::new(ParkingMutex::new(None));
         let received_model = Arc::new(ParkingMutex::new(None));
+        let received_cwd = Arc::new(ParkingMutex::new(None));
+        let received_roots = Arc::new(ParkingMutex::new(Vec::new()));
         let turn_threads = Arc::new(ParkingMutex::new(Vec::new()));
         let approval_responses = Arc::new(ParkingMutex::new(Vec::new()));
         let emit_activity_flag = Arc::new(AtomicBool::new(emit_activity));
@@ -111,6 +115,8 @@ impl FakeAppServer {
         let trc = thread_resume_count.clone();
         let rdi = received_developer_instructions.clone();
         let rm = received_model.clone();
+        let rcwd = received_cwd.clone();
+        let rroots = received_roots.clone();
         let tt = turn_threads.clone();
         let ar = approval_responses.clone();
         let ea = emit_activity_flag.clone();
@@ -134,6 +140,8 @@ impl FakeAppServer {
                 let trc = trc.clone();
                 let rdi = rdi.clone();
                 let rm = rm.clone();
+                let rcwd = rcwd.clone();
+                let rroots = rroots.clone();
                 let tt = tt.clone();
                 let ar = ar.clone();
                 let ea = ea.clone();
@@ -198,6 +206,19 @@ impl FakeAppServer {
                                     }
                                     if let Some(m) = params.get("model").and_then(Value::as_str) {
                                         *rm.lock() = Some(m.to_string());
+                                    }
+                                    if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
+                                        *rcwd.lock() = Some(cwd.to_string());
+                                    }
+                                    if let Some(roots) = params
+                                        .get("runtimeWorkspaceRoots")
+                                        .and_then(Value::as_array)
+                                    {
+                                        *rroots.lock() = roots
+                                            .iter()
+                                            .filter_map(Value::as_str)
+                                            .map(String::from)
+                                            .collect();
                                     }
 
                                     let resp = json!({
@@ -512,6 +533,8 @@ impl FakeAppServer {
             thread_resume_count,
             received_developer_instructions,
             received_model,
+            received_cwd,
+            received_roots,
             turn_threads,
             approval_responses,
             conn_count,
@@ -953,6 +976,66 @@ async fn test_omo_backend_emits_hermes_activity_lines() {
 }
 
 #[tokio::test]
+async fn test_omo_backend_cron_session_suppresses_activity_lines_and_delivers_only_final_result() {
+    // Given: fake server emitting reasoning + commandExecution activity items followed by result
+    let server = FakeAppServer::spawn_with_activity().await;
+    let url = format!("ws://127.0.0.1:{}", server.port);
+
+    let config = OmoBackendConfig::new(&url).with_default_model(Some("claude-3-5-sonnet"));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+
+    let session_key = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "chan-1",
+        None::<String>,
+        "cron:omon-katok-3h-group-digest-v3",
+    );
+    let mut session = SessionContext::new(session_key.clone());
+    session.state.metadata.insert(
+        "cron_scheduler_delivery".to_string(),
+        serde_json::json!(true),
+    );
+
+    // When: a cron turn runs through tool + reasoning activity
+    let event = InboundEvent::message(
+        session_key.clone(),
+        "cron:omon-katok-3h-group-digest-v3",
+        "Run the probe command",
+    );
+    let result = backend.run(&mut session, event).await;
+    assert!(result.is_ok(), "turn failed: {:?}", result.err());
+
+    // Then: final chunk delivered must NOT contain activity lines (no ⚙️ Running, no > 💭, no ⤷)
+    let chunks = dispatcher.stream_chunks();
+    assert!(!chunks.is_empty(), "no chunks emitted");
+
+    let final_chunk = chunks
+        .iter()
+        .find(|c| c.is_final)
+        .map(|c| c.content.as_str())
+        .expect("final chunk must be emitted");
+
+    assert!(
+        !final_chunk.contains("⚙️ Running"),
+        "cron final chunk must not contain tool activity lines: {final_chunk}"
+    );
+    assert!(
+        !final_chunk.contains("> 💭"),
+        "cron final chunk must not contain reasoning blocks: {final_chunk}"
+    );
+    assert!(
+        !final_chunk.contains("⤷"),
+        "cron final chunk must not contain output excerpts: {final_chunk}"
+    );
+    assert_eq!(
+        final_chunk, "OMOACT-OK",
+        "cron final chunk should contain ONLY the pure final result"
+    );
+}
+
+#[tokio::test]
 async fn test_omo_backend_persists_without_preexisting_session_row() {
     // Regression: cron sessions are created implicitly by backend.run —
     // persisting the assistant message must not violate the messages->
@@ -1091,5 +1174,124 @@ async fn test_omo_backend_deadline_interrupts_looping_turn() {
     assert!(
         !server.interrupts.lock().is_empty(),
         "turn/interrupt must be sent to the daemon"
+    );
+}
+
+#[tokio::test]
+async fn test_omo_backend_provisions_agent_workspace_and_passes_to_thread_start() {
+    // Given: a running FakeAppServer and an OmoBackend configured with a workspace root
+    let server = FakeAppServer::spawn().await;
+    let url = format!("ws://127.0.0.1:{}", server.port);
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let workspace_root = temp_dir.path().to_path_buf();
+
+    let config = OmoBackendConfig::new(&url).with_workspace_root(workspace_root.clone());
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+
+    let session_key = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "chan-1",
+        None::<String>,
+        "user-1",
+    )
+    .with_bot_id("1465631383862120451");
+    let mut session = SessionContext::new(session_key.clone());
+
+    // When: running one backend turn
+    let event = InboundEvent::message(session_key.clone(), "msg-1", "Hello from bot");
+    let result = backend.run(&mut session, event).await;
+    assert!(
+        result.is_ok(),
+        "backend.run must succeed: {:?}",
+        result.err()
+    );
+
+    // Then: thread/start received cwd and roots, agent and shared dirs exist, and .omo/omo.json exists
+    let expected_agent_dir = workspace_root
+        .join("agents")
+        .join("bot-1465631383862120451");
+    let expected_shared_dir = workspace_root.join("shared");
+    let expected_cwd_str = expected_agent_dir.to_str().unwrap().to_string();
+    let expected_shared_str = expected_shared_dir.to_str().unwrap().to_string();
+
+    assert_eq!(
+        *server.received_cwd.lock(),
+        Some(expected_cwd_str.clone()),
+        "FakeAppServer must receive provisioned cwd"
+    );
+    assert_eq!(
+        *server.received_roots.lock(),
+        vec![expected_cwd_str, expected_shared_str],
+        "FakeAppServer must receive runtimeWorkspaceRoots"
+    );
+    assert!(
+        expected_agent_dir.exists(),
+        "agent workspace directory must exist"
+    );
+    assert!(
+        expected_shared_dir.exists(),
+        "shared workspace directory must exist"
+    );
+
+    let omo_json_path = expected_agent_dir.join(".omo").join("omo.json");
+    assert!(omo_json_path.exists(), ".omo/omo.json must exist");
+    let omo_json_str = std::fs::read_to_string(&omo_json_path).expect("read omo.json");
+    let omo_json_val: Value = serde_json::from_str(&omo_json_str).expect("valid json in omo.json");
+    assert_eq!(
+        omo_json_val,
+        json!({
+            "memory": {
+                "agent": "bot-1465631383862120451"
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn test_omo_backend_omits_workspace_when_per_agent_disabled() {
+    // Given: FakeAppServer and OmoBackend configured with workspace root but per_agent_workspace disabled
+    let server = FakeAppServer::spawn().await;
+    let url = format!("ws://127.0.0.1:{}", server.port);
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let workspace_root = temp_dir.path().to_path_buf();
+
+    let config = OmoBackendConfig::new(&url)
+        .with_workspace_root(workspace_root)
+        .with_per_agent_workspace(false);
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+
+    let session_key = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "chan-1",
+        None::<String>,
+        "user-1",
+    )
+    .with_bot_id("1465631383862120451");
+    let mut session = SessionContext::new(session_key.clone());
+
+    // When: running one backend turn
+    let event = InboundEvent::message(session_key.clone(), "msg-1", "Hello");
+    let result = backend.run(&mut session, event).await;
+    assert!(
+        result.is_ok(),
+        "backend.run must succeed: {:?}",
+        result.err()
+    );
+
+    // Then: thread/start received no cwd or runtimeWorkspaceRoots
+    assert_eq!(
+        *server.received_cwd.lock(),
+        None,
+        "FakeAppServer must not receive cwd when kill-switch is disabled"
+    );
+    assert!(
+        server.received_roots.lock().is_empty(),
+        "FakeAppServer must not receive runtimeWorkspaceRoots when kill-switch is disabled"
     );
 }

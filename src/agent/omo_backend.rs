@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
+use super::agent_workspace::{agent_workspace_slug, resolve_workspace};
 use super::backend::AgentBackend;
 use super::omo_activity::{
     command_output_excerpt, format_activity_line, reasoning_blockquote, OUTPUT_CAP, REASONING_CAP,
@@ -198,9 +199,71 @@ impl OmoBackend {
             .active_model
             .as_deref()
             .or(self.config.default_model.as_deref());
+
+        let workspace = if self.config.per_agent_workspace {
+            if let Some(root) = &self.config.workspace_root {
+                let slug = agent_workspace_slug(
+                    &session.key.platform,
+                    &session.key.user_id,
+                    session.key.bot_id.as_deref(),
+                );
+                let ws = resolve_workspace(root, &slug);
+                tokio::fs::create_dir_all(&ws.cwd).await.map_err(|err| {
+                    OmonError::Config(format!(
+                        "failed to provision agent workspace at {}: {err}",
+                        ws.cwd.display()
+                    ))
+                })?;
+                let shared_dir = root.join("shared");
+                tokio::fs::create_dir_all(&shared_dir)
+                    .await
+                    .map_err(|err| {
+                        OmonError::Config(format!(
+                            "failed to provision agent workspace at {}: {err}",
+                            shared_dir.display()
+                        ))
+                    })?;
+                let omo_dir = ws.cwd.join(".omo");
+                tokio::fs::create_dir_all(&omo_dir).await.map_err(|err| {
+                    OmonError::Config(format!(
+                        "failed to provision agent workspace at {}: {err}",
+                        omo_dir.display()
+                    ))
+                })?;
+                let omo_json_path = omo_dir.join("omo.json");
+                if !tokio::fs::try_exists(&omo_json_path).await.unwrap_or(false) {
+                    let content = serde_json::to_string_pretty(&json!({
+                        "memory": {
+                            "agent": slug
+                        }
+                    }))
+                    .map_err(|err| {
+                        OmonError::Config(format!(
+                            "failed to provision agent workspace at {}: {err}",
+                            omo_json_path.display()
+                        ))
+                    })?;
+                    tokio::fs::write(&omo_json_path, content.as_bytes())
+                        .await
+                        .map_err(|err| {
+                            OmonError::Config(format!(
+                                "failed to provision agent workspace at {}: {err}",
+                                omo_json_path.display()
+                            ))
+                        })?;
+                }
+                Some(ws)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         ws.send(thread_start_request(
             session.state.system_prompt.as_deref(),
             model,
+            workspace.as_ref(),
         ))
         .await
         .map_err(|e| OmonError::Llm(format!("failed to send thread/start: {e}")))?;
@@ -273,6 +336,14 @@ impl OmoBackend {
         ws.send(turn_start_request(&thread_id, &user_prompt, model))
             .await
             .map_err(|e| OmonError::Llm(format!("failed to send turn/start: {e}")))?;
+
+        let is_cron_session = session.key.user_id.starts_with("cron:")
+            || session
+                .state
+                .metadata
+                .get("cron_scheduler_delivery")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
 
         let stream_id = Uuid::new_v4();
         let mut sequence: u64 = 0;
@@ -403,7 +474,7 @@ impl OmoBackend {
                             }
                         }
 
-                        let rendered = if activity_lines.is_empty() {
+                        let rendered = if is_cron_session || activity_lines.is_empty() {
                             full_content.clone()
                         } else {
                             format!("{}\n\n{}", activity_lines.join("\n"), full_content)
@@ -436,7 +507,7 @@ impl OmoBackend {
                                     == Some("idle")
                                 && !full_content.is_empty()) =>
                     {
-                        let rendered = if activity_lines.is_empty() {
+                        let rendered = if is_cron_session || activity_lines.is_empty() {
                             full_content.clone()
                         } else {
                             format!("{}\n\n{}", activity_lines.join("\n"), full_content)
@@ -480,6 +551,7 @@ impl AgentBackend for OmoBackend {
                     || msg.contains("os error 54")
                     || msg.contains("Broken pipe")
                     || msg.contains("connection closed")
+                    || msg.contains("Handshake not finished")
         );
         if retryable {
             tracing::warn!("omo daemon connection reset mid-turn; retrying once");

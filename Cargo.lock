@@ -1816,6 +1816,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serenity",
+ "sha2",
  "songbird",
  "sqlx",
  "tempfile",

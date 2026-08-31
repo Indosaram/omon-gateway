@@ -1,5 +1,6 @@
 use crate::{OmonError, Result};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub fn validate_agent_backend_value(value: Option<&str>) -> Result<()> {
@@ -42,6 +43,8 @@ pub struct OmoBackendConfig {
     pub request_timeout: Duration,
     pub total_timeout: Duration,
     pub default_model: Option<String>,
+    pub per_agent_workspace: bool,
+    pub workspace_root: Option<PathBuf>,
 }
 
 /// Default daemon URL for the isolated cron lane (see [`OmoBackendConfig::cron_from_env`]).
@@ -56,6 +59,8 @@ impl Default for OmoBackendConfig {
             request_timeout: Duration::from_secs(600),
             total_timeout: Duration::from_secs(900),
             default_model: None,
+            per_agent_workspace: true,
+            workspace_root: None,
         }
     }
 }
@@ -90,6 +95,16 @@ impl OmoBackendConfig {
 
     pub fn with_default_model(mut self, default_model: Option<impl Into<String>>) -> Self {
         self.default_model = default_model.map(Into::into);
+        self
+    }
+
+    pub fn with_workspace_root(mut self, workspace_root: impl Into<PathBuf>) -> Self {
+        self.workspace_root = Some(workspace_root.into());
+        self
+    }
+
+    pub fn with_per_agent_workspace(mut self, per_agent_workspace: bool) -> Self {
+        self.per_agent_workspace = per_agent_workspace;
         self
     }
 
@@ -158,6 +173,20 @@ impl OmoBackendConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let per_agent_workspace = match std::env::var("OMON_PER_AGENT_WORKSPACE") {
+            Ok(v) => {
+                let trimmed = v.trim().to_ascii_lowercase();
+                if trimmed.is_empty() {
+                    true
+                } else {
+                    !matches!(trimmed.as_str(), "false" | "0" | "off" | "no")
+                }
+            }
+            Err(_) => true,
+        };
+
+        let workspace_root = std::env::var_os("OMON_WORKSPACE_ROOT").map(PathBuf::from);
+
         Ok(Self {
             appserver_url,
             auth_token,
@@ -165,6 +194,8 @@ impl OmoBackendConfig {
             request_timeout,
             total_timeout,
             default_model,
+            per_agent_workspace,
+            workspace_root,
         })
     }
 
@@ -352,5 +383,45 @@ mod tests {
         std::env::remove_var("OMON_OMO_APPSERVER_URL");
         std::env::remove_var("OMON_OMO_APPSERVER_AUTH_TOKEN");
         std::env::remove_var("OMON_DEFAULT_MODEL");
+    }
+
+    #[test]
+    fn test_per_agent_workspace_and_workspace_root_env_parsing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Default when unset
+        std::env::remove_var("OMON_PER_AGENT_WORKSPACE");
+        std::env::remove_var("OMON_WORKSPACE_ROOT");
+        let cfg = OmoBackendConfig::from_env().unwrap();
+        assert!(cfg.per_agent_workspace);
+        assert_eq!(cfg.workspace_root, None);
+
+        // Workspace root parsed
+        std::env::set_var("OMON_WORKSPACE_ROOT", "/tmp/omon-test-ws");
+        let cfg = OmoBackendConfig::from_env().unwrap();
+        assert_eq!(cfg.workspace_root, Some(PathBuf::from("/tmp/omon-test-ws")));
+
+        // Kill-switch: false / 0 / off / no (case-insensitive)
+        for falsy in ["false", "False", "0", "off", "OFF", "no", "NO"] {
+            std::env::set_var("OMON_PER_AGENT_WORKSPACE", falsy);
+            let cfg = OmoBackendConfig::from_env().unwrap();
+            assert!(
+                !cfg.per_agent_workspace,
+                "Expected per_agent_workspace=false for '{falsy}'"
+            );
+        }
+
+        // Truthy values
+        for truthy in ["true", "True", "1", "on", "yes", "YES", ""] {
+            std::env::set_var("OMON_PER_AGENT_WORKSPACE", truthy);
+            let cfg = OmoBackendConfig::from_env().unwrap();
+            assert!(
+                cfg.per_agent_workspace,
+                "Expected per_agent_workspace=true for '{truthy}'"
+            );
+        }
+
+        std::env::remove_var("OMON_PER_AGENT_WORKSPACE");
+        std::env::remove_var("OMON_WORKSPACE_ROOT");
     }
 }
