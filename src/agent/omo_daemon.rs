@@ -11,12 +11,14 @@ use crate::agent::OmoBackendConfig;
 use crate::{OmonError, Result};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
+
+static SPAWN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const READY_WAIT_AFTER_SPAWN: Duration = Duration::from_secs(30);
@@ -116,9 +118,37 @@ fn daemon_command(bin: &str, listen_url: &str) -> Command {
     let mut cmd = Command::new(bin);
     cmd.args(["app-server", "--listen", listen_url, "--ws-auth", "off"])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .kill_on_drop(true);
+
+    let log_file = std::env::var("HOME")
+        .ok()
+        .map(|home| {
+            let port = listen_url
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.split('/').next())
+                .unwrap_or("default");
+            std::path::PathBuf::from(home)
+                .join(".omon")
+                .join(format!("omo-appserver-{port}.log"))
+        })
+        .and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        });
+
+    if let Some(file) = log_file {
+        if let Ok(file_clone) = file.try_clone() {
+            cmd.stdout(Stdio::from(file));
+            cmd.stderr(Stdio::from(file_clone));
+            return cmd;
+        }
+    }
+
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
     cmd
 }
 
@@ -146,6 +176,7 @@ impl OmoDaemonSupervisor {
     /// when necessary. Returns `Ok(None)` when an externally managed daemon
     /// is already serving (or autospawn is disabled / URL is non-local).
     pub async fn ensure(cfg: &OmoBackendConfig) -> Result<Option<Self>> {
+        let _guard = SPAWN_LOCK.lock().await;
         let bin = resolve_daemon_bin(
             &std::env::var("OMON_OMO_BIN").unwrap_or_else(|_| "omo".to_string()),
             &std::env::var("PATH").unwrap_or_default(),
@@ -236,7 +267,7 @@ impl OmoDaemonSupervisor {
                     return;
                 }
                 tracing::warn!(url = %url, "omo app-server daemon exited; checking before restart");
-                sleep(RESTART_BACKOFF).await;
+                sleep(Duration::from_millis(100)).await;
                 if shutdown.load(Ordering::Acquire) {
                     return;
                 }
@@ -253,10 +284,21 @@ impl OmoDaemonSupervisor {
                 match daemon_command(&bin, &url).spawn() {
                     Ok(child) => {
                         child_slot.lock().await.replace(child);
+                        let deadline = Instant::now() + READY_WAIT_AFTER_SPAWN;
+                        while Instant::now() < deadline {
+                            if shutdown.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if probe_readyz(&url, READY_PROBE_TIMEOUT).await {
+                                tracing::info!(url = %url, "restarted omo app-server daemon ready");
+                                break;
+                            }
+                            sleep(Duration::from_millis(200)).await;
+                        }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "failed to restart omo app-server daemon");
-                        return;
+                        sleep(RESTART_BACKOFF).await;
                     }
                 }
             }

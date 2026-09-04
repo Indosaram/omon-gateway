@@ -10,8 +10,8 @@ pub fn initialize_request() -> Message {
             "method": "initialize",
             "params": {
                 "clientInfo": {
-                    "name": "omon-gateway",
-                    "title": "omon-gateway",
+                    "name": "omo-gateway",
+                    "title": "omo-gateway",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }
@@ -89,7 +89,7 @@ pub fn approval_denial_response(req_id: &Value) -> Message {
             "result": {
                 "allow": false,
                 "decision": "decline",
-                "reason": "denied by gateway policy"
+                "reason": "denied by gateway policy - do not retry this tool; ask the user for the information instead"
             }
         })
         .to_string(),

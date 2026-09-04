@@ -1,0 +1,8 @@
+
+running 3 tests
+test cron::ack::tests::failing_command_reports_failure_without_panicking ... ok
+test cron::ack::tests::runs_command_and_captures_output ... ok
+test cron::ack::tests::timeout_bounds_runaway_command ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 275 filtered out; finished in 0.20s
+

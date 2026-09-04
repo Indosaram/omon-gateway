@@ -1,0 +1,57 @@
+{
+  "id": "07531bb8-9ca0-4b81-8cb1-d0e113db7c20",
+  "ok": true,
+  "result": {
+    "screenshot": {
+      "scale": 1,
+      "height": 1496,
+      "width": 3840,
+      "format": "png",
+      "path": "/var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/orca-computer-use/07531bb8-9ca0-4b81-8cb1-d0e113db7c20-screenshot.png",
+      "dataOmitted": true,
+      "expiresAt": "2026-08-31T11:20:35.515Z"
+    },
+    "snapshot": {
+      "focusedElementId": null,
+      "truncation": {
+        "maxNodes": 1200,
+        "truncated": false,
+        "maxDepthReached": false,
+        "maxDepth": 64
+      },
+      "window": {
+        "y": 30,
+        "screenIndex": 0,
+        "id": 320,
+        "x": 0,
+        "width": 3840,
+        "isMinimized": false,
+        "isOffscreen": false,
+        "title": "@wawabot - Discord",
+        "platform": {
+          "layer": 0
+        },
+        "height": 1496
+      },
+      "app": {
+        "bundleId": "com.hnc.Discord",
+        "name": "Discord",
+        "pid": 57990
+      },
+      "id": "8E8D1167-23E8-4413-A5F6-EA091ED49F8B",
+      "treeText": "App=com.hnc.Discord (pid 57990)\nWindow: \"@wawabot - Discord\", App: Discord.\n\n0 standard window @wawabot - Discord\n\t1 container @wawabot - Discord\n\t2 close button\n\t3 full screen button, Secondary Actions: zoom the window\n\t4 minimize button\n\nNo UI element is currently focused.",
+      "elementCount": 5,
+      "coordinateSpace": "window"
+    },
+    "screenshotStatus": {
+      "state": "captured",
+      "metadata": {
+        "engine": "screenCaptureKit",
+        "windowId": 320
+      }
+    }
+  },
+  "_meta": {
+    "runtimeId": "a1f31a39-2574-4eb9-8be8-d974ee34a3f3"
+  }
+}

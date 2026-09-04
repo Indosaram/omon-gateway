@@ -87,6 +87,42 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// True when the base URL already ends with a version path segment (for
+/// example `/v1` or z.ai's `/v4`), so only `/chat/completions` needs appending.
+fn ends_with_version_segment(base: &str) -> bool {
+    base.rsplit('/').next().is_some_and(|segment| {
+        let digits = segment.strip_prefix('v').unwrap_or(segment);
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    fn openai_endpoint(base: Option<&str>) -> String {
+        let mut config = LlmConfig::new(LlmProvider::OpenAi, "glm-5.3-flash");
+        config.base_url = base.map(str::to_string);
+        LlmClient::new(config).unwrap().endpoint()
+    }
+
+    #[test]
+    fn versioned_base_urls_skip_v1_append() {
+        assert_eq!(
+            openai_endpoint(Some("https://api.z.ai/api/coding/paas/v4")),
+            "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            openai_endpoint(Some("http://127.0.0.1:8317/v1")),
+            "http://127.0.0.1:8317/v1/chat/completions"
+        );
+        assert_eq!(
+            openai_endpoint(Some("https://llm.example.com")),
+            "https://llm.example.com/v1/chat/completions"
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct LlmClient {
     config: LlmConfig,
@@ -132,7 +168,7 @@ impl LlmClient {
                 LlmProvider::Anthropic => format!("{base}/v1/messages"),
                 LlmProvider::Ollama if base.ends_with("/api") => format!("{base}/chat"),
                 LlmProvider::Ollama => format!("{base}/api/chat"),
-                _ if base.ends_with("/v1") => format!("{base}/chat/completions"),
+                _ if ends_with_version_segment(base) => format!("{base}/chat/completions"),
                 _ => format!("{base}/v1/chat/completions"),
             };
         }

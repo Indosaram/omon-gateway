@@ -133,6 +133,19 @@ impl SessionActor {
                     let delivery_id = event.delivery_id.clone();
                     let cancellation = CancellationToken::new();
                     let mut turn_context = self.context.clone();
+
+                    // Immediately broadcast typing indicator when turn execution begins
+                    if !turn_context.key.user_id.starts_with("cron:") {
+                        if let Some(dispatcher) = &self.dispatcher {
+                            let _ = dispatcher
+                                .dispatch(crate::OutboundAction::Typing {
+                                    session: turn_context.key.clone(),
+                                    active: true,
+                                })
+                                .await;
+                        }
+                    }
+
                     let runner = self.runner.clone();
                     let mut run = Box::pin(runner.run_cancelable(
                         &mut turn_context,

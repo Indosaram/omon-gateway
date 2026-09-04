@@ -15,9 +15,7 @@ use uuid::Uuid;
 
 use super::agent_workspace::{agent_workspace_slug, resolve_workspace};
 use super::backend::AgentBackend;
-use super::omo_activity::{
-    command_output_excerpt, format_activity_line, reasoning_blockquote, OUTPUT_CAP, REASONING_CAP,
-};
+
 use super::omo_config::OmoBackendConfig;
 use super::omo_protocol::{
     approval_denial_response, initialize_request, is_approval_request, thread_resume_request,
@@ -29,6 +27,10 @@ use crate::models::{
 use crate::{OmonError, OutboundDispatcher, Result};
 
 type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Approval denials tolerated per turn before the gateway aborts it: a
+/// policy-denial loop otherwise burns the entire turn deadline flailing.
+pub const APPROVAL_DENIAL_TURN_LIMIT: u32 = 5;
 
 pub struct OmoBackend {
     pub config: OmoBackendConfig,
@@ -67,23 +69,38 @@ impl OmoBackend {
             request.headers_mut().insert("Authorization", header_val);
         }
 
-        let connect_fut = tokio_tungstenite::connect_async(request);
-        let (ws, _) = tokio::time::timeout(self.config.connect_timeout, connect_fut)
-            .await
-            .map_err(|_| {
-                OmonError::Llm(format!(
-                    "timeout connecting to omo app-server at {}",
-                    self.config.appserver_url
-                ))
-            })?
-            .map_err(|e| {
-                OmonError::Llm(format!(
-                    "failed to connect to omo app-server at {}: {e}",
-                    self.config.appserver_url
-                ))
-            })?;
+        let mut last_err = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut attempt = 0;
+        while tokio::time::Instant::now() < deadline {
+            attempt += 1;
+            if attempt > 1 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let connect_fut = tokio_tungstenite::connect_async(request.clone());
+            match tokio::time::timeout(self.config.connect_timeout, connect_fut).await {
+                Ok(Ok((ws, _))) => return Ok(ws),
+                Ok(Err(e)) => {
+                    last_err = Some(OmonError::Llm(format!(
+                        "failed to connect to omo app-server at {}: {e}",
+                        self.config.appserver_url
+                    )));
+                }
+                Err(_) => {
+                    last_err = Some(OmonError::Llm(format!(
+                        "timeout connecting to omo app-server at {}",
+                        self.config.appserver_url
+                    )));
+                }
+            }
+        }
 
-        Ok(ws)
+        Err(last_err.unwrap_or_else(|| {
+            OmonError::Llm(format!(
+                "failed to connect to omo app-server at {}",
+                self.config.appserver_url
+            ))
+        }))
     }
 
     async fn do_initialize(&self, ws: &mut WsStream) -> Result<()> {
@@ -140,7 +157,11 @@ impl OmoBackend {
         session: &mut SessionContext,
     ) -> Result<String> {
         let storage_key = session.key.storage_key();
-        if let Some(id) = session
+        let is_cron = session.key.user_id.starts_with("cron:");
+        if is_cron {
+            session.state.metadata.remove("omo_thread_id");
+            self.thread_ids.lock().remove(&storage_key);
+        } else if let Some(id) = session
             .state
             .metadata
             .get("omo_thread_id")
@@ -282,11 +303,13 @@ impl OmoBackend {
                     }
                     if let Some(id) = val.pointer("/result/thread/id").and_then(Value::as_str) {
                         let id_str = id.to_string();
-                        session
-                            .state
-                            .metadata
-                            .insert("omo_thread_id".into(), json!(id_str));
-                        self.thread_ids.lock().insert(storage_key, id_str.clone());
+                        if !is_cron {
+                            session
+                                .state
+                                .metadata
+                                .insert("omo_thread_id".into(), json!(id_str));
+                            self.thread_ids.lock().insert(storage_key, id_str.clone());
+                        }
                         return Ok(id_str);
                     }
                 }
@@ -304,20 +327,19 @@ impl OmoBackend {
         sequence: u64,
         content: String,
         is_final: bool,
-    ) {
+    ) -> Result<()> {
         let chunk = StreamChunk {
             stream_id,
             sequence,
             content,
             is_final,
         };
-        let _ = self
-            .dispatcher
+        self.dispatcher
             .dispatch(OutboundAction::Stream {
                 session: session.key.clone(),
                 chunk,
             })
-            .await;
+            .await
     }
 }
 
@@ -345,13 +367,24 @@ impl OmoBackend {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
+        // Immediately notify Discord that the agent is typing while preparing/reasoning
+        if !is_cron_session {
+            let _ = self
+                .dispatcher
+                .dispatch(OutboundAction::Typing {
+                    session: session.key.clone(),
+                    active: true,
+                })
+                .await;
+        }
+
         let stream_id = Uuid::new_v4();
         let mut sequence: u64 = 0;
         let mut full_content = String::new();
-        let mut activity_lines: Vec<String> = Vec::new();
+        let mut tool_call_counts: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut total_tool_calls: usize = 0;
         let mut started_ids: std::collections::HashSet<String> = Default::default();
-        let mut completed_ids: std::collections::HashSet<String> = Default::default();
-        let mut excerpt_ids: std::collections::HashSet<String> = Default::default();
+        let mut approval_denials: u32 = 0;
 
         let started_at = std::time::Instant::now();
         let mut turn_id: Option<String> = None;
@@ -399,6 +432,25 @@ impl OmoBackend {
                     (val.get("id"), val.get("method").and_then(Value::as_str))
                 {
                     if is_approval_request(method) {
+                        approval_denials += 1;
+                        if approval_denials >= APPROVAL_DENIAL_TURN_LIMIT {
+                            tracing::error!(
+                                denials = approval_denials,
+                                "approval denial loop: aborting turn instead of flailing until the deadline"
+                            );
+                            if let Some(turn_id) = &turn_id {
+                                let interrupt = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 9_002,
+                                    "method": "turn/interrupt",
+                                    "params": { "threadId": thread_id, "turnId": turn_id }
+                                });
+                                let _ = ws.send(Message::text(interrupt.to_string())).await;
+                            }
+                            return Err(OmonError::Llm(format!(
+                                "tool approval denied {approval_denials} times by gateway policy; turn aborted"
+                            )));
+                        }
                         let _ = ws.send(approval_denial_response(req_id)).await;
                         continue;
                     }
@@ -406,11 +458,13 @@ impl OmoBackend {
 
                 match method {
                     "turn/started" => {
+                        approval_denials = 0;
                         if let Some(tid) = val.pointer("/params/turnId").and_then(Value::as_str) {
                             turn_id = Some(tid.to_string());
                         }
                     }
                     "item/started" | "item/completed" => {
+                        approval_denials = 0;
                         let is_started =
                             val.get("method").and_then(Value::as_str) == Some("item/started");
                         let Some(item) = val.pointer("/params/item") else {
@@ -418,22 +472,22 @@ impl OmoBackend {
                         };
                         let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
 
-                        if let Some(line) = format_activity_line(item) {
-                            if is_started {
-                                if !item_id.is_empty() && started_ids.contains(item_id) {
-                                    continue;
-                                }
-                                if !item_id.is_empty() {
-                                    started_ids.insert(item_id.to_string());
-                                }
-                                activity_lines.push(line);
-                            } else if !started_ids.contains(item_id)
-                                && !completed_ids.contains(item_id)
-                            {
-                                if !item_id.is_empty() {
-                                    completed_ids.insert(item_id.to_string());
-                                }
-                                activity_lines.push(line);
+                        if is_started && !item_id.is_empty() && started_ids.insert(item_id.to_string()) {
+                            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                            if !matches!(item_type, "agentMessage" | "userMessage" | "reasoning" | "") {
+                                total_tool_calls += 1;
+                                let tool_name = item
+                                    .get("command")
+                                    .or_else(|| item.get("tool"))
+                                    .or_else(|| item.get("name"))
+                                    .or_else(|| item.get("path"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(item_type);
+                                let short_name = tool_name
+                                    .split_whitespace()
+                                    .next()
+                                    .unwrap_or(tool_name);
+                                *tool_call_counts.entry(short_name.to_string()).or_insert(0) += 1;
                             }
                         }
 
@@ -445,84 +499,119 @@ impl OmoBackend {
                                         full_content.push_str(text);
                                     }
                                 }
-                                Some("reasoning") => {
-                                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                                        if item_id.is_empty()
-                                            || completed_ids.insert(item_id.to_string())
-                                        {
-                                            activity_lines
-                                                .push(reasoning_blockquote(text, REASONING_CAP));
-                                        }
-                                    }
-                                }
-                                Some("commandExecution") => {
-                                    if let Some(output) =
-                                        item.get("aggregatedOutput").and_then(Value::as_str)
-                                    {
-                                        if !output.trim().is_empty()
-                                            && (item_id.is_empty()
-                                                || excerpt_ids.insert(item_id.to_string()))
-                                        {
-                                            activity_lines.push(format!(
-                                                "⤷ {}",
-                                                command_output_excerpt(output, OUTPUT_CAP)
-                                            ));
-                                        }
-                                    }
-                                }
                                 _ => {}
                             }
                         }
-
-                        let rendered = if is_cron_session || activity_lines.is_empty() {
-                            full_content.clone()
-                        } else {
-                            format!("{}\n\n{}", activity_lines.join("\n"), full_content)
-                        };
-                        self.emit_chunk(session, stream_id, sequence, rendered, false)
-                            .await;
-                        sequence = sequence.saturating_add(1);
                     }
                     "item/agentMessage/delta" => {
                         if let Some(delta) = val.pointer("/params/delta").and_then(Value::as_str) {
                             if !delta.is_empty() {
                                 full_content.push_str(delta);
-                                self.emit_chunk(
-                                    session,
-                                    stream_id,
-                                    sequence,
-                                    full_content.clone(),
-                                    false,
-                                )
-                                .await;
+                                let _ = self
+                                    .emit_chunk(
+                                        session,
+                                        stream_id,
+                                        sequence,
+                                        full_content.clone(),
+                                        false,
+                                    )
+                                    .await;
                                 sequence = sequence.saturating_add(1);
                             }
                         }
                     }
-                    "turn/completed" | "thread/status/changed"
-                        if method == "turn/completed"
-                            || (val.pointer("/params/threadId").and_then(Value::as_str)
-                                == Some(thread_id.as_str())
-                                && val.pointer("/params/status/type").and_then(Value::as_str)
-                                    == Some("idle")
-                                && !full_content.is_empty()) =>
-                    {
-                        let rendered = if is_cron_session || activity_lines.is_empty() {
-                            full_content.clone()
+                    "turn/completed" | "thread/status/changed" => {
+                        if method == "turn/completed" {
+                            let is_for_current_thread = val
+                                .pointer("/params/threadId")
+                                .and_then(Value::as_str)
+                                .map(|id| id == thread_id)
+                                .unwrap_or(true);
+                            if !is_for_current_thread {
+                                continue;
+                            }
+                            if val.pointer("/params/turn/status").and_then(Value::as_str) == Some("failed") {
+                                let err_msg = val
+                                    .pointer("/params/turn/error")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| val.pointer("/params/turn/error/message").and_then(Value::as_str))
+                                    .unwrap_or("turn failed");
+                                return Err(OmonError::Llm(format!("omo turn failed: {err_msg}")));
+                            }
+                        }
+
+                        let has_content = !full_content.is_empty() || total_tool_calls > 0;
+                        if !has_content {
+                            // A terminal frame with no streamed content (observed:
+                            // the daemon raced a premature turn/completed at +6s
+                            // while the real turn was still running) must not end
+                            // the turn — ignore premature completion and keep streaming.
+                            continue;
+                        }
+
+                        let rendered = if is_cron_session || total_tool_calls == 0 {
+                            if full_content.trim().is_empty() {
+                                "✅ Done.".to_string()
+                            } else {
+                                full_content.clone()
+                            }
                         } else {
-                            format!("{}\n\n{}", activity_lines.join("\n"), full_content)
+                            let breakdown: Vec<String> = tool_call_counts
+                                .iter()
+                                .map(|(tool, count)| {
+                                    if *count > 1 {
+                                        format!("`{tool}` ×{count}")
+                                    } else {
+                                        format!("`{tool}`")
+                                    }
+                                })
+                                .collect();
+                            let summary_badge = if breakdown.is_empty() {
+                                format!("-# 🛠️ 도구 {total_tool_calls}회 실행됨")
+                            } else {
+                                format!(
+                                    "-# 🛠️ 도구 {total_tool_calls}회 실행 ({})",
+                                    breakdown.join(", ")
+                                )
+                            };
+
+                            if full_content.trim().is_empty() {
+                                format!("✅ Done.\n\n{summary_badge}")
+                            } else {
+                                format!("{}\n\n{}", full_content, summary_badge)
+                            }
                         };
-                        self.emit_chunk(session, stream_id, sequence, rendered.clone(), true)
+                        // A terminal frame with no streamed content (observed:
+                        // the daemon raced a premature turn/completed at +6s
+                        // while the real turn was still running) must not end
+                        // the turn — record a success whose delivery is empty
+                        // or fail it outright. Ignore the frame and keep
+                        // streaming until real completion or the deadlines.
+                        let delivered = self
+                            .emit_chunk(session, stream_id, sequence, rendered.clone(), true)
                             .await;
                         if let Some(pool) = &self.pool {
                             ensure_session_row(pool, session).await?;
                             persist_message(pool, session, &rendered).await?;
+                        }
+                        if delivered.is_ok() {
+                            if let Some(ack_command) = session
+                                .state
+                                .metadata
+                                .get("cron_ack_command")
+                                .and_then(Value::as_str)
+                                .filter(|command| !command.trim().is_empty())
+                            {
+                                crate::cron::ack::run_ack_logged(ack_command).await;
+                            }
                         }
                         return Ok(());
                     }
                     "error" | "turn/error" => {
                         let err_msg = val
                             .pointer("/params/message")
+                            .or_else(|| val.pointer("/params/error"))
+                            .or_else(|| val.pointer("/params/error/message"))
                             .and_then(Value::as_str)
                             .unwrap_or("unknown error from omo app-server");
                         return Err(OmonError::Llm(format!(
@@ -533,7 +622,13 @@ impl OmoBackend {
                 }
             }
         }
-        Ok(())
+        // Reaching the end of the stream without a terminal frame means the
+        // daemon connection closed mid-turn. Failing here (retryable — the
+        // message matches the connection-error retry contract) prevents a
+        // silent Ok with whatever partial content was collected.
+        Err(OmonError::Llm(
+            "connection closed before turn completion".into(),
+        ))
     }
 }
 
@@ -552,9 +647,13 @@ impl AgentBackend for OmoBackend {
                     || msg.contains("Broken pipe")
                     || msg.contains("connection closed")
                     || msg.contains("Handshake not finished")
+                    || msg.contains("Connection refused")
+                    || msg.contains("os error 61")
+                    || msg.contains("failed to connect to omo app-server")
         );
         if retryable {
-            tracing::warn!("omo daemon connection reset mid-turn; retrying once");
+            tracing::warn!("omo daemon connection reset or refused mid-turn; retrying once after cooldown");
+            tokio::time::sleep(Duration::from_millis(500)).await;
             return self.run_once(session, event).await;
         }
         outcome

@@ -4,6 +4,8 @@
 //! ~/.hermes/hermes-agent/agent/display.py): per-tool emoji, present-tense
 //! verbs, primary-arg previews with truncation, and "for"-connector phrasing.
 
+#![allow(dead_code)]
+
 use serde_json::Value;
 
 const PREVIEW_CAP: usize = 60;

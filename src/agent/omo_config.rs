@@ -57,7 +57,7 @@ impl Default for OmoBackendConfig {
             auth_token: None,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(600),
-            total_timeout: Duration::from_secs(900),
+            total_timeout: Duration::from_secs(1800),
             default_model: None,
             per_agent_workspace: true,
             workspace_root: None,
@@ -150,6 +150,9 @@ impl OmoBackendConfig {
         // Hard ceiling for a whole turn: a looping agent keeps emitting
         // events, so the per-event gap timeout never fires. On deadline the
         // backend sends turn/interrupt so the daemon thread is freed.
+        // 1800s fits a multi-round investigation turn: the reasoning model
+        // needs 1-4min per tool round, and cutting at 900s killed turns that
+        // had already found the answer.
         let total_timeout = match std::env::var("OMON_OMO_TURN_TOTAL_TIMEOUT_SECS") {
             Ok(v) if !v.trim().is_empty() => Duration::from_secs(
                 v.trim().parse::<u64>().map_err(|_| {
@@ -158,7 +161,7 @@ impl OmoBackendConfig {
                     ))
                 })?,
             ),
-            _ => Duration::from_secs(900),
+            _ => Duration::from_secs(1800),
         };
 
         let auth_token = std::env::var("OMON_OMO_APPSERVER_AUTH_TOKEN")
@@ -190,7 +193,7 @@ impl OmoBackendConfig {
         Ok(Self {
             appserver_url,
             auth_token,
-            connect_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(15),
             request_timeout,
             total_timeout,
             default_model,

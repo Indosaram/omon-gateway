@@ -1187,6 +1187,16 @@ impl CronScheduler {
                     reply_to: None,
                 })
                 .await?;
+
+            let ack_command = job.payload().ok().and_then(|payload| {
+                payload
+                    .get("ack_command")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+            if let Some(ack_command) = ack_command.filter(|command| !command.trim().is_empty()) {
+                super::ack::run_ack_logged(&ack_command).await;
+            }
         }
 
         let attach_to_session = job
@@ -1569,6 +1579,15 @@ mod tests {
         assert!(!is_cron_silence_response("Found 3 new vulnerabilities"));
     }
 
+    struct SilentDispatcher;
+
+    #[async_trait]
+    impl OutboundDispatcher for SilentDispatcher {
+        async fn dispatch(&self, _action: OutboundAction) -> Result<()> {
+            Ok(())
+        }
+    }
+
     struct SilentExecutor(Option<String>);
 
     #[async_trait]
@@ -1617,6 +1636,34 @@ mod tests {
         active_scheduler.execute_job(&job).await.unwrap();
         let note = active_notifications.try_recv().unwrap();
         assert_eq!(note.content, "Report content");
+    }
+
+    #[tokio::test]
+    async fn test_deliver_runs_ack_command_after_delivery() {
+        let database = crate::Database::connect("sqlite::memory:").await.unwrap();
+        let scheduler = CronScheduler::with_dispatcher(
+            database.pool().clone(),
+            Arc::new(SilentExecutor(Some("Report content".into()))),
+            Arc::new(SilentDispatcher),
+        );
+        let marker = tempfile::tempdir().expect("tempdir");
+        let marker_path = marker.path().join("ack-ran");
+        let job = scheduler
+            .register_job(
+                "interval:1m",
+                serde_json::json!({
+                    "channel_id": 123456,
+                    "ack_command": format!("touch {}", marker_path.display()),
+                }),
+            )
+            .await
+            .unwrap();
+
+        scheduler.execute_job(&job).await.unwrap();
+        assert!(
+            marker_path.exists(),
+            "ack command must run after successful delivery"
+        );
     }
 
     #[test]

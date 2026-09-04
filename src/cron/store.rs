@@ -130,6 +130,11 @@ pub struct HermesJob {
     pub script: Option<String>,
     #[serde(default)]
     pub no_agent: bool,
+    /// Shell command the gateway runs after this job's output was
+    /// successfully delivered. Keeps checkpoint commit independent of the
+    /// agent choosing to run an ack script.
+    #[serde(default)]
+    pub ack_command: Option<String>,
     #[serde(default)]
     pub context_from: Option<Value>,
     pub schedule: HermesSchedule,

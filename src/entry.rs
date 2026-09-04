@@ -34,7 +34,7 @@ mod legacy {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "omon-gateway")]
+#[command(name = "omo-gateway")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -113,9 +113,7 @@ mod tests {
     #[test]
     fn cli_defaults_to_gateway_run() {
         assert!(matches!(
-            Cli::try_parse_from(["omon-gateway"])
-                .unwrap()
-                .into_command(),
+            Cli::try_parse_from(["omo-gateway"]).unwrap().into_command(),
             Command::Run
         ));
     }
@@ -123,7 +121,7 @@ mod tests {
     #[test]
     fn cli_accepts_dashboard_and_serve_alias() {
         let dashboard = Cli::try_parse_from([
-            "omon-gateway",
+            "omo-gateway",
             "dashboard",
             "--host",
             "127.0.0.1",
@@ -140,7 +138,7 @@ mod tests {
         }
 
         assert!(matches!(
-            Cli::try_parse_from(["omon-gateway", "serve", "--insecure"])
+            Cli::try_parse_from(["omo-gateway", "serve", "--insecure"])
                 .unwrap()
                 .into_command(),
             Command::Serve(_)

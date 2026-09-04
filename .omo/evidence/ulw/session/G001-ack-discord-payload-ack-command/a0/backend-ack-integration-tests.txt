@@ -1,0 +1,26 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running tests/test_omo_backend.rs (target/debug/deps/test_omo_backend-7b657b462bc2846f)
+
+running 19 tests
+test test_omo_backend_ignores_turn_completed_for_other_thread ... ok
+test test_omo_backend_surfaces_turn_start_rpc_error_immediately ... ok
+test test_omo_backend_unreachable_daemon_error ... ok
+test test_omo_backend_skips_ack_when_delivery_fails ... ok
+test test_omo_backend_omits_workspace_when_per_agent_disabled ... ok
+test test_omo_backend_cron_sessions_always_start_fresh_thread ... ok
+test test_omo_backend_cron_session_suppresses_activity_lines_and_delivers_only_final_result ... ok
+test test_omo_backend_emits_hermes_activity_lines ... ok
+test test_omo_backend_completes_from_final_agent_message_when_turn_terminal_is_missing ... ok
+test test_omo_backend_retries_once_after_connection_drop ... ok
+test test_omo_backend_replaces_stale_cached_thread ... ok
+test test_omo_backend_provisions_agent_workspace_and_passes_to_thread_start ... ok
+test test_omo_backend_persists_without_preexisting_session_row ... ok
+test test_omo_backend_runs_ack_command_after_cron_delivery ... ok
+test test_omo_backend_e2e_thread_lifecycle_and_streaming ... ok
+test test_omo_backend_accepts_received_completion_at_deadline_edge ... ok
+test test_omo_backend_ignores_turn_completed_without_content ... ok
+test test_omo_backend_deadline_interrupts_looping_turn ... ok
+test test_omo_backend_waits_for_final_message_after_tool_activity ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+

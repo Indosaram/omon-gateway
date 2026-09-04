@@ -1,0 +1,5 @@
+pending file:
+CLEARED
+state:
+근카스와 AI 포모단 ckpt= 2026-09-01T07:46:24+00:00 pending= True n= 4076
+클코단 ckpt= 2026-09-01T15:20:15+00:00 pending= True n= 15

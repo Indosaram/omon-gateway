@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
-  "active_work_id": null,
+  "active_work_id": "daemon-multiplexer-agent-workspaces",
   "works": {
-    "hermes-oneclick-migration": {
-      "work_id": "hermes-oneclick-migration",
-      "active_plan": ".omo/plans/hermes-oneclick-migration.md",
-      "plan_name": "hermes-oneclick-migration",
+    "daemon-multiplexer-agent-workspaces": {
+      "work_id": "daemon-multiplexer-agent-workspaces",
+      "active_plan": ".omo/plans/daemon-multiplexer-agent-workspaces.md",
+      "plan_name": "daemon-multiplexer-agent-workspaces",
       "session_ids": [
-        "senpi:01a00559-273c-731f-bbf4-26de8b3617ae"
+        "senpi:01a046a7-75a7-7cb2-95ce-8ececa12e27d"
       ],
       "status": "completed",
       "worktree_path": null

@@ -72,7 +72,15 @@ impl Tool for CronTool {
                 },
                 "expression": {
                     "type": "string",
-                    "description": "Cron expression (e.g. '0 */2 * * *' or '0 10 * * *') or interval ('@every 5m'). Required for add."
+                    "description": "Cron expression (e.g. '0 */2 * * *'), interval ('@every 5m'), or one-shot expression ('once:2026-08-26T13:16:00Z'). Required unless delay/once_at is supplied."
+                },
+                "once_at": {
+                    "type": "string",
+                    "description": "One-shot execution time as RFC3339, e.g. 2026-08-26T13:16:00Z. The job disables itself after execution."
+                },
+                "delay": {
+                    "type": "string",
+                    "description": "Relative one-shot delay such as 1h, 30m, or 90s. The job disables itself after execution."
                 },
                 "schedule": {
                     "type": "string",
@@ -399,11 +407,27 @@ impl Tool for CronTool {
             }
             "add" | "create" => {
                 let id = id_param.ok_or_else(|| OmonError::ToolExecution("missing 'id'".into()))?;
-                let expression = args
-                    .get("expression")
-                    .or_else(|| args.get("schedule"))
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| OmonError::ToolExecution("missing 'expression'".into()))?;
+                let now = chrono::Utc::now();
+                let expression = if let Some(once_at) = args.get("once_at").and_then(Value::as_str)
+                {
+                    // Validate the timestamp immediately and store the canonical one-shot form.
+                    let next = next_run(&format!("once:{once_at}"), now)?;
+                    format!("once:{}", next.to_rfc3339())
+                } else if let Some(delay) = args.get("delay").and_then(Value::as_str) {
+                    // Relative delays are converted to an absolute one-shot timestamp at creation time.
+                    let next = next_run(&format!("interval:{delay}"), now)?;
+                    format!("once:{}", next.to_rfc3339())
+                } else {
+                    args.get("expression")
+                        .or_else(|| args.get("schedule"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            OmonError::ToolExecution(
+                                "missing 'expression' (or once_at/delay)".into(),
+                            )
+                        })?
+                        .to_string()
+                };
                 let prompt = args.get("prompt").and_then(Value::as_str);
                 let script = args.get("script").and_then(Value::as_str);
                 if prompt.is_none() && script.is_none() {
@@ -442,8 +466,7 @@ impl Tool for CronTool {
                     .map(str::to_owned);
                 let payload_json = serde_json::to_string(&payload)
                     .map_err(|error| OmonError::ToolExecution(error.to_string()))?;
-                let now = chrono::Utc::now();
-                let next_run_at = next_run(expression, now)?;
+                let next_run_at = next_run(&expression, now)?;
 
                 sqlx::query(
                     "INSERT INTO cron_jobs (id, session_key, expression, payload_json, enabled, next_run_at, created_at, updated_at)
@@ -453,7 +476,7 @@ impl Tool for CronTool {
                 )
                 .bind(id)
                 .bind(session_key)
-                .bind(expression)
+                .bind(&expression)
                 .bind(payload_json)
                 .bind(next_run_at)
                 .bind(now)
@@ -466,6 +489,7 @@ impl Tool for CronTool {
                     "status": "registered",
                     "id": id,
                     "expression": expression,
+                    "one_shot": expression.starts_with("once:"),
                     "prompt": prompt,
                     "script": script
                 }))

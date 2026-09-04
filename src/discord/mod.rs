@@ -3,6 +3,7 @@ pub mod approval;
 pub mod attachments;
 pub mod commands;
 pub mod pairing;
+pub mod table_render;
 pub mod throttler;
 
 pub use adapter::{

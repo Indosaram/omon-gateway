@@ -10,7 +10,7 @@ use omon_gateway::{
     DiscordApprovalRequester, FileTool, McpTool, MessageContextPolicyMatrix,
     MessengerPolicyStore, MultiplexerConfig, OmoBackend, OmoBackendConfig, OmoDaemonSupervisor,
     OutboundDispatcher, Result, ScaleToZero, SessionMultiplexer, SmartApprovalGuard, TerminalTool,
-    ToolRegistry, validate_agent_backend_env, wipe_omo_thread_bindings,
+    ToolRegistry, validate_agent_backend_env,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -114,16 +114,6 @@ pub async fn run_standalone(
 
     validate_agent_backend_env()?;
     let omo_config = OmoBackendConfig::from_env()?.with_workspace_root(workspace_root.clone());
-    if omo_config.per_agent_workspace {
-        match wipe_omo_thread_bindings(&pool).await {
-            Ok(wiped) => {
-                tracing::info!(wiped, "cleared omo thread bindings for per-agent workspace rebind");
-            }
-            Err(error) => {
-                tracing::error!(%error, "failed to clear omo thread bindings on boot");
-            }
-        }
-    }
     // Zero-config daemon lifecycle: spawn/keep-alive/kill the local
     // `omo app-server` unless an external one is already serving.
     let _daemon_supervisor = OmoDaemonSupervisor::ensure(&omo_config).await?;

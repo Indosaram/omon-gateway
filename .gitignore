@@ -20,3 +20,9 @@ apps/
 web/node_modules/
 *.framework
 *.app
+
+# Agent local artifacts
+.omo/senpi-task/
+.omo/ulw-loop/
+.omo/ulw-execute/
+.tmp/

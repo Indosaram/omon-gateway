@@ -1,0 +1,1 @@
+No Discord message was sent: first click was blocked by Orca window_not_focused; paste/send artifacts never existed. User revoked GUI control and will QA manually.

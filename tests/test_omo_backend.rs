@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use omon_gateway::{
-    AgentBackend, InboundEvent, OmoBackend, OmoBackendConfig, OutboundAction, OutboundDispatcher,
-    SessionContext, SessionKey, StreamChunk,
+    AgentBackend, InboundEvent, OmoBackend, OmoBackendConfig, OmonError, OutboundAction,
+    OutboundDispatcher, SessionContext, SessionKey, StreamChunk,
 };
 use parking_lot::Mutex as ParkingMutex;
 use serde_json::{json, Value};
@@ -40,6 +40,17 @@ impl OutboundDispatcher for CapturingDispatcher {
     async fn dispatch(&self, action: OutboundAction) -> omon_gateway::Result<()> {
         self.actions.lock().push(action);
         Ok(())
+    }
+}
+
+/// Dispatcher whose Stream deliveries always fail — for proving the ack hook
+/// stays silent when delivery did not succeed.
+struct FailingStreamDispatcher;
+
+#[async_trait]
+impl OutboundDispatcher for FailingStreamDispatcher {
+    async fn dispatch(&self, _action: OutboundAction) -> omon_gateway::Result<()> {
+        Err(OmonError::Llm("discord send failed".into()))
     }
 }
 
@@ -581,6 +592,138 @@ async fn spawn_turn_start_error_server() -> u16 {
     port
 }
 
+async fn spawn_cross_thread_completed_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind free port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let Ok(request) = serde_json::from_str::<Value>(text.as_str()) else {
+                continue;
+            };
+            let id = request
+                .get("id")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            match request.get("method").and_then(Value::as_str) {
+                Some("initialize") => {
+                    let _ = ws
+                        .send(Message::text(
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string(),
+                        ))
+                        .await;
+                }
+                Some("thread/start") => {
+                    let _ = ws
+                        .send(Message::text(
+                            json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-1"}}})
+                                .to_string(),
+                        ))
+                        .await;
+                }
+                Some("turn/start") => {
+                    let _ = ws
+                        .send(Message::text(
+                            json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1","status":"inProgress"}}})
+                                .to_string(),
+                        ))
+                        .await;
+                    let first = json!({
+                        "jsonrpc":"2.0","method":"item/agentMessage/delta",
+                        "params":{"threadId":"thread-1","turnId":"turn-1","itemId":"m1","delta":"Hello "}
+                    });
+                    let _ = ws.send(Message::text(first.to_string())).await;
+                    // A turn/completed belonging to a DIFFERENT thread must
+                    // not terminate this turn (observed on a live daemon at
+                    // +6s while the real turn was still running).
+                    let stray = json!({
+                        "jsonrpc":"2.0","method":"turn/completed",
+                        "params":{"threadId":"thread-other","turn":{"id":"turn-x","status":"completed"}}
+                    });
+                    let _ = ws.send(Message::text(stray.to_string())).await;
+                    let second = json!({
+                        "jsonrpc":"2.0","method":"item/agentMessage/delta",
+                        "params":{"threadId":"thread-1","turnId":"turn-1","itemId":"m1","delta":"World!"}
+                    });
+                    let _ = ws.send(Message::text(second.to_string())).await;
+                    let done = json!({
+                        "jsonrpc":"2.0","method":"turn/completed",
+                        "params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}
+                    });
+                    let _ = ws.send(Message::text(done.to_string())).await;
+                }
+                _ => continue,
+            }
+        }
+    });
+    port
+}
+
+async fn spawn_empty_turn_completed_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind free port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let Ok(request) = serde_json::from_str::<Value>(text.as_str()) else {
+                continue;
+            };
+            let id = request
+                .get("id")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            match request.get("method").and_then(Value::as_str) {
+                Some("initialize") => {
+                    let _ = ws
+                        .send(Message::text(
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string(),
+                        ))
+                        .await;
+                }
+                Some("thread/start") => {
+                    let _ = ws
+                        .send(Message::text(
+                            json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-1"}}})
+                                .to_string(),
+                        ))
+                        .await;
+                }
+                Some("turn/start") => {
+                    let _ = ws
+                        .send(Message::text(
+                            json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1","status":"inProgress"}}})
+                                .to_string(),
+                        ))
+                        .await;
+                    // Terminal signal with NO streamed content: the turn must
+                    // fail instead of recording a successful empty delivery.
+                    let done = json!({
+                        "jsonrpc":"2.0","method":"turn/completed",
+                        "params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}
+                    });
+                    let _ = ws.send(Message::text(done.to_string())).await;
+                }
+                _ => continue,
+            }
+        }
+    });
+    port
+}
+
 async fn spawn_tool_after_agent_message_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -871,7 +1014,7 @@ async fn test_omo_backend_replaces_stale_cached_thread() {
         Some("guild-1"),
         "chan-1",
         None::<String>,
-        "cron:stale-test",
+        "user-stale",
     );
     let mut session = SessionContext::new(session_key.clone());
     session
@@ -899,6 +1042,46 @@ async fn test_omo_backend_replaces_stale_cached_thread() {
             .and_then(Value::as_str),
         Some("server-assigned-thread-uuid-1234")
     );
+}
+
+#[tokio::test]
+async fn test_omo_backend_cron_sessions_always_start_fresh_thread() {
+    // Given: a cron session that still carries a cached thread id.
+    // Resumed in-memory threads in the app-server do not deliver turn
+    // completion events to the new connection, so cron sessions must
+    // never resume — result-only reporting needs no conversation
+    // continuity.
+    let server = FakeAppServer::spawn().await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{}", server.port));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher);
+    let session_key = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "chan-1",
+        None::<String>,
+        "cron:omon-katok-3h-group-digest-v3",
+    );
+    let mut session = SessionContext::new(session_key.clone());
+    session
+        .state
+        .metadata
+        .insert("omo_thread_id".into(), json!("cached-thread"));
+
+    // When: a cron turn runs.
+    let result = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg-1", "Run the digest"),
+        )
+        .await;
+
+    // Then: the cached thread is never resumed — a fresh thread/start is
+    // issued, and no thread id is cached for cron sessions.
+    assert!(result.is_ok(), "cron turn failed: {result:?}");
+    assert_eq!(server.thread_resume_count.load(Ordering::SeqCst), 0);
+    assert_eq!(server.thread_start_count.load(Ordering::SeqCst), 1);
+    assert!(!session.state.metadata.contains_key("omo_thread_id"));
 }
 
 #[tokio::test]
@@ -947,31 +1130,12 @@ async fn test_omo_backend_emits_hermes_activity_lines() {
     let result = backend.run(&mut session, event).await;
     assert!(result.is_ok(), "turn failed: {:?}", result.err());
 
-    // Then: activity lines appear in the stream, interleaved before the reply
+    // Then: the final message carries reply + clean tool summary badge instead of noisy raw logs
     let chunks = dispatcher.stream_chunks();
     assert!(!chunks.is_empty(), "no chunks emitted");
 
-    let combined: String = chunks
-        .iter()
-        .map(|c| c.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        combined.contains("⚙️ Running `echo OMOITEMPROBE-OK`…"),
-        "tool activity line missing: {combined}"
-    );
-    assert!(
-        combined.contains("> 💭 hmm let me think about this carefully…"),
-        "thinking block missing: {combined}"
-    );
-    assert!(
-        combined.contains("⤷ OMOITEMPROBE-OK"),
-        "output excerpt missing: {combined}"
-    );
-
-    // And: the final visible message carries activity block + reply
     let last = chunks.last().map(|c| c.content.clone()).unwrap_or_default();
-    let expected = "> 💭 hmm let me think about this carefully…\n⚙️ Running `echo OMOITEMPROBE-OK`…\n⤷ OMOITEMPROBE-OK\n\nOMOACT-OK";
+    let expected = "OMOACT-OK\n\n-# 🛠️ 도구 1회 실행 (`echo`)";
     assert_eq!(last, expected, "final chunk layout mismatch: {last:?}");
 }
 
@@ -1293,5 +1457,263 @@ async fn test_omo_backend_omits_workspace_when_per_agent_disabled() {
     assert!(
         server.received_roots.lock().is_empty(),
         "FakeAppServer must not receive runtimeWorkspaceRoots when kill-switch is disabled"
+    );
+}
+
+#[tokio::test]
+async fn test_omo_backend_ignores_turn_completed_for_other_thread() {
+    let port = spawn_cross_thread_completed_server().await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
+        .with_request_timeout(std::time::Duration::from_secs(3));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "cron");
+    let mut session = SessionContext::new(session_key.clone());
+
+    let result = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg", "digest"),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "a cross-thread turn/completed must not end this turn: {result:?}"
+    );
+    let chunks = dispatcher.stream_chunks();
+    let final_chunk = chunks.last().expect("final chunk");
+    assert!(final_chunk.is_final);
+    assert_eq!(
+        final_chunk.content, "Hello World!",
+        "the turn must keep streaming until its own thread completes"
+    );
+}
+
+#[tokio::test]
+async fn test_omo_backend_ignores_turn_completed_without_content() {
+    let port = spawn_empty_turn_completed_server().await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
+        .with_request_timeout(std::time::Duration::from_millis(500))
+        .with_total_timeout(std::time::Duration::from_secs(5));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "cron");
+    let mut session = SessionContext::new(session_key.clone());
+
+    let result = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg", "digest"),
+        )
+        .await;
+
+    // The premature empty terminal frame must NOT complete the turn as a
+    // success (that recorded a digest delivery that never happened). The
+    // stream then stalls and the connection/gap failure surfaces instead.
+    assert!(
+        result.is_err(),
+        "empty-content terminal must not succeed: {:?}",
+        result.ok()
+    );
+    assert!(
+        dispatcher.stream_chunks().is_empty(),
+        "no final chunk may be emitted for an empty turn"
+    );
+}
+
+#[tokio::test]
+async fn test_omo_backend_runs_ack_command_after_cron_delivery() {
+    // Given: a cron session carrying an ack command, and a daemon whose turn
+    // completes with content (successful final delivery)
+    let server = FakeAppServer::spawn().await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{}", server.port))
+        .with_request_timeout(std::time::Duration::from_secs(3));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher.clone());
+
+    let marker = tempfile::tempdir().expect("tempdir");
+    let marker_path = marker.path().join("ack-ran");
+
+    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "cron");
+    let mut session = SessionContext::new(session_key.clone());
+    session
+        .state
+        .metadata
+        .insert("cron_scheduler_delivery".into(), json!(true));
+    session.state.metadata.insert(
+        "cron_ack_command".into(),
+        json!(format!("touch {}", marker_path.display())),
+    );
+
+    // When: the turn completes
+    let result = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg", "digest"),
+        )
+        .await;
+
+    // Then: the ack command executed after the successful delivery
+    assert!(result.is_ok(), "turn must succeed: {:?}", result.err());
+    assert!(
+        marker_path.exists(),
+        "ack command must run after successful cron delivery"
+    );
+}
+
+#[tokio::test]
+async fn test_omo_backend_skips_ack_when_delivery_fails() {
+    // Given: a cron session with an ack command, but every delivery fails
+    let server = FakeAppServer::spawn().await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{}", server.port))
+        .with_request_timeout(std::time::Duration::from_secs(3));
+    let dispatcher = Arc::new(FailingStreamDispatcher);
+    let backend = OmoBackend::new(config, dispatcher);
+
+    let marker = tempfile::tempdir().expect("tempdir");
+    let marker_path = marker.path().join("ack-ran");
+
+    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "cron");
+    let mut session = SessionContext::new(session_key.clone());
+    session
+        .state
+        .metadata
+        .insert("cron_scheduler_delivery".into(), json!(true));
+    session.state.metadata.insert(
+        "cron_ack_command".into(),
+        json!(format!("touch {}", marker_path.display())),
+    );
+
+    // When: the turn completes against a failing egress
+    let result = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg", "digest"),
+        )
+        .await;
+
+    // Then: the turn outcome is unchanged, but the ack never ran — the
+    // checkpoint must not commit for a delivery that did not happen.
+    assert!(
+        result.is_ok(),
+        "delivery failure must not fail the turn: {:?}",
+        result.err()
+    );
+    assert!(
+        !marker_path.exists(),
+        "ack command must NOT run when delivery failed"
+    );
+}
+
+/// Approval-request server that fires `count` execCommandApproval requests,
+/// one per denial response received. Reproduces a policy-denial loop.
+async fn spawn_repeated_approval_server(count: usize) -> u16 {
+    use futures_util::{SinkExt, StreamExt};
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind free port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        let (mut sink, mut stream) = ws.split();
+        let mut next_req_id = 1000usize;
+        let mut pending_approvals: usize = 0;
+        loop {
+            let Some(Ok(Message::Text(text))) = stream.next().await else {
+                break;
+            };
+            let Ok(request) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if request.get("method").is_none() {
+                // A client response (e.g. an approval denial): fire the next
+                // approval request while any remain.
+                if pending_approvals > 0 {
+                    pending_approvals -= 1;
+                    next_req_id += 1;
+                    let req = json!({
+                        "jsonrpc": "2.0",
+                        "id": next_req_id,
+                        "method": "execCommandApproval",
+                        "params": { "command": "rm -rf /", "reason": "policy probe" }
+                    });
+                    let _ = sink.send(Message::text(req.to_string())).await;
+                }
+                continue;
+            }
+            let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
+            match method {
+                "initialize" => {
+                    let _ = sink
+                        .send(Message::text(
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string(),
+                        ))
+                        .await;
+                }
+                "thread/start" => {
+                    let _ = sink
+                        .send(Message::text(
+                            json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-1"}}})
+                                .to_string(),
+                        ))
+                        .await;
+                }
+                "turn/start" => {
+                    let _ = sink
+                        .send(Message::text(
+                            json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1","status":"inProgress"}}})
+                                .to_string(),
+                        ))
+                        .await;
+                    // Fire the first approval request; the rest follow on each
+                    // denial response.
+                    let req = json!({
+                        "jsonrpc": "2.0",
+                        "id": 1000,
+                        "method": "execCommandApproval",
+                        "params": { "command": "rm -rf /", "reason": "policy probe" }
+                    });
+                    let _ = sink.send(Message::text(req.to_string())).await;
+                    pending_approvals = count - 1;
+                }
+                _ => {}
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn test_omo_backend_aborts_turn_on_repeated_approval_denials() {
+    // Given: a daemon stuck in a policy-denial loop (8 approval requests)
+    let port = spawn_repeated_approval_server(8).await;
+    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
+        .with_request_timeout(std::time::Duration::from_secs(3));
+    let dispatcher = Arc::new(CapturingDispatcher::new());
+    let backend = OmoBackend::new(config, dispatcher);
+    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "cron");
+    let mut session = SessionContext::new(session_key.clone());
+
+    // When: the denials accumulate
+    let result = backend
+        .run(
+            &mut session,
+            InboundEvent::message(session_key, "msg", "do the thing"),
+        )
+        .await;
+
+    // Then: the turn aborts with a policy error instead of flailing until
+    // the whole-turn deadline.
+    let error = result.expect_err("denial loop must abort the turn");
+    assert!(
+        error.to_string().contains("approval denied"),
+        "unexpected error: {error}"
     );
 }

@@ -1,0 +1,20 @@
+RED — final-only Discord delivery
+
+Surface baseline:
+- Orca get-app-state app=com.hnc.Discord window=320
+- Screenshot: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/orca-computer-use/07531bb8-9ca0-4b81-8cb1-d0e113db7c20-screenshot.png
+- Window: @wawabot - Discord
+- Unique QA token and ULW-CU-OK reply absent before send.
+
+Code proof before implementation:
+```
+error[E0425]: cannot find function `completed_stream_content` in this scope
+ --> src/discord/adapter.rs:2434:20
+error: could not compile `omon-gateway` (lib test) due to 2 previous errors
+```
+
+GREEN focused proof:
+- cargo test --lib discord::adapter::tests::discord_stream_delivers_only_completed_content
+  1 passed, 0 failed
+- cargo test --test test_discord_adapter
+  38 passed, 0 failed

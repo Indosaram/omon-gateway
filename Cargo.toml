@@ -1,12 +1,12 @@
 [package]
-name = "omon-gateway"
+name = "omo-gateway"
 version = "0.1.0"
 edition = "2021"
 autobins = false
 description = "Ultra-fast, zero-GC async AI agent gateway and session multiplexer for Discord in 100% Rust"
 license = "Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/omon-ai/omon-gateway"
+repository = "https://github.com/Indosaram/omo-gateway"
 keywords = ["discord", "agent", "multiplexer", "llm", "hermes"]
 categories = ["network-programming", "asynchronous"]
 
@@ -15,7 +15,7 @@ name = "omon_gateway"
 path = "src/lib.rs"
 
 [[bin]]
-name = "omon-gateway"
+name = "omo-gateway"
 path = "src/entry.rs"
 
 [dependencies]
@@ -51,6 +51,8 @@ base64 = "0.22"
 sha2 = "0.10"
 regex = "1.11"
 tokio-tungstenite = "0.26"
+resvg = "0.48.1"
+usvg = "0.48.1"
 
 [dev-dependencies]
 tempfile = "3"

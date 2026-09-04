@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -683,6 +684,7 @@ impl DiscordAdapter {
 
     pub async fn start(&self, token: impl AsRef<str>) -> Result<()> {
         let mut client = self.client(token).await?;
+        spawn_receive_watchdog(client.shard_manager.clone());
         client.start().await?;
         Ok(())
     }
@@ -733,6 +735,7 @@ async fn handle_event(
     event: &FullEvent,
     data: &PoiseData,
 ) -> Result<(), CommandError> {
+    LAST_DISCORD_EVENT_MS.store(now_ms(), Ordering::Relaxed);
     match event {
         FullEvent::Message { new_message } => {
             let _ = update_channel_cursor(
@@ -1471,6 +1474,91 @@ struct ActiveDiscordStream {
 type StreamKey = (String, Uuid);
 type ApprovalMessageTarget = (SessionKey, ChannelId, MessageId);
 
+/// Millis (unix epoch) of the last gateway dispatch event, per process.
+/// Drives the receive watchdog: a long silence while connected means the
+/// Discord gateway session is a zombie and the shard must be restarted.
+static LAST_DISCORD_EVENT_MS: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+
+const RECEIVE_WATCHDOG_DEFAULT_THRESHOLD_SECS: u64 = 1200;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn receive_watchdog_threshold_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(RECEIVE_WATCHDOG_DEFAULT_THRESHOLD_SECS)
+}
+
+fn receive_watchdog_threshold() -> u64 {
+    receive_watchdog_threshold_from(
+        std::env::var("OMON_DISCORD_RECEIVE_WATCHDOG_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Restart the shard when no gateway dispatch has arrived for the silence
+/// window: a healthy Discord connection delivers events constantly, so a
+/// long quiet stretch while connected means the session is a zombie that
+/// serenity's own heartbeats can no longer rescue. 0 disables.
+fn spawn_receive_watchdog(shard_manager: Arc<serenity::ShardManager>) {
+    let threshold_secs = receive_watchdog_threshold();
+    if threshold_secs == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let last_event = LAST_DISCORD_EVENT_MS.load(Ordering::Relaxed);
+            if last_event == 0 {
+                // No dispatch received yet since boot (waiting for first event or Ready).
+                continue;
+            }
+            let silence_secs = now_ms().saturating_sub(last_event) / 1000;
+            if silence_secs < threshold_secs {
+                continue;
+            }
+            // Double-check shard runner health before forcing a restart:
+            // if serenity's runner reports connected with an active heartbeat
+            // latency, the gateway is alive and the silence is simply an idle channel/bot.
+            let runners = shard_manager.runners.lock().await;
+            let is_runner_healthy = runners
+                .get(&serenity::all::ShardId(0))
+                .is_some_and(|runner| {
+                    runner.stage == serenity::gateway::ConnectionStage::Connected
+                        && runner.latency.is_some()
+                });
+            drop(runners);
+
+            if is_runner_healthy {
+                tracing::debug!(
+                    silence_secs,
+                    threshold_secs,
+                    "Discord receive watchdog: dispatch silent but shard runner reports healthy connected heartbeat; skipping restart"
+                );
+                // Advance the marker to give another full silence window before checking again
+                LAST_DISCORD_EVENT_MS.store(now_ms(), Ordering::Relaxed);
+                continue;
+            }
+
+            tracing::error!(
+                silence_secs,
+                threshold_secs,
+                "Discord receive watchdog: no gateway events and shard runner unhealthy; restarting shard"
+            );
+            LAST_DISCORD_EVENT_MS.store(now_ms(), Ordering::Relaxed);
+            shard_manager.restart_shard(serenity::all::ShardId(0)).await;
+        }
+    });
+}
+
 #[derive(Clone)]
 pub struct DiscordEgress {
     clients: Arc<HashMap<String, Arc<serenity::Http>>>,
@@ -1766,7 +1854,7 @@ impl DiscordEgress {
             if let Some(active) = streams.get(&key) {
                 active.clone()
             } else {
-                let transport = Arc::new(SerenityMessageTransport::new(http));
+                let transport = Arc::new(SerenityMessageTransport::new(http.clone()));
                 let message_id = transport
                     .send_message(channel, "\u{200b}".to_owned())
                     .await?;
@@ -1783,11 +1871,28 @@ impl DiscordEgress {
         if last_sequence.is_some_and(|sequence| chunk.sequence <= sequence) {
             return Ok(());
         }
-        active.throttler.update(content, true).await?;
+        let (processed_content, rendered_tables) = if chunk.is_final {
+            crate::discord::table_render::transform_markdown_tables_to_images(content)
+        } else {
+            (content.to_string(), Vec::new())
+        };
+
+        active.throttler.update(&processed_content, true).await?;
         *last_sequence = Some(chunk.sequence);
         drop(last_sequence);
 
         if chunk.is_final {
+            if !rendered_tables.is_empty() {
+                let attachments: Vec<CreateAttachment> = rendered_tables
+                    .into_iter()
+                    .map(|table| CreateAttachment::bytes(table.png_bytes, table.filename))
+                    .collect();
+                let create_msg = CreateMessage::new().allowed_mentions(safe_allowed_mentions());
+                if let Err(error) = channel.send_files(&http, attachments, create_msg).await {
+                    tracing::error!(%error, "failed to attach rendered table images to Discord channel");
+                }
+            }
+
             let mut streams = self.streams.lock().await;
             if streams
                 .get(&key)
@@ -1832,7 +1937,10 @@ impl OutboundDispatcher for DiscordEgress {
                     .and_then(|id| id.parse::<u64>().ok())
                     .map(MessageId::new);
 
-                let chunks = chunk_markdown(&content, DISCORD_MESSAGE_LIMIT);
+                let (processed_content, rendered_tables) =
+                    crate::discord::table_render::transform_markdown_tables_to_images(&content);
+
+                let chunks = chunk_markdown(&processed_content, DISCORD_MESSAGE_LIMIT);
 
                 let is_forum = match channel.to_channel(&http).await {
                     Ok(serenity::Channel::Guild(guild_channel)) => {
@@ -1954,6 +2062,17 @@ impl OutboundDispatcher for DiscordEgress {
                             }
                             return Err(error.into());
                         }
+                    }
+                }
+
+                if !rendered_tables.is_empty() {
+                    let attachments: Vec<CreateAttachment> = rendered_tables
+                        .into_iter()
+                        .map(|table| CreateAttachment::bytes(table.png_bytes, table.filename))
+                        .collect();
+                    let create_msg = CreateMessage::new().allowed_mentions(safe_allowed_mentions());
+                    if let Err(error) = channel.send_files(&http, attachments, create_msg).await {
+                        tracing::error!(%error, "failed to attach rendered table images in SendMessage");
                     }
                 }
             }
@@ -2090,6 +2209,7 @@ impl OutboundDispatcher for DiscordEgress {
                 if active {
                     let http = self.http_for(&session)?;
                     let guard = http.start_typing(channel);
+                    let _ = http.broadcast_typing(channel).await;
                     self.typing
                         .lock()
                         .await
@@ -3275,3 +3395,30 @@ mod tests {
         assert!(!registry.is_dead(333));
     }
 }
+
+#[cfg(test)]
+mod receive_watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn threshold_defaults_to_1200() {
+        assert_eq!(receive_watchdog_threshold_from(None), 1200);
+    }
+
+    #[test]
+    fn threshold_env_override_applies() {
+        assert_eq!(receive_watchdog_threshold_from(Some("600")), 600);
+    }
+
+    #[test]
+    fn threshold_zero_disables_watchdog() {
+        assert_eq!(receive_watchdog_threshold_from(Some("0")), 0);
+    }
+
+    #[test]
+    fn threshold_invalid_value_falls_back_to_default() {
+        assert_eq!(receive_watchdog_threshold_from(Some("soon")), 1200);
+        assert_eq!(receive_watchdog_threshold_from(Some("-5")), 1200);
+    }
+}
+// receive_watchdog_tests appended above via separate block — see receive_watchdog_tests mod

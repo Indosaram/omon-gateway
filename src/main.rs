@@ -12,25 +12,25 @@ use omon_gateway::{
     augmented_path_from_environment, cron_runs_retention_days_from_environment,
     cron_script_timeout_secs_from, format_context_from_block, parse_context_from_ids,
     parse_profile_routes, parse_wake_gate, prune_terminal_cron_runs, resolve_cron_script_timeout,
-    resolve_predecessor_output, truncate_context_output, validate_agent_backend_env, AgentBackend,
-    ApprovalPolicy, AttachmentDownloader, CronJob, CronScheduler, CronTaskExecutor, CronTool,
-    DeliveryLedgerService, DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool,
-    HermesJob, HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool,
-    MultiplexerConfig, OmoBackend, OmoBackendConfig, OmoDaemonSupervisor, OmonError, OutboundAction,
-    OutboundDispatcher, PoiseData, ProfileRoute, ProfileRouter, RestartLoopGuard, Result,
-    ScaleToZero, SessionContext,
+    resolve_predecessor_output, truncate_context_output, validate_agent_backend_env,
+    AgentBackend, ApprovalPolicy, AttachmentDownloader, CronJob,
+    CronScheduler, CronTaskExecutor, CronTool, DeliveryLedgerService, DiscordAdapter,
+    DiscordApprovalRequester, DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer,
+    InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool, MultiplexerConfig, OmoBackend,
+    OmoBackendConfig, OmoDaemonSupervisor, OmonError, OutboundAction, OutboundDispatcher,
+    PoiseData, ProfileRoute, ProfileRouter, RestartLoopGuard, Result, ScaleToZero, SessionContext,
     SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
-    wipe_omo_thread_bindings, MAX_CONTEXT_CHARS,
+    MAX_CONTEXT_CHARS,
 };
 use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
-#[command(name = "omon-gateway")]
+#[command(name = "omo-gateway")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -529,8 +529,7 @@ impl CronTaskExecutor for AgentCronExecutor {
             let home_path = hermes_home(&hermes).ok();
             for source_id in &context_ids {
                 if let Some(output) =
-                    resolve_predecessor_output(&self.pool, home_path.as_deref(), source_id)
-                        .await
+                    resolve_predecessor_output(&self.pool, home_path.as_deref(), source_id).await
                 {
                     if !output.trim().is_empty() {
                         let truncated = truncate_context_output(output.trim(), MAX_CONTEXT_CHARS);
@@ -588,6 +587,16 @@ impl CronTaskExecutor for AgentCronExecutor {
             .state
             .metadata
             .insert("cron_scheduler_delivery".into(), json!(true));
+        if let Some(ack_command) = hermes
+            .ack_command
+            .as_deref()
+            .filter(|command| !command.trim().is_empty())
+        {
+            session
+                .state
+                .metadata
+                .insert("cron_ack_command".into(), json!(ack_command));
+        }
         let event = InboundEvent::message(session_key, format!("cron:{}", job.id), prompt);
         // TODO(omo-only): Cron execution runs directly through AgentBackend (OMO appserver backend).
         // Model selection is propagated via session.state.active_model.
@@ -681,6 +690,16 @@ async fn execute_native_cron(
         .state
         .metadata
         .insert("cron_scheduler_delivery".into(), json!(true));
+    if let Some(ack_command) = payload
+        .get("ack_command")
+        .and_then(serde_json::Value::as_str)
+        .filter(|command| !command.trim().is_empty())
+    {
+        session
+            .state
+            .metadata
+            .insert("cron_ack_command".into(), json!(ack_command));
+    }
     let event = InboundEvent::message(session_key, format!("cron:{}", job.id), task);
     backend.run(&mut session, event).await?;
     Ok(None)
@@ -1215,18 +1234,9 @@ async fn run_gateway() -> Result<()> {
     let tool_names = tools.names();
 
     validate_agent_backend_env()?;
-    let omo_config =
-        OmoBackendConfig::from_env()?.with_workspace_root(config.workspace_root.clone());
-    if omo_config.per_agent_workspace {
-        match wipe_omo_thread_bindings(&pool).await {
-            Ok(wiped) => {
-                info!(wiped, "cleared omo thread bindings for per-agent workspace rebind");
-            }
-            Err(error) => {
-                error!(%error, "failed to clear omo thread bindings on boot");
-            }
-        }
-    }
+    let omo_config = OmoBackendConfig::from_env()?
+        .with_workspace_root(config.workspace_root.clone())
+        .with_default_model(Some(config.default_model.clone()));
     // Zero-config daemon lifecycle: spawn/keep-alive/kill the local
     // `omo app-server` unless an external one is already serving.
     let _daemon_supervisor = OmoDaemonSupervisor::ensure(&omo_config).await?;
@@ -1235,10 +1245,8 @@ async fn run_gateway() -> Result<()> {
         "Initializing agent backend: OMO app-server"
     );
     let shared_dispatcher = Arc::new(SharedDispatcher::default());
-    let omo_backend = Arc::new(
-        OmoBackend::new(omo_config, shared_dispatcher.clone())
-            .with_pool(pool.clone()),
-    );
+    let omo_backend =
+        Arc::new(OmoBackend::new(omo_config, shared_dispatcher.clone()).with_pool(pool.clone()));
     let runner: Arc<dyn AgentBackend> = omo_backend.clone();
     let profile_router = ProfileRouter::new(config.profile_routes.clone());
     let multiplexer = SessionMultiplexer::with_profile_router(
@@ -1395,7 +1403,7 @@ async fn run_gateway() -> Result<()> {
         model = %config.default_model,
         database = %config.database_url,
         bot_count = clients.len(),
-        "omon-gateway listening on Discord"
+        "omo-gateway listening on Discord"
     );
 
     let mut join_set = tokio::task::JoinSet::new();
@@ -1438,7 +1446,7 @@ async fn run_gateway() -> Result<()> {
     scheduler.shutdown().await;
     scale_to_zero.shutdown().await;
     pool.close().await;
-    warn!("omon-gateway stopped");
+    warn!("omo-gateway stopped");
     Ok(())
 }
 
@@ -1599,20 +1607,20 @@ mod runner_tests {
 
     #[test]
     fn cli_defaults_to_run_without_a_subcommand() {
-        let cli = Cli::try_parse_from(["omon-gateway"]).unwrap();
+        let cli = Cli::try_parse_from(["omo-gateway"]).unwrap();
         assert!(matches!(cli.into_command(), Command::Run));
     }
 
     #[test]
     fn cli_maps_explicit_run_to_the_run_path() {
-        let cli = Cli::try_parse_from(["omon-gateway", "run"]).unwrap();
+        let cli = Cli::try_parse_from(["omo-gateway", "run"]).unwrap();
         assert!(matches!(cli.into_command(), Command::Run));
     }
 
     #[test]
     fn cli_parses_migrate_flags() {
         let cli =
-            Cli::try_parse_from(["omon-gateway", "migrate", "--dry-run", "--no-cutover"]).unwrap();
+            Cli::try_parse_from(["omo-gateway", "migrate", "--dry-run", "--no-cutover"]).unwrap();
         match cli.into_command() {
             Command::Migrate(args) => {
                 assert!(args.dry_run);
@@ -1624,7 +1632,7 @@ mod runner_tests {
 
     #[test]
     fn cli_rejects_unknown_subcommands() {
-        assert!(Cli::try_parse_from(["omon-gateway", "bogus"]).is_err());
+        assert!(Cli::try_parse_from(["omo-gateway", "bogus"]).is_err());
     }
 
     #[test]
@@ -2012,6 +2020,7 @@ mod runner_tests {
             base_url: None,
             script: None,
             no_agent: false,
+            ack_command: None,
             context_from: None,
             schedule: omon_gateway::HermesSchedule::default(),
             schedule_display: "".into(),
@@ -2048,6 +2057,7 @@ mod runner_tests {
             base_url: None,
             script: None,
             no_agent: false,
+            ack_command: None,
             context_from: None,
             schedule: omon_gateway::HermesSchedule::default(),
             schedule_display: "".into(),
@@ -2086,6 +2096,7 @@ mod runner_tests {
             base_url: None,
             script: None,
             no_agent: false,
+            ack_command: None,
             context_from: None,
             schedule: omon_gateway::HermesSchedule::default(),
             schedule_display: "".into(),
@@ -2190,6 +2201,7 @@ mod runner_tests {
             base_url: None,
             script: None,
             no_agent: false,
+            ack_command: None,
             context_from: None,
             schedule: omon_gateway::HermesSchedule::default(),
             schedule_display: "".into(),
