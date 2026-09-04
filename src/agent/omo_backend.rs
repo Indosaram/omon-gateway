@@ -388,18 +388,35 @@ impl OmoBackend {
 
         let started_at = std::time::Instant::now();
         let mut turn_id: Option<String> = None;
+        let mut turn_started_ack = false;
+        let mut last_activity_at = std::time::Instant::now();
+        let effective_total_timeout = if is_cron_session {
+            self.config.total_timeout
+        } else {
+            self.config.total_timeout.min(Duration::from_secs(300))
+        };
 
         while let Some(msg) = tokio::time::timeout(self.config.request_timeout, ws.next())
             .await
             .map_err(|_| OmonError::Llm("timeout during turn streaming".into()))?
         {
+            if !turn_started_ack && started_at.elapsed() > Duration::from_secs(30) {
+                return Err(OmonError::Llm(
+                    "timeout waiting for turn/start acknowledgement from omo app-server".into(),
+                ));
+            }
+            if last_activity_at.elapsed() > self.config.request_timeout {
+                return Err(OmonError::Llm("timeout during turn streaming".into()));
+            }
+
             let msg = msg.map_err(|e| OmonError::Llm(format!("ws streaming error: {e}")))?;
             if let Message::Text(text) = msg {
+                last_activity_at = std::time::Instant::now();
                 let val: Value = serde_json::from_str(text.as_str())
                     .map_err(|e| OmonError::Llm(format!("invalid json: {e}")))?;
                 let method = val.get("method").and_then(Value::as_str).unwrap_or("");
 
-                if method != "turn/completed" && started_at.elapsed() > self.config.total_timeout {
+                if method != "turn/completed" && started_at.elapsed() > effective_total_timeout {
                     if let Some(turn_id) = &turn_id {
                         let interrupt = json!({
                             "jsonrpc": "2.0",
@@ -414,7 +431,7 @@ impl OmoBackend {
                     }
                     return Err(OmonError::Llm(format!(
                         "turn exceeded total deadline of {:?}; turn/interrupt sent",
-                        self.config.total_timeout
+                        effective_total_timeout
                     )));
                 }
 
@@ -422,6 +439,7 @@ impl OmoBackend {
                     if let Some(error) = val.get("error") {
                         return Err(OmonError::Llm(format!("turn/start error: {error}")));
                     }
+                    turn_started_ack = true;
                     if let Some(id) = val.pointer("/result/turn/id").and_then(Value::as_str) {
                         turn_id = Some(id.to_string());
                     }
@@ -521,7 +539,7 @@ impl OmoBackend {
                         }
                     }
                     "turn/completed" | "thread/status/changed" => {
-                        if method == "turn/completed" {
+                        let is_terminal = if method == "turn/completed" {
                             let is_for_current_thread = val
                                 .pointer("/params/threadId")
                                 .and_then(Value::as_str)
@@ -538,6 +556,21 @@ impl OmoBackend {
                                     .unwrap_or("turn failed");
                                 return Err(OmonError::Llm(format!("omo turn failed: {err_msg}")));
                             }
+                            true
+                        } else if method == "thread/status/changed" {
+                            let is_for_current_thread = val
+                                .pointer("/params/threadId")
+                                .and_then(Value::as_str)
+                                .map(|id| id == thread_id)
+                                .unwrap_or(false);
+                            let is_idle = val.pointer("/params/status/type").and_then(Value::as_str) == Some("idle");
+                            is_for_current_thread && is_idle
+                        } else {
+                            false
+                        };
+
+                        if !is_terminal {
+                            continue;
                         }
 
                         let has_content = !full_content.is_empty() || total_tool_calls > 0;
@@ -608,6 +641,17 @@ impl OmoBackend {
                         return Ok(());
                     }
                     "error" | "turn/error" => {
+                        let is_turn_error = val.pointer("/params/turnId").is_some()
+                            || val.pointer("/params/turn").is_some()
+                            || method == "turn/error";
+                        if !is_turn_error {
+                            tracing::warn!(
+                                %thread_id,
+                                ?val,
+                                "non-fatal notification error from omo app-server; continuing turn"
+                            );
+                            continue;
+                        }
                         let err_msg = val
                             .pointer("/params/message")
                             .or_else(|| val.pointer("/params/error"))
